@@ -1,4 +1,4 @@
-"""Differential tests: lightgbm-rust vs LightGBM 4.7.0 on the regression/binary subset.
+"""Differential tests: lightgbm-rust vs LightGBM 4.7.0 on the regression-family/binary subset.
 
 Each test compares intermediate and final quantities; tolerances come from
 tests/tolerances.toml (see its rationale entries).
@@ -17,6 +17,7 @@ import lightgbm_rust as lgb_rs
 from .conftest import (
     CASES,
     DETERMINISTIC,
+    REGRESSION_OBJECTIVES,
     case_ids,
     parse_dump_text,
     rust_tree_arrays,
@@ -51,12 +52,137 @@ def _seqsum(x):
     return float(np.cumsum(x, dtype=np.float64)[-1])
 
 
+def _cexp(x):
+    """C library exp (what upstream calls), not NumPy's SIMD implementation."""
+    return np.array([math.exp(v) for v in np.asarray(x, dtype=np.float64)])
+
+
+def _percentile(vals, alpha):
+    """upstream PercentileFun; `vals` is float32 (label_t) or float64, arithmetic as in the C++ macro."""
+    t = vals.dtype.type
+    n = len(vals)
+    if n <= 1:
+        return vals[0]
+    float_pos = (n - 1) * (1.0 - alpha)
+    pos = int(float_pos) + 1
+    if pos < 1:
+        return vals.max()
+    if pos >= n:
+        return vals.min()
+    bias = float_pos - (pos - 1)
+    desc = np.sort(vals)[::-1]
+    v1, v2 = desc[pos - 1], desc[pos]
+    return t(float(v1) - float(t(v1 - v2)) * bias)
+
+
+def _weighted_percentile(vals, weights, alpha):
+    """upstream WeightedPercentileFun (stable sort, double cumulative weights)."""
+    t = vals.dtype.type
+    n = len(vals)
+    if n <= 1:
+        return vals[0]
+    order = np.argsort(vals, kind="stable")
+    cdf = np.cumsum(np.asarray(weights, dtype=np.float64)[order])
+    threshold = cdf[-1] * alpha
+    pos = min(int(np.searchsorted(cdf, threshold, side="right")), n - 1)
+    if pos == 0 or pos == n - 1:
+        return vals[order[pos]]
+    v1, v2 = vals[order[pos - 1]], vals[order[pos]]
+    if cdf[pos] - cdf[pos - 1] >= 1.0:
+        return t((threshold - cdf[pos - 1]) / (cdf[pos] - cdf[pos - 1]) * float(t(v2 - v1)) + float(v1))
+    return v1
+
+
+_SQRT_ALLOWED = ("regression", "regression_l1", "fair", "quantile", "mape")
+
+
+def _reference_regression_gradients(case, y, w):
+    """Losses derived from upstream RegressionL2loss (regression_objective.hpp)."""
+    p = case.full_params
+    obj = case.objective
+    f32 = np.float32
+    if p.get("reg_sqrt") and obj in _SQRT_ALLOWED:
+        y = (np.sign(y) * np.sqrt(np.abs(y))).astype(f32).astype(np.float64)
+    y32 = y.astype(f32)
+    w32 = None if w is None else w.astype(f32)
+    ww = np.ones_like(y) if w is None else w
+    alpha = p.get("alpha", 0.9)
+    a32 = f32(alpha)
+    lw32 = f32(1.0) / np.maximum(f32(1.0), np.abs(y32))
+    if w32 is not None:
+        lw32 = lw32 * w32
+
+    def mean():
+        return _seqsum(y * ww) / _seqsum(ww)
+
+    if case.init_score is not None:
+        score = case.init_score.astype(np.float64)
+    elif not p.get("boost_from_average", True):
+        score = np.zeros_like(y)
+    else:
+        if obj in ("regression", "huber", "fair"):
+            init = mean()
+        elif obj in ("poisson", "gamma", "tweedie"):
+            m = mean()
+            init = math.log(m) if m > 0 else -math.inf
+        elif obj in ("regression_l1", "quantile"):
+            a = 0.5 if obj == "regression_l1" else float(a32)
+            init = float(_percentile(y32, a) if w32 is None else _weighted_percentile(y32, w32, a))
+        else:  # mape
+            init = float(_weighted_percentile(y32, lw32, 0.5))
+        score = np.full_like(y, init)
+
+    def wt(x):
+        return x if w is None else x * w
+
+    hess_w = np.ones_like(y, dtype=f32) if w is None else w32
+    diff = score - y
+    if obj == "regression":
+        # upstream: static_cast<score_t>(static_cast<score_t>(score - label) * weight)
+        g = diff.astype(f32)
+        return (g if w is None else g * w32), hess_w
+    if obj == "regression_l1":
+        return wt(np.sign(diff)).astype(f32), hess_w
+    if obj == "huber":
+        inside = np.abs(diff) <= alpha
+        g = np.where(inside, wt(diff), wt(np.sign(diff)) * alpha)
+        return g.astype(f32), hess_w
+    if obj == "fair":
+        c = p.get("fair_c", 1.0)
+        ax = np.abs(diff)
+        return wt(c * diff / (ax + c)).astype(f32), wt(c * c / ((ax + c) * (ax + c))).astype(f32)
+    if obj == "poisson":
+        emds = math.exp(p.get("poisson_max_delta_step", 0.7))
+        e = _cexp(score)
+        return wt(e - y).astype(f32), wt(e * emds).astype(f32)
+    if obj == "quantile":
+        delta = diff.astype(f32)
+        pos, neg = f32(1.0) - a32, -a32
+        if w32 is None:
+            g = np.where(delta >= 0, pos, neg).astype(f32)
+        else:
+            g = np.where(delta >= 0, pos * w32, neg * w32).astype(f32)
+        return g, hess_w
+    if obj == "mape":
+        return (np.sign(diff) * lw32.astype(np.float64)).astype(f32), hess_w
+    if obj == "gamma":
+        e = _cexp(-score)
+        return wt(1.0 - y * e).astype(f32), wt(y * e).astype(f32)
+    if obj == "tweedie":
+        rho = p.get("tweedie_variance_power", 1.5)
+        e1, e2 = _cexp((1 - rho) * score), _cexp((2 - rho) * score)
+        return wt(-y * e1 + e2).astype(f32), wt(-y * (1 - rho) * e1 + (2 - rho) * e2).astype(f32)
+    raise AssertionError(f"no reference for objective {obj}")
+
+
 def _reference_gradients(case):
     """float64 NumPy evaluation of upstream objective formulas, rounded to float32."""
     p = case.full_params
     y = case.y.astype(np.float32).astype(np.float64)
     w = None if case.weight is None else case.weight.astype(np.float32).astype(np.float64)
     ww = np.ones_like(y) if w is None else w
+    if case.objective != "regression" and case.objective in REGRESSION_OBJECTIVES:
+        return _reference_regression_gradients(case, y, w)
     if case.objective == "regression":
         if p.get("reg_sqrt"):
             # upstream stores the transformed label as label_t (float32)
@@ -182,7 +308,9 @@ def test_metrics_and_early_stopping(case, recorder):
     rec.finish()
 
 
-MT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_basic", "reg_100_rounds", "bin_100_rounds")]
+MT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_basic", "reg_100_rounds", "bin_100_rounds",
+                                           "l1_weighted", "quantile_basic", "mape_weighted", "poisson_weighted",
+                                           "tweedie_basic")]
 
 
 @pytest.mark.parametrize("case", MT_CASES, ids=[c.name for c in MT_CASES])

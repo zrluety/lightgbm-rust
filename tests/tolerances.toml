@@ -22,7 +22,8 @@ the same greedy algorithm; any difference is a bug, not round-off."""
 mode = "exact"
 rationale = """Upstream does not expose gradients, so the reference is a float64 NumPy
 evaluation of the upstream formulas rounded to float32 (the score_t/float
-type upstream uses). Engine-level gradient parity is established indirectly
+type upstream uses), with float32 intermediates where upstream uses them
+(quantile, MAPE weights, percentiles) and the C library exp. Engine-level gradient parity is established indirectly
 by exact leaf values, which are sums of these gradients."""
 
 [tree_structure]
@@ -76,8 +77,9 @@ parameters; exact equality is the model-format compatibility criterion."""
 mode = "rtol"
 rtol = 1e-5
 atol = 1e-9
-rationale = """Upstream sums row-wise histograms per thread and then merges them, so the
-float summation order depends on the thread count; lightgbm-rust builds
-histograms per feature and its result does not depend on thread count.
-Structure may legitimately differ after a near-tie, so only predictions are
+rationale = """Upstream sums row-wise histograms per thread block and then merges them, so
+the float summation order depends on the thread count. lightgbm-rust mirrors
+the upstream block split and merge order, so results are expected to match,
+but OpenMP scheduling is not part of upstream's contract and structure may
+legitimately differ after a near-tie. Only predictions and leaf values are
 compared, and results are reported separately from single-thread parity."""

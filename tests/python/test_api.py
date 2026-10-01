@@ -62,6 +62,19 @@ def test_invalid_parameter_message_matches_upstream_check():
         lgb.train({**BASE, "num_leaves": 1}, lgb.Dataset(X, label=y), 2)
 
 
+@pytest.mark.parametrize(
+    ("params", "label_scale", "message"),
+    [
+        ({"objective": "huber", "reg_sqrt": True}, 1.0, "Cannot use sqrt transform in huber Regression, will auto disable it"),
+        ({"objective": "mape"}, 0.5, "Some label values are < 1 in absolute value. MAPE is unstable with such values"),
+    ],
+)
+def test_objective_warnings_match_upstream(capsys, params, label_scale, message):
+    X, y = _data()
+    lgb.train({**BASE, "verbosity": 0, **params}, lgb.Dataset(X, label=y * label_scale), 1)
+    assert f"[LightGBM] [Warning] {message}" in capsys.readouterr().out
+
+
 def test_feature_count_mismatch_on_predict():
     X, y = _data()
     bst = lgb.train({**BASE, "objective": "binary"}, lgb.Dataset(X, label=y), 2)

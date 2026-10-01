@@ -62,6 +62,7 @@ pub struct Gbdt {
     pub(crate) feature_infos: Vec<String>,
     train: Option<TrainState>,
     pool: Option<Arc<rayon::ThreadPool>>,
+    warnings: Vec<String>,
 }
 
 fn build_pool(num_threads: i32) -> Result<Option<Arc<rayon::ThreadPool>>> {
@@ -91,7 +92,14 @@ impl Gbdt {
             feature_infos: Vec::new(),
             train: None,
             pool: None,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Drain the upstream warnings raised while creating the booster
+    /// (objective construction and initialization).
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Create a booster for training. `objective` overrides the built-in one
@@ -108,8 +116,10 @@ impl Gbdt {
             None => create_objective(&config)?,
         };
         let n = train.num_data();
+        let mut warnings = Vec::new();
         if let Some(o) = objective.as_mut() {
             o.init(&train.metadata, n)?;
+            warnings = o.take_warnings();
         }
         let ntpi = objective.as_ref().map_or(1, |o| o.num_outputs());
         let class_need_train = (0..ntpi)
@@ -161,6 +171,7 @@ impl Gbdt {
             config: Some(config),
             loaded_parameters: None,
             pool,
+            warnings,
         })
     }
 
@@ -169,7 +180,7 @@ impl Gbdt {
             .metric
             .iter()
             .filter(|m| m.as_str() != "custom")
-            .map(|m| Ok(Metric::new(MetricKind::from_name(m)?, &data.metadata)))
+            .map(|m| Metric::new(MetricKind::from_name(m)?, &data.metadata, config))
             .collect()
     }
 
@@ -354,6 +365,31 @@ impl Gbdt {
 
             if tree.num_leaves > 1 {
                 should_continue = true;
+                if let Some(obj) = self.objective.as_ref().filter(|o| o.is_renew_tree_output()) {
+                    // upstream: SerialTreeLearner::RenewTreeOutput, before shrinkage
+                    let st = self.train.as_ref().unwrap();
+                    let part = st.learner.partition();
+                    let scores = &st.scores[offset..offset + n];
+                    let renew = || -> Vec<Option<f64>> {
+                        use rayon::prelude::*;
+                        (0..tree.num_leaves)
+                            .into_par_iter()
+                            .map(|leaf| {
+                                let idx = part.indices_on_leaf(leaf);
+                                (!idx.is_empty()).then(|| obj.renew_leaf_output(idx, scores))
+                            })
+                            .collect()
+                    };
+                    let outputs = match &self.pool {
+                        Some(p) => p.install(renew),
+                        None => renew(),
+                    };
+                    for (leaf, v) in outputs.into_iter().enumerate() {
+                        if let Some(v) = v {
+                            tree.set_leaf_output(leaf, v);
+                        }
+                    }
+                }
                 tree.shrink(cfg.learning_rate);
                 let st = self.train.as_mut().unwrap();
                 let mut update = || {

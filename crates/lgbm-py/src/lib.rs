@@ -274,9 +274,10 @@ impl RsBooster {
     #[staticmethod]
     fn for_training(py: Python<'_>, train: PyRef<'_, RsDataset>, params: Vec<(String, String)>) -> PyResult<Self> {
         let cfg = config_from(params)?;
-        let warnings = cfg.warnings.clone();
+        let mut warnings = cfg.warnings.clone();
         let data = train.inner.clone();
-        let inner = detached(py, || Gbdt::new(cfg, data, None))?;
+        let mut inner = detached(py, || Gbdt::new(cfg, data, None))?;
+        warnings.extend(inner.take_warnings());
         Ok(Self { inner, warnings })
     }
 

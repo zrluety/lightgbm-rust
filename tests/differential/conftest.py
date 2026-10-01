@@ -172,12 +172,28 @@ def _features(rng: np.random.Generator, n: int, p: int, kind: str) -> np.ndarray
     return X
 
 
+REGRESSION_OBJECTIVES = ("regression", "regression_l1", "huber", "fair", "poisson", "quantile", "mape", "gamma",
+                         "tweedie")
+
+
 def _target(rng: np.random.Generator, X: np.ndarray, objective: str) -> np.ndarray:
     Z = np.nan_to_num(X)
     f = np.tanh(Z[:, 0]) * 2 + 0.5 * Z[:, 1] - 0.3 * Z[:, 2] * (Z[:, 0] > 0)
-    if objective == "regression":
-        return f + rng.normal(scale=0.5, size=len(f))
-    return (rng.random(len(f)) < 1 / (1 + np.exp(-f))).astype(np.float64)
+    n = len(f)
+    if objective in ("regression", "regression_l1", "huber", "fair", "quantile"):
+        return f + rng.normal(scale=0.5, size=n)
+    if objective == "mape":
+        # spans |label| < 1 (clamped to 1 in the MAPE weights) and larger values
+        return (f + rng.normal(scale=0.5, size=n)) * 3
+    if objective == "poisson":
+        return rng.poisson(np.exp(f / 2)).astype(np.float64)
+    if objective == "gamma":
+        return rng.gamma(2.0, np.exp(f / 2) / 2.0)
+    if objective == "tweedie":
+        # compound Poisson-gamma: exact zeros plus a continuous positive part
+        counts = rng.poisson(np.exp(f / 2) * 0.8)
+        return np.array([rng.gamma(2.0, 0.5, size=k).sum() for k in counts])
+    return (rng.random(n) < 1 / (1 + np.exp(-f))).astype(np.float64)
 
 
 def make_case(name: str, objective: str, params: Dict[str, Any], *, n: int = 3000, p: int = 6,
@@ -225,6 +241,26 @@ CASES = [
     make_case("bin_sigmoid", "binary", {"sigmoid": 0.7}),
     make_case("bin_init_score", "binary", {}, init_score=True),
     make_case("bin_100_rounds", "binary", {"num_leaves": 63, "min_data_in_leaf": 10}, n=8000, rounds=100),
+    make_case("reg_loss_metrics", "regression", {"metric": ["quantile", "huber", "fair", "mape"], "alpha": 0.7}),
+    make_case("l1_basic", "regression_l1", {}),
+    make_case("l1_weighted", "regression_l1", {}, weighted=True),
+    make_case("l1_sqrt", "regression_l1", {"reg_sqrt": True}),
+    make_case("l1_no_boost_from_average", "regression_l1", {"boost_from_average": False}),
+    make_case("huber_basic", "huber", {}),
+    make_case("huber_weighted", "huber", {"alpha": 0.5}, weighted=True),
+    make_case("fair_basic", "fair", {"fair_c": 0.5}),
+    make_case("fair_weighted", "fair", {}, weighted=True),
+    make_case("poisson_basic", "poisson", {}),
+    make_case("poisson_weighted", "poisson", {"poisson_max_delta_step": 0.3}, weighted=True),
+    make_case("quantile_basic", "quantile", {"alpha": 0.3}),
+    make_case("quantile_weighted", "quantile", {}, weighted=True),
+    make_case("quantile_init_score", "quantile", {"alpha": 0.6}, init_score=True),
+    make_case("mape_basic", "mape", {}),
+    make_case("mape_weighted", "mape", {}, weighted=True),
+    make_case("gamma_basic", "gamma", {"metric": ["gamma", "gamma_deviance"]}),
+    make_case("gamma_weighted", "gamma", {}, weighted=True),
+    make_case("tweedie_basic", "tweedie", {"tweedie_variance_power": 1.2}),
+    make_case("tweedie_weighted", "tweedie", {"metric": ["tweedie", "poisson", "l2"]}, weighted=True),
 ]
 
 

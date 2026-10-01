@@ -91,7 +91,8 @@ const HONORED: &[&str] = &[
     "boost_from_average", "reg_sqrt", "num_class", "metric", "saved_feature_importance_type",
     "start_iteration_predict", "num_iteration_predict", "predict_raw_score",
     "predict_leaf_index", "predict_disable_shape_check", "is_provide_training_metric",
-    "force_col_wise", "force_row_wise",
+    "force_col_wise", "force_row_wise", "alpha", "fair_c", "poisson_max_delta_step",
+    "tweedie_variance_power",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -110,7 +111,6 @@ const NO_EFFECT: &[&str] = &[
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
     "local_listen_port", "time_out", "machine_list_filename", "machines",
     // Objective-specific knobs of objectives that are gated via `objective`.
-    "alpha", "fair_c", "poisson_max_delta_step", "tweedie_variance_power",
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
     "lambdarank_position_bias_regularization", "eval_at", "multi_error_top_k",
     "auc_mu_weights",
@@ -126,8 +126,14 @@ const NO_EFFECT: &[&str] = &[
     "convert_model_language", "convert_model", "parser_config_file",
 ];
 
-pub const SUPPORTED_OBJECTIVES: &[&str] = &["regression", "binary"];
-pub const SUPPORTED_METRICS: &[&str] = &["l2", "rmse", "l1", "binary_logloss", "binary_error", "auc"];
+pub const SUPPORTED_OBJECTIVES: &[&str] = &[
+    "regression", "regression_l1", "huber", "fair", "poisson", "quantile", "mape", "gamma", "tweedie",
+    "binary",
+];
+pub const SUPPORTED_METRICS: &[&str] = &[
+    "l2", "rmse", "l1", "quantile", "huber", "fair", "poisson", "mape", "gamma", "gamma_deviance",
+    "tweedie", "binary_logloss", "binary_error", "auc",
+];
 
 /// upstream: include/LightGBM/config.h `ParseObjectiveAlias`.
 pub fn parse_objective_alias(t: &str) -> String {
@@ -311,6 +317,11 @@ pub struct Config {
     pub sigmoid: f64,
     pub boost_from_average: bool,
     pub reg_sqrt: bool,
+    /// Huber delta and quantile level.
+    pub alpha: f64,
+    pub fair_c: f64,
+    pub poisson_max_delta_step: f64,
+    pub tweedie_variance_power: f64,
     pub num_class: i32,
     pub saved_feature_importance_type: i32,
     pub is_provide_training_metric: bool,
@@ -363,6 +374,10 @@ impl Default for Config {
             sigmoid: 1.0,
             boost_from_average: true,
             reg_sqrt: false,
+            alpha: 0.9,
+            fair_c: 1.0,
+            poisson_max_delta_step: 0.7,
+            tweedie_variance_power: 1.5,
             num_class: 1,
             saved_feature_importance_type: 0,
             is_provide_training_metric: false,
@@ -566,6 +581,10 @@ impl Config {
         set_f64!(sigmoid);
         set_bool!(boost_from_average);
         set_bool!(reg_sqrt);
+        set_f64!(alpha);
+        set_f64!(fair_c);
+        set_f64!(poisson_max_delta_step);
+        set_f64!(tweedie_variance_power);
         set_int!(num_class);
         set_int!(saved_feature_importance_type);
         set_bool!(is_provide_training_metric);
@@ -674,6 +693,10 @@ impl Config {
             "sigmoid" => g(self.sigmoid),
             "boost_from_average" => b(self.boost_from_average),
             "reg_sqrt" => b(self.reg_sqrt),
+            "alpha" => g(self.alpha),
+            "fair_c" => g(self.fair_c),
+            "poisson_max_delta_step" => g(self.poisson_max_delta_step),
+            "tweedie_variance_power" => g(self.tweedie_variance_power),
             "num_class" => self.num_class.to_string(),
             "saved_feature_importance_type" => self.saved_feature_importance_type.to_string(),
             _ => return self.explicit.get(name).cloned(),

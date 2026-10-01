@@ -28,6 +28,18 @@ fn check_row_objective(
     scores: &[f64],
     loss: impl Fn(usize, f64) -> f64,
 ) {
+    check_row_objective_with(obj, meta, scores, loss, true);
+}
+
+/// `check_hess = false` for losses whose upstream Hessian is a deliberate
+/// constant rather than the second derivative (L1, Huber, quantile, MAPE).
+fn check_row_objective_with(
+    obj: &mut dyn RowObjective,
+    meta: &Metadata,
+    scores: &[f64],
+    loss: impl Fn(usize, f64) -> f64,
+    check_hess: bool,
+) {
     let n = scores.len();
     obj.init(meta, n).unwrap();
     let mut g = vec![0.0f32; n];
@@ -37,8 +49,14 @@ fn check_row_objective(
         let (fg, fh) = fd(|s| loss(i, s), scores[i]);
         // f32 gradient storage limits agreement to ~1e-6 relative.
         assert!((g[i] as f64 - fg).abs() <= 1e-5 * (1.0 + fg.abs()), "grad row {i}: {} vs {fg}", g[i]);
-        assert!((h[i] as f64 - fh).abs() <= 1e-3 * (1.0 + fh.abs()), "hess row {i}: {} vs {fh}", h[i]);
+        if check_hess {
+            assert!((h[i] as f64 - fh).abs() <= 1e-3 * (1.0 + fh.abs()), "hess row {i}: {} vs {fh}", h[i]);
+        }
     }
+}
+
+fn regression_obj(pairs: &[(&str, &str)]) -> regression::Regression {
+    regression::Regression::new(&Config::from_pairs(pairs.iter().copied()).unwrap()).unwrap()
 }
 
 #[test]
@@ -47,11 +65,83 @@ fn l2_matches_finite_differences() {
     let weight = vec![1.0f32, 0.5, 2.0, 1.5];
     let scores = [0.1, 0.2, -0.3, 4.0];
     let meta = Metadata { label: label.clone(), weight: None, init_score: None };
-    let mut o = regression::RegressionL2::with_sqrt(false);
+    let mut o = regression_obj(&[("objective", "regression")]);
     check_row_objective(&mut o, &meta, &scores, |i, s| l2_loss(s, label[i] as f64, 1.0));
     let meta_w = Metadata { label: label.clone(), weight: Some(weight.clone()), init_score: None };
-    let mut o = regression::RegressionL2::with_sqrt(false);
+    let mut o = regression_obj(&[("objective", "regression")]);
     check_row_objective(&mut o, &meta_w, &scores, |i, s| l2_loss(s, label[i] as f64, weight[i] as f64));
+}
+
+#[test]
+fn regression_losses_match_finite_differences() {
+    let label = vec![0.5f32, 1.0, 2.0, 3.25, 0.75];
+    let weight = vec![1.0f32, 0.5, 2.0, 1.5, 0.25];
+    // keep |score - label| away from the kinks of L1/Huber/quantile
+    let scores = [0.1, 1.7, -0.3, 4.0, 0.2];
+    let (alpha, c, rho) = (0.8f64, 1.3f64, 1.4f64);
+    let a32 = alpha as f32 as f64;
+    type Loss = Box<dyn Fn(f64, f64) -> f64>;
+    type Case<'a> = (&'a str, Vec<(&'a str, String)>, Loss, bool);
+    let cases: Vec<Case> = vec![
+        ("fair", vec![("fair_c", c.to_string())], Box::new(move |s, y| {
+            let x = (s - y).abs();
+            c * x - c * c * (1.0 + x / c).ln()
+        }), true),
+        ("poisson", vec![("poisson_max_delta_step", "1e-300".into())], Box::new(|s, y| s.exp() - y * s), true),
+        ("gamma", vec![], Box::new(|s, y| y * (-s).exp() + s), true),
+        ("tweedie", vec![("tweedie_variance_power", rho.to_string())], Box::new(move |s, y| {
+            -y * ((1.0 - rho) * s).exp() / (1.0 - rho) + ((2.0 - rho) * s).exp() / (2.0 - rho)
+        }), true),
+        ("huber", vec![("alpha", alpha.to_string())], Box::new(move |s, y| {
+            let d = s - y;
+            if d.abs() <= alpha { 0.5 * d * d } else { alpha * (d.abs() - 0.5 * alpha) }
+        }), false),
+        ("regression_l1", vec![], Box::new(|s, y| (s - y).abs()), false),
+        ("quantile", vec![("alpha", alpha.to_string())], Box::new(move |s, y| {
+            let d = y - s;
+            if d < 0.0 { (a32 - 1.0) * d } else { a32 * d }
+        }), false),
+        ("mape", vec![], Box::new(|s, y| (s - y).abs() / y.abs().max(1.0)), false),
+    ];
+    for (name, extra, loss, check_hess) in cases {
+        for weighted in [false, true] {
+            let mut pairs = vec![("objective", name.to_string())];
+            pairs.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
+            let mut o = regression::Regression::new(&Config::from_pairs(pairs).unwrap()).unwrap();
+            let meta = Metadata {
+                label: label.clone(),
+                weight: weighted.then(|| weight.clone()),
+                init_score: None,
+            };
+            let w = |i: usize| if weighted { weight[i] as f64 } else { 1.0 };
+            check_row_objective_with(&mut o, &meta, &scores, |i, s| w(i) * loss(s, label[i] as f64), check_hess);
+        }
+    }
+}
+
+#[test]
+fn regression_boost_from_score_and_renew() {
+    let meta = Metadata { label: vec![1.0, 5.0, 2.0, 9.0, 3.0], weight: None, init_score: None };
+    let mut l1 = regression_obj(&[("objective", "l1")]);
+    l1.init(&meta, 5).unwrap();
+    assert_eq!(l1.boost_from_score(0), 3.0);
+    assert!(l1.is_renew_tree_output());
+    // residuals label - score over rows {0, 1, 3}: 1, 5, 9 -> median 5
+    assert_eq!(l1.renew_leaf_output(&[0, 1, 3], &[0.0; 5]), 5.0);
+    let mut p = regression_obj(&[("objective", "poisson")]);
+    p.init(&meta, 5).unwrap();
+    assert_eq!(p.boost_from_score(0), 4.0f64.ln());
+    assert!(!p.is_renew_tree_output());
+    let mut out = [0.0];
+    p.convert_output(&[1.0], &mut out);
+    assert_eq!(out[0], 1.0f64.exp());
+    let bad = Metadata { label: vec![1.0, -1.0], weight: None, init_score: None };
+    let e = regression_obj(&[("objective", "gamma")]).init(&bad, 2).unwrap_err();
+    assert!(e.to_string().contains("[gamma]: at least one target label is negative"), "{e}");
+    let zero = Metadata { label: vec![0.0, 0.0], weight: None, init_score: None };
+    assert!(regression_obj(&[("objective", "tweedie")]).init(&zero, 2).is_err());
+    let cfg = Config::from_pairs([("objective", "quantile"), ("alpha", "1.5")]);
+    assert!(cfg.is_err() || regression::Regression::new(&cfg.unwrap()).is_err());
 }
 
 #[test]

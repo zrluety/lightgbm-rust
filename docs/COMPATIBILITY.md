@@ -29,7 +29,7 @@ The **evidence** referred to throughout comes from three places:
 - **Upstream tests (U):** upstream's own `tests/python_package_test`, run unmodified through the import shim.
 - **Rust tests (R):** `cargo test -p lgbm-core`, including the ported C++ tests.
 
-Upstream-suite totals: **130 passed, 0 failed, 448 unsupported, 14 skipped**. On top of those cases, `test_sklearn.py` (65 functions) cannot be collected, and `test_dask.py` (32 functions) is skipped because dask is not installed.
+Upstream-suite totals: **140 passed, 0 failed, 438 unsupported, 14 skipped**. On top of those cases, `test_sklearn.py` (65 functions) cannot be collected, and `test_dask.py` (32 functions) is skipped because dask is not installed.
 
 ## Python API surface
 
@@ -95,7 +95,7 @@ Upstream-suite totals: **130 passed, 0 failed, 448 unsupported, 14 skipped**. On
 |---|---|---|---|---|---|---|---|
 | `regression` (L2), incl. `reg_sqrt` | implemented | verified | verified | partial | D: all `reg_*` cases, `gradients` exact; U: `test_regression[regression]`, `test_constant_features_regression`; R: finite-difference tests | gradients (exact) | – |
 | `binary` (logloss), incl. `sigmoid`, `is_unbalance`, `scale_pos_weight` | implemented | verified | verified | partial | D: all `bin_*` cases, `gradients` exact; U: `test_binary`, `test_constant_features_binary`; R: finite-difference tests | gradients (exact) | – |
-| `regression_l1`, `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie` | not started | not started | not started | not started | U: e.g. `test_regression[huber/fair/poisson/quantile]` unsupported | – | – |
+| `regression_l1`, `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`, with `alpha`, `fair_c`, `poisson_max_delta_step`, `tweedie_variance_power`, `reg_sqrt` | implemented | verified | verified | partial | D: `l1_*`, `huber_*`, `fair_*`, `poisson_*`, `quantile_*`, `mape_*`, `gamma_*`, `tweedie_*` (unweighted and weighted; `l1_sqrt`, `l1_no_boost_from_average`, `quantile_init_score`): gradients, model text, trees, and predictions exact, and 4-thread runs for five of them; U: `test_regression[regression_l1/huber/fair/poisson/quantile]`, `test_weighted_percentile_inside_label_range[regression_l1/quantile/mape]`; R: finite-difference tests, `BoostFromScore` and leaf-renewal tests | gradients (exact) | Leaf renewal (`RenewTreeOutput` for L1, quantile, MAPE) uses the upstream percentile functions, including float32 interpolation. Label checks (negative labels, zero label sum, quantile `alpha` range) fail with the upstream messages. `test_mape_for_specific_boosting_types` is still unsupported because it needs DART/rf with bagging. |
 | `multiclass`, `multiclassova` | not started | not started | not started | not started | U: multiclass 8 unsupported | – | The booster supports several trees per iteration internally, but no multi-output objective is implemented. |
 | `cross_entropy`, `cross_entropy_lambda`, `lambdarank`, `rank_xendcg` | not started | not started | not started | not started | U: ranking 4 unsupported | – | – |
 | Grouped / multi-output objective interface (`GroupedObjective`, `GradHessBlock`, `HessianMode`, `DiagonalReduction`) | implemented (Rust only) | implemented | implemented (`hessian_reduction:` recorded) | n/a | R: finite-difference test of a synthetic grouped objective with cross-row coupling | – | No concrete grouped objective is shipped. The hazard objective is a design note only ([hazard/design-note.md](hazard/design-note.md)). |
@@ -106,7 +106,8 @@ Upstream-suite totals: **130 passed, 0 failed, 448 unsupported, 14 skipped**. On
 |---|---|---|---|---|---|---|---|
 | `l2`, `rmse`, `l1`, `binary_logloss`, `binary_error`, `auc` | implemented | verified | n/a | implemented | D: `metrics` all exact (`reg_heavy_tail` for l1/rmse, `bin_basic` for auc/error); U: `test_default_objective_and_metric`, `test_record_evaluation_with_train` | metrics | – |
 | Custom `feval` (single and list) | implemented | verified | n/a | n/a | U: `test_multiple_feval_train`, `test_booster_eval_adds_new_valid_dataset` | – | – |
-| Other metrics (`mape`, `r2`, `average_precision`, `multi_logloss`, `ndcg`, `map`, `auc_mu`, ...) | not started | not started | n/a | not started | U: metrics 5 unsupported | – | – |
+| `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie` | implemented | verified | n/a | implemented | D: `metrics` exact (`reg_loss_metrics`, each objective's default metric, `gamma_basic` for gamma_deviance, `tweedie_weighted` for tweedie/poisson/l2); R: `regression_metric_values` | metrics | The gamma metrics reject labels ≤ 0 with upstream's `Check failed: (label) > (0)`. |
+| Other metrics (`r2`, `average_precision`, `multi_logloss`, `multi_error`, `ndcg`, `map`, `auc_mu`, `cross_entropy`, ...) | not started | not started | n/a | not started | U: `test_r2_metric`, `test_average_precision_metric` unsupported | – | – |
 
 ## Prediction
 

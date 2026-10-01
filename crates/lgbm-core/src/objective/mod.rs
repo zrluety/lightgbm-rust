@@ -14,6 +14,7 @@
 //! Score layout follows upstream: class-major, `scores[k * num_data + i]`.
 
 pub mod binary;
+pub mod percentile;
 pub mod regression;
 
 use crate::config::Config;
@@ -44,6 +45,11 @@ pub trait RowObjective: Send + Sync {
         1
     }
     fn init(&mut self, meta: &Metadata, num_data: usize) -> Result<()>;
+    /// Upstream `Log::Warning` messages raised while constructing or
+    /// initializing the objective; drained by the booster.
+    fn take_warnings(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// Writes `grad[k*n+i]`, `hess[k*n+i]` (f32 like upstream `score_t`).
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]);
     /// Initial raw score when `boost_from_average` is on.
@@ -52,6 +58,17 @@ pub trait RowObjective: Send + Sync {
     }
     fn class_need_train(&self, _output: usize) -> bool {
         true
+    }
+    /// upstream `IsRenewTreeOutput`: leaf values are recomputed from the
+    /// residuals after each tree is grown (L1, quantile, MAPE).
+    fn is_renew_tree_output(&self) -> bool {
+        false
+    }
+    /// upstream `RenewTreeOutput` for one leaf: `indices` are the leaf's rows
+    /// in partition order, `scores` the training scores before this tree.
+    /// Only called when [`is_renew_tree_output`](Self::is_renew_tree_output).
+    fn renew_leaf_output(&self, _indices: &[u32], _scores: &[f64]) -> f64 {
+        unreachable!("renew_leaf_output without is_renew_tree_output")
     }
     /// Map one row's raw outputs to the prediction scale.
     fn convert_output(&self, raw: &[f64], out: &mut [f64]) {
@@ -302,6 +319,13 @@ impl Objective {
         }
     }
 
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        match self {
+            Objective::Row(o) => o.take_warnings(),
+            Objective::Grouped { .. } => Vec::new(),
+        }
+    }
+
     pub fn boost_from_score(&self, k: usize) -> f64 {
         match self {
             Objective::Row(o) => o.boost_from_score(k),
@@ -313,6 +337,20 @@ impl Objective {
         match self {
             Objective::Row(o) => o.class_need_train(k),
             Objective::Grouped { .. } => true,
+        }
+    }
+
+    pub fn is_renew_tree_output(&self) -> bool {
+        match self {
+            Objective::Row(o) => o.is_renew_tree_output(),
+            Objective::Grouped { .. } => false,
+        }
+    }
+
+    pub fn renew_leaf_output(&self, indices: &[u32], scores: &[f64]) -> f64 {
+        match self {
+            Objective::Row(o) => o.renew_leaf_output(indices, scores),
+            Objective::Grouped { .. } => unreachable!("grouped objectives do not renew leaf outputs"),
         }
     }
 
@@ -361,7 +399,9 @@ impl Objective {
 /// Create a built-in objective from the config.
 pub fn create_objective(cfg: &Config) -> Result<Option<Objective>> {
     match cfg.objective.as_str() {
-        "regression" => Ok(Some(Objective::Row(Box::new(regression::RegressionL2::new(cfg))))),
+        o if regression::REGRESSION_OBJECTIVES.contains(&o) => {
+            Ok(Some(Objective::Row(Box::new(regression::Regression::new(cfg)?))))
+        }
         "binary" => Ok(Some(Objective::Row(Box::new(binary::BinaryLogloss::new(cfg)?)))),
         "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("objective={other}"))),
@@ -373,11 +413,10 @@ pub fn objective_from_model_string(s: &str) -> Result<Option<Objective>> {
     let mut toks = s.split_whitespace();
     let name = toks.next().unwrap_or("");
     let rest: Vec<&str> = toks.collect();
+    if let Some(r) = regression::Regression::for_prediction(name, &rest) {
+        return Ok(Some(Objective::Row(Box::new(r))));
+    }
     match name {
-        "regression" => {
-            let sqrt = rest.contains(&"sqrt");
-            Ok(Some(Objective::Row(Box::new(regression::RegressionL2::with_sqrt(sqrt)))))
-        }
         "binary" => {
             let mut sigmoid = 1.0;
             for t in &rest {
