@@ -294,24 +294,60 @@ def _is_allowed_numpy_dtype(dtype: type) -> bool:
     )
 
 
-def _pandas_to_numpy(data: Any, feature_name: Any, categorical_feature: Any) -> Tuple[np.ndarray, Optional[List[str]]]:
-    """upstream: ``_data_from_pandas`` for frames without categorical columns."""
+def _check_for_bad_pandas_dtypes(pandas_dtypes_series: Any) -> None:
+    bad = [f"{c}: {d}" for c, d in pandas_dtypes_series.items() if not _is_allowed_numpy_dtype(d.type)]
+    if bad:
+        raise ValueError(f"pandas dtypes must be int, float or bool.\nFields with bad pandas dtypes: {', '.join(bad)}")
+
+
+def _pandas_to_numpy(data: Any, target_dtype: Any) -> np.ndarray:
+    """upstream: ``_pandas_to_numpy``."""
+    _check_for_bad_pandas_dtypes(data.dtypes)
+    try:
+        return data.to_numpy(dtype=target_dtype, copy=False)
+    except TypeError:
+        return data.astype(target_dtype, copy=False).values
+    except ValueError:
+        return data.to_numpy(dtype=target_dtype, na_value=np.nan)
+
+
+def _data_from_pandas(
+    data: Any,
+    feature_name: Any,
+    categorical_feature: Any,
+    pandas_categorical: Optional[List[List]],
+) -> Tuple[np.ndarray, Any, Any, List[List]]:
+    """upstream: ``_data_from_pandas``.
+
+    Categorical columns become their integer codes (unknown or missing
+    values become NaN); the training frame's categories are recorded in
+    ``pandas_categorical`` and imposed on later frames.
+    """
     import pandas as pd
 
     if len(data.shape) != 2 or data.shape[0] < 1:
         raise ValueError("Input data must be 2 dimensional and non empty.")
-    names = [str(col) for col in data.columns] if feature_name == "auto" else None
-    if any(isinstance(dtype, pd.CategoricalDtype) for dtype in data.dtypes):
-        raise _unsupported("pandas categorical columns")
-    bad = [f"{c}: {d}" for c, d in data.dtypes.items() if not _is_allowed_numpy_dtype(d.type)]
-    if bad:
-        raise ValueError(f"pandas dtypes must be int, float or bool.\nFields with bad pandas dtypes: {', '.join(bad)}")
-    target_dtype = np.result_type(*[d.type for d in data.dtypes], np.float32)
-    try:
-        arr = data.to_numpy(dtype=target_dtype, copy=False)
-    except ValueError:
-        arr = data.to_numpy(dtype=target_dtype, na_value=np.nan)
-    return arr, names
+    data = data.copy(deep=False)
+    if feature_name == "auto":
+        feature_name = [str(col) for col in data.columns]
+    cat_cols = [col for col, dtype in zip(data.columns, data.dtypes) if isinstance(dtype, pd.CategoricalDtype)]
+    cat_cols_not_ordered: List[str] = [col for col in cat_cols if not data[col].cat.ordered]
+    if pandas_categorical is None:  # train dataset
+        pandas_categorical = [list(data[col].cat.categories) for col in cat_cols]
+    else:
+        if len(cat_cols) != len(pandas_categorical):
+            raise ValueError("train and valid dataset categorical_feature do not match.")
+        for col, category in zip(cat_cols, pandas_categorical):
+            if list(data[col].cat.categories) != list(category):
+                data[col] = data[col].cat.set_categories(category)
+    if cat_cols:
+        data[cat_cols] = data[cat_cols].apply(lambda x: x.cat.codes).replace({-1: np.nan})
+    if categorical_feature == "auto":
+        categorical_feature = cat_cols_not_ordered
+    df_dtypes = [dtype.type for dtype in data.dtypes]
+    df_dtypes.append(np.float32)
+    target_dtype = np.result_type(*df_dtypes)
+    return _pandas_to_numpy(data, target_dtype=target_dtype), feature_name, categorical_feature, pandas_categorical
 
 
 _SparseParts = Tuple[bool, np.ndarray, np.ndarray, np.ndarray, int, int]
@@ -367,13 +403,17 @@ def _matrix_nrows(mat: Union[np.ndarray, _SparseParts]) -> int:
 
 
 def _to_float_matrix(
-    data: Any, feature_name: Any = "auto", categorical_feature: Any = "auto", predict: bool = False
+    data: Any,
+    feature_name: Any = "auto",
+    predict: bool = False,
+    pandas_categorical: Optional[List[List]] = None,
 ) -> Tuple[Union[np.ndarray, _SparseParts], Optional[List[str]]]:
     """Convert supported inputs to a 2-D float32/float64 array, or the parts of a CSR/CSC matrix.
 
     float32/float64 arrays that are C- or F-contiguous are passed through
     unchanged (borrowed by the engine without copying). Other numeric dtypes
-    are converted to float32, like upstream ``_np2d_to_np1d``.
+    are converted to float32, like upstream ``_np2d_to_np1d``. pandas frames
+    go through ``_data_from_pandas`` with ``pandas_categorical``.
     """
     names: Optional[List[str]] = None
     if isinstance(data, (str, Path)):
@@ -388,7 +428,8 @@ def _to_float_matrix(
         values, nrow, ncol = _rs.arrow_table_to_columns(nw.from_native(data).__arrow_c_stream__())
         return values.reshape((ncol, nrow)).T, names
     if _is_pandas_df(data):
-        data, names = _pandas_to_numpy(data, feature_name, categorical_feature)
+        data, cols, _, _ = _data_from_pandas(data, feature_name, "auto", pandas_categorical)
+        names = cols if feature_name == "auto" else None
     elif isinstance(data, list) and data and all(isinstance(m, np.ndarray) for m in data):
         # upstream: Dataset.__init_from_list_np2d (rows of all chunks, in order)
         chunks = []
@@ -563,6 +604,25 @@ _DATASET_PARAMS = (
 )
 
 
+# upstream: the parameters of Dataset._lazy_init
+_LAZY_INIT_ARGS = frozenset(
+    (
+        "self",
+        "data",
+        "label",
+        "reference",
+        "weight",
+        "group",
+        "init_score",
+        "predictor",
+        "feature_name",
+        "categorical_feature",
+        "params",
+        "position",
+    )
+)
+
+
 class _InnerPredictor:
     """Prediction-only view of a model, used for continued training (upstream ``_InnerPredictor``).
 
@@ -660,30 +720,9 @@ class Dataset:
             return self._construct_subset()
         if self.data is None:
             raise ValueError("Cannot construct a Dataset whose raw data has been freed.")
-        cat = self.categorical_feature
-        if cat not in ("auto", None) and len(cat) > 0:
-            raise _unsupported("categorical features")
-        for alias in _ConfigAliases.get("categorical_feature"):
-            if self.params.get(alias) not in (None, "", []):
-                raise _unsupported("categorical features")
-
-        mat, names = _to_float_matrix(self.data, self.feature_name, self.categorical_feature)
-        if self.feature_name != "auto" and self.feature_name is not None:
-            names = list(self.feature_name)
-        self._has_non_default_feature_names = names is not None
-        n = _matrix_nrows(mat)
-        label = np.zeros(n, dtype=np.float32) if self.label is None else _label_to_numpy(self.label)
-        weight = None
-        if self.weight is not None and not _weight_is_all_ones(self.weight):
-            weight = _field_1d_to_numpy(self.weight, np.float32, "weight")
-        init_score = None
-        if self.init_score is not None:
-            init_score = _init_score_to_numpy(self.init_score)
 
         ref_rs = None
         if self.reference is not None:
-            self.reference.construct()
-            ref_rs = self.reference._rs
             # upstream: validation data inherits the reference's dataset parameters
             reference_params = self.reference.get_params()
             own_params = self.get_params()
@@ -694,7 +733,60 @@ class Dataset:
                 if a != b:
                     _log_warning("Overriding the parameters from Reference Dataset.")
                 self._update_params(reference_params)
+
+        # upstream: Dataset._lazy_init
+        data = self.data
+        feature_name = self.feature_name
+        categorical_feature = self.categorical_feature
+        if self.reference is not None:
+            self.pandas_categorical = self.reference.pandas_categorical
+            categorical_feature = self.reference.categorical_feature
+        if _is_pandas_df(data):
+            data, feature_name, categorical_feature, self.pandas_categorical = _data_from_pandas(
+                data, feature_name, categorical_feature, self.pandas_categorical
+            )
+        mat, names = _to_float_matrix(data, feature_name)
+        if feature_name != "auto" and feature_name is not None:
+            names = list(feature_name)
+        elif names is not None:
+            feature_name = names
+        self._has_non_default_feature_names = names is not None
+        n = _matrix_nrows(mat)
+        label = np.zeros(n, dtype=np.float32) if self.label is None else _label_to_numpy(self.label)
+        weight = None
+        if self.weight is not None and not _weight_is_all_ones(self.weight):
+            weight = _field_1d_to_numpy(self.weight, np.float32, "weight")
+        init_score = None
+        if self.init_score is not None:
+            init_score = _init_score_to_numpy(self.init_score)
         params = self.params
+        for key in params.keys():
+            if key in _LAZY_INIT_ARGS:
+                _log_warning(
+                    f"{key} keyword has been found in `params` and will be ignored.\n"
+                    f"Please use {key} argument of the Dataset constructor to pass this parameter."
+                )
+        if isinstance(categorical_feature, list):
+            categorical_indices = set()
+            feature_dict = {}
+            if isinstance(feature_name, list):
+                feature_dict = {name: i for i, name in enumerate(feature_name)}
+            for name in categorical_feature:
+                if isinstance(name, str) and name in feature_dict:
+                    categorical_indices.add(feature_dict[name])
+                elif isinstance(name, int):
+                    categorical_indices.add(name)
+                else:
+                    raise TypeError(f"Wrong type({type(name).__name__}) or unknown name({name}) in categorical_feature")
+            if categorical_indices:
+                for cat_alias in _ConfigAliases.get("categorical_feature"):
+                    if cat_alias in params:
+                        if not (isinstance(params[cat_alias], list) and set(params[cat_alias]) == categorical_indices):
+                            _log_warning(f"{cat_alias} in param dict is overridden.")
+                        params.pop(cat_alias, None)
+                params["categorical_column"] = sorted(categorical_indices)
+        if self.reference is not None:
+            ref_rs = self.reference.construct()._rs
         predictor = self._predictor
         if predictor is not None and not isinstance(predictor, _InnerPredictor):
             raise TypeError(f"Wrong predictor type {type(predictor).__name__}")
@@ -982,10 +1074,28 @@ class Dataset:
         return self
 
     def set_categorical_feature(self, categorical_feature: Any) -> "Dataset":
-        if categorical_feature not in ("auto", None) and len(categorical_feature) > 0:
-            raise _unsupported("categorical features")
-        self.categorical_feature = categorical_feature
-        return self
+        # upstream: Dataset.set_categorical_feature
+        if self.categorical_feature == categorical_feature:
+            return self
+        if self.data is not None:
+            if self.categorical_feature is None:
+                self.categorical_feature = categorical_feature
+                return self._free_handle()
+            elif categorical_feature == "auto":
+                return self
+            else:
+                if self.categorical_feature != "auto":
+                    _log_warning(
+                        "categorical_feature in Dataset is overridden.\n"
+                        f"New categorical_feature is {list(categorical_feature)}"
+                    )
+                self.categorical_feature = categorical_feature
+                return self._free_handle()
+        else:
+            raise LightGBMError(
+                "Cannot set categorical feature after freed raw data, "
+                "set free_raw_data=False when construct Dataset to avoid this."
+            )
 
     def get_label(self) -> Optional[np.ndarray]:
         if self.label is None and self._rs is not None:
@@ -1081,7 +1191,7 @@ class Dataset:
             raise LightGBMError("Cannot get feature_num_bin before construct dataset")
         if isinstance(feature, str):
             feature = self.get_feature_name().index(feature)
-        return len(self._rs.bin_upper_bounds(int(feature)))
+        return self._rs.feature_num_bin(int(feature))
 
     def subset(self, used_indices: List[int], params: Optional[Dict[str, Any]] = None) -> "Dataset":
         """Get subset of current Dataset (rows ``used_indices``, sharing its bin mappers)."""
@@ -1448,7 +1558,7 @@ class Booster:
             for i, (e, got) in enumerate(zip(expected, names)):
                 if e != got:
                     raise LightGBMError(f"Expected '{e}' at position {i} but found '{got}'")
-        mat, _ = _to_float_matrix(data, predict=True)
+        mat, _ = _to_float_matrix(data, predict=True, pandas_categorical=self.pandas_categorical)
         assert self._rs is not None
         if pred_contrib and isinstance(mat, tuple):
             sparse = self._predict_contrib_sparse(mat, int(start_iteration), int(num_iteration))
@@ -1708,7 +1818,7 @@ def _json_default_with_numpy(obj: Any) -> Any:
 
 
 def _dump_pandas_categorical(pandas_categorical: Optional[List[List]]) -> str:
-    return f"\npandas_categorical:{json.dumps(pandas_categorical)}\n"
+    return f"\npandas_categorical:{json.dumps(pandas_categorical, default=_json_default_with_numpy)}\n"
 
 
 def _load_pandas_categorical(model_str: str) -> Optional[List[List]]:

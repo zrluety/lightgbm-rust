@@ -357,8 +357,16 @@ impl Dataset {
         let n = mat.nrows();
         let ncol = mat.ncols();
         Self::validate_fields(n, ncol, &fields)?;
-        if !fields.categorical_features.is_empty() {
-            return Err(LgbmError::Unsupported("categorical features".into()));
+        let mut is_categorical = vec![false; ncol];
+        for c in cfg.categorical_indices()? {
+            if c >= 0 && (c as usize) < ncol {
+                is_categorical[c as usize] = true;
+            }
+        }
+        for &c in &fields.categorical_features {
+            if c < ncol {
+                is_categorical[c] = true;
+            }
         }
         if n > i32::MAX as usize {
             return Err(LgbmError::InvalidData("more than 2^31-1 rows".into()));
@@ -382,16 +390,36 @@ impl Dataset {
             zero_as_missing: cfg.zero_as_missing,
         };
         let columns: Vec<SampleColumn> = mat.sample_columns(&sample_indices);
-        let bin_mappers: Vec<BinMapper> = columns
+        let found: Vec<(BinMapper, Vec<String>)> = columns
             .par_iter()
-            .map(|col| BinMapper::find_bin(&col.values, total_sample_size, BinType::Numerical, &params))
+            .enumerate()
+            .map(|(c, col)| {
+                let bin_type = if is_categorical[c] { BinType::Categorical } else { BinType::Numerical };
+                let mut w = Vec::new();
+                BinMapper::find_bin_logged(&col.values, total_sample_size, bin_type, &params, &mut w).map(|m| (m, w))
+            })
             .collect::<Result<_>>()?;
+        let mut warnings = Vec::new();
+        let mut bin_mappers = Vec::with_capacity(found.len());
+        for (m, w) in found {
+            warnings.extend(w);
+            bin_mappers.push(m);
+        }
+        // upstream: DatasetLoader::CheckCategoricalFeatureNumBin
+        if bin_mappers.iter().any(|m| m.bin_type == BinType::Categorical && m.num_bin > cfg.max_bin) {
+            warnings.push("Categorical features with more bins than the configured maximum bin number found.".into());
+            warnings.push(
+                "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories."
+                    .into(),
+            );
+        }
 
         let (feature_names, replaced) = match fields.feature_names.clone() {
             Some(names) => sanitize_feature_names(names)?,
             None => ((0..ncol).map(|i| format!("Column_{i}")).collect(), false),
         };
         let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
+        ds.warnings = warnings;
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
         ds.upstream_inner = upstream_inner_order(
             &ds.bin_mappers,
@@ -679,6 +707,8 @@ impl Dataset {
                     && a.is_trivial == b.is_trivial
                     && a.default_bin == b.default_bin
                     && a.most_freq_bin == b.most_freq_bin
+                    && a.bin_type == b.bin_type
+                    && a.bin_2_categorical == b.bin_2_categorical
                     && a.bin_upper_bound.len() == b.bin_upper_bound.len()
                     && a.bin_upper_bound.iter().zip(&b.bin_upper_bound).all(|(x, y)| x.to_bits() == y.to_bits())
             })

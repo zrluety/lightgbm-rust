@@ -10,7 +10,7 @@ use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::DenseMatrix;
 use crate::matrix::Matrix;
 use crate::error::{LgbmError, Result};
-use crate::tree::Tree;
+use crate::tree::{Tree, find_in_bitset};
 
 /// Rows walked through each tree together, so that their (independent)
 /// root-to-leaf paths overlap in the pipeline.
@@ -23,26 +23,37 @@ struct Node {
     feature: u32,
     missing_type: i8,
     default_left: bool,
+    /// Index into `FlatTree::cat_bits` for categorical nodes, else -1.
+    cat: i32,
     /// `[left, right]`
     children: [i32; 2],
 }
 
 /// One tree in a compact layout for branchless traversal; decisions are
-/// those of `Tree::numerical_decision`.
+/// those of `Tree::decision`.
 struct FlatTree {
     nodes: Vec<Node>,
     depth: usize,
+    /// Category bitsets of the categorical nodes.
+    cat_bits: Vec<Vec<u32>>,
 }
 
 impl FlatTree {
     fn new(t: &Tree, ncol: usize) -> Self {
         let ni = t.num_leaves.saturating_sub(1);
+        let mut cat_bits = Vec::new();
         let nodes: Vec<Node> = (0..ni)
             .map(|n| Node {
                 threshold: t.threshold[n],
                 feature: (t.split_feature[n] as usize).min(ncol) as u32,
                 missing_type: (t.decision_type[n] >> 2) & 3,
                 default_left: t.decision_type[n] & 2 > 0,
+                cat: if t.is_categorical(n) {
+                    cat_bits.push(t.cat_bitset(n).to_vec());
+                    cat_bits.len() as i32 - 1
+                } else {
+                    -1
+                },
                 children: [t.left_child[n], t.right_child[n]],
             })
             .collect();
@@ -57,7 +68,25 @@ impl FlatTree {
                 }
             }
         }
-        Self { nodes, depth }
+        Self { nodes, depth, cat_bits }
+    }
+
+    /// `step` for trees with categorical nodes (upstream `CategoricalDecision`).
+    #[inline(always)]
+    fn step_any(&self, node: i32, row: &[f64]) -> i32 {
+        if node < 0 {
+            return node;
+        }
+        let n = &self.nodes[node as usize];
+        if n.cat < 0 {
+            return self.step(node, row);
+        }
+        let v = row[n.feature as usize];
+        let left = !v.is_nan() && {
+            let c = v as i32;
+            c >= 0 && find_in_bitset(&self.cat_bits[n.cat as usize], c)
+        };
+        n.children[!left as usize]
     }
 
     #[inline(always)]
@@ -86,9 +115,17 @@ impl FlatTree {
             return;
         }
         let mut node = [0i32; BLOCK];
-        for _ in 0..self.depth {
-            for r in 0..nb {
-                node[r] = self.step(node[r], &rows[r * stride..(r + 1) * stride]);
+        if self.cat_bits.is_empty() {
+            for _ in 0..self.depth {
+                for r in 0..nb {
+                    node[r] = self.step(node[r], &rows[r * stride..(r + 1) * stride]);
+                }
+            }
+        } else {
+            for _ in 0..self.depth {
+                for r in 0..nb {
+                    node[r] = self.step_any(node[r], &rows[r * stride..(r + 1) * stride]);
+                }
             }
         }
         for r in 0..nb {

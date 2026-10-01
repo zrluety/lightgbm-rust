@@ -50,8 +50,6 @@ def test_unsupported_features_raise_lightgbm_error():
     for params in ({"objective": "cross_entropy"}, {"cegb_tradeoff": 0.5}, {"boosting": "dart"}):
         with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet"):
             lgb.train({**BASE, **params}, lgb.Dataset(X, label=y), 2)
-    with pytest.raises(lgb.LightGBMError, match="categorical"):
-        lgb.Dataset(X, label=y, categorical_feature=[0]).construct()
     with pytest.raises(lgb.LightGBMError, match="not supported"):
         lgb.Dataset(X, label=y).construct().save_binary("unused.bin")
 

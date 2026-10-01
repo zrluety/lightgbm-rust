@@ -175,6 +175,15 @@ def _features(rng: np.random.Generator, n: int, p: int, kind: str) -> np.ndarray
         X = np.where(slot[:, None] == np.arange(p)[None, :], X, 0.0)
         X[:, 0] = rng.normal(size=n)
         X[rng.random(X.shape) < 0.01] = 1.5
+    elif kind == "categorical":
+        # col 1: 30 categories (+NaN, negatives -> NaN, fractional values truncated);
+        # col 3: 3 categories; col 4: 100 categories with a long tail of rare ones
+        X[:, 1] = rng.integers(0, 30, size=n)
+        X[rng.random(n) < 0.05, 1] = np.nan
+        X[rng.random(n) < 0.01, 1] = -2.0
+        X[rng.random(n) < 0.05, 1] += 0.4
+        X[:, 3] = rng.integers(0, 3, size=n)
+        X[:, 4] = np.minimum(rng.geometric(0.05, size=n) - 1, 99)
     return X
 
 
@@ -185,8 +194,15 @@ REGRESSION_OBJECTIVES = ("regression", "regression_l1", "huber", "fair", "poisso
 MULTICLASS_OBJECTIVES = ("multiclass", "multiclassova")
 
 
-def _target(rng: np.random.Generator, X: np.ndarray, objective: str, num_labels: int = 1) -> np.ndarray:
+def _target(rng: np.random.Generator, X: np.ndarray, objective: str, num_labels: int = 1,
+            kind: str = "normal") -> np.ndarray:
     Z = np.nan_to_num(X)
+    if kind == "categorical":
+        # unordered category effects (fixed pseudo-random lookup tables)
+        effect = np.random.default_rng(99).normal(size=(3, 100))
+        Z = Z.copy()
+        Z[:, 1] = effect[0, np.clip(Z[:, 1].astype(int), 0, 99)]
+        Z[:, 2] = Z[:, 2] + effect[1, Z[:, 3].astype(int)] + 0.5 * effect[2, Z[:, 4].astype(int)]
     f = np.tanh(Z[:, 0]) * 2 + 0.5 * Z[:, 1] - 0.3 * Z[:, 2] * (Z[:, 0] > 0)
     n = len(f)
     if objective in MULTICLASS_OBJECTIVES:
@@ -222,8 +238,8 @@ def make_case(name: str, objective: str, params: Dict[str, Any], *, n: int = 300
     num_labels = k if num_labels is None else num_labels
     X = _features(rng, n, p, kind)
     Xv = _features(rng, n // 3, p, kind)
-    y = _target(rng, X, objective, num_labels)
-    yv = _target(rng, Xv, objective, num_labels)
+    y = _target(rng, X, objective, num_labels, kind)
+    yv = _target(rng, Xv, objective, num_labels, kind)
     if imbalance:
         keep = (y == 1) | (rng.random(n) > imbalance)
         X, y = X[keep], y[keep]
@@ -321,6 +337,28 @@ CASES = [
     make_case("sampling_combo", "regression",
               {"bagging_fraction": 0.8, "bagging_freq": 2, "feature_fraction": 0.8, "feature_fraction_bynode": 0.7,
                "extra_trees": True, "num_leaves": 15}, n=6000, p=8, weighted=True),
+    # categorical features (upstream bin.cpp categorical FindBin, feature_histogram.hpp categorical split search)
+    make_case("cat_basic", "regression", {"categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("cat_onehot", "regression", {"categorical_feature": "1,3", "max_cat_to_onehot": 32},
+              kind="categorical"),
+    make_case("cat_params", "regression",
+              {"categorical_feature": "1,4", "cat_smooth": 1.0, "cat_l2": 1.0, "max_cat_threshold": 8,
+               "min_data_per_group": 10, "min_data_in_leaf": 5}, kind="categorical"),
+    make_case("cat_binary", "binary", {"categorical_feature": "1,3,4", "metric": ["binary_logloss", "auc"]},
+              kind="categorical"),
+    make_case("cat_multiclass", "multiclass", {"num_class": 3, "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("cat_weighted", "regression", {"categorical_feature": "1,3,4"}, kind="categorical", weighted=True),
+    make_case("cat_extra_trees", "regression", {"categorical_feature": "1,3,4", "extra_trees": True},
+              kind="categorical"),
+    make_case("cat_sampling", "regression",
+              {"categorical_feature": "1,3,4", "bagging_fraction": 0.7, "bagging_freq": 1,
+               "feature_fraction_bynode": 0.7}, kind="categorical"),
+    make_case("cat_max_bin", "regression", {"categorical_feature": "1,4", "max_bin": 15, "min_data_in_bin": 1},
+              kind="categorical"),
+    make_case("cat_no_missing", "regression", {"categorical_feature": "1,3,4", "use_missing": False},
+              kind="categorical"),
+    make_case("cat_100_rounds", "binary", {"categorical_feature": "1,3,4", "num_leaves": 63, "min_data_in_leaf": 10},
+              kind="categorical", n=8000, rounds=100),
 ]
 
 
@@ -385,7 +423,8 @@ def upstream_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
                 t["split_feature"][s] = node["split_feature"]
                 t["split_gain"][s] = node["split_gain"]
                 t["threshold"][s] = node["threshold"]
-                t["decision_type"][s] = (2 if node["default_left"] else 0) | (_MISSING[node["missing_type"]] << 2)
+                t["decision_type"][s] = ((1 if node["decision_type"] == "==" else 0) | (2 if node["default_left"] else 0)
+                                         | (_MISSING[node["missing_type"]] << 2))
                 t["left_child"][s] = idx(node["left_child"])
                 t["right_child"][s] = idx(node["right_child"])
                 t["internal_value"][s] = node["internal_value"]
@@ -410,7 +449,9 @@ def rust_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
         if not t["leaf_weight"]:
             # a reloaded one-leaf tree stores no weight; upstream_tree_arrays defaults the missing JSON key to 0.0
             t["leaf_weight"] = [0.0] * t["num_leaves"]
-        t["threshold"] = [avoid_inf(v) for v in t["threshold"]]
+        # categorical nodes: dump_model writes the category list as "a||b"
+        t["threshold"] = [avoid_inf(v) if c is None else "||".join(map(str, c))
+                          for v, c in zip(t["threshold"], t.pop("cat_threshold"))]
         t["split_gain"] = [avoid_inf(v) for v in t["split_gain"]]
     return trees
 

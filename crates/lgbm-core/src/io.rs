@@ -95,7 +95,16 @@ impl Gbdt {
         for (name, info) in self.feature_names.iter().zip(&self.feature_infos) {
             let Some(range) = info.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
                 if info != "none" {
-                    return Err(LgbmError::Unsupported("categorical features".into()));
+                    // categorical: the categories of each bin
+                    let vals: Vec<i32> = info
+                        .split(':')
+                        .map(|v| v.trim().parse::<i32>())
+                        .collect::<std::result::Result<_, _>>()
+                        .map_err(|_| LgbmError::ModelFormat(format!("bad feature_infos entry {info}")))?;
+                    let min = vals.iter().copied().min().unwrap_or(0);
+                    let max = vals.iter().copied().max().unwrap_or(0);
+                    let joined = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+                    infos.push(format!("\"{name}\":{{\"min_value\":{min},\"max_value\":{max},\"values\":[{joined}]}}"));
                 }
                 continue;
             };

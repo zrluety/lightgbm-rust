@@ -6,8 +6,6 @@
 //! blocks whose left/right parts are concatenated in block order (upstream
 //! `ParallelPartitionRunner`), which yields the same stable order.
 
-use super::goes_left;
-use super::split::FeatureMeta;
 use crate::dataset::BinColumn;
 use crate::threading::{SharedMut, ThreadTeam};
 
@@ -91,26 +89,15 @@ impl DataPartition {
         &self.indices[b..b + self.leaf_count[leaf]]
     }
 
-    /// Split `leaf` on a binned feature; left rows keep `leaf`, right rows
-    /// become `right_leaf`.
-    pub fn split(
-        &mut self,
-        team: &ThreadTeam,
-        leaf: usize,
-        col: &BinColumn,
-        meta: &FeatureMeta,
-        threshold: u32,
-        default_left: bool,
-        right_leaf: usize,
-    ) {
+    /// Split `leaf` on a binned feature; rows whose bin `b` has `lut[b]`
+    /// keep `leaf`, the others become `right_leaf`.
+    pub fn split(&mut self, team: &ThreadTeam, leaf: usize, col: &BinColumn, lut: &[bool], right_leaf: usize) {
         let begin = self.leaf_begin[leaf];
         let cnt = self.leaf_count[leaf];
-        let lut: Vec<bool> =
-            (0..meta.num_bin.max(1) as u32).map(|b| goes_left(b, meta, threshold, default_left)).collect();
         let left_cnt = match col {
-            BinColumn::U8(v) => self.split_typed(team, v, begin, cnt, &lut),
-            BinColumn::U16(v) => self.split_typed(team, v, begin, cnt, &lut),
-            BinColumn::U32(v) => self.split_typed(team, v, begin, cnt, &lut),
+            BinColumn::U8(v) => self.split_typed(team, v, begin, cnt, lut),
+            BinColumn::U16(v) => self.split_typed(team, v, begin, cnt, lut),
+            BinColumn::U32(v) => self.split_typed(team, v, begin, cnt, lut),
         };
         self.leaf_count[leaf] = left_cnt;
         self.leaf_begin[right_leaf] = begin + left_cnt;

@@ -1,6 +1,7 @@
 //! Decision tree model.
 //!
-//! upstream: include/LightGBM/tree.h, src/io/tree.cpp (numerical splits only).
+//! upstream: include/LightGBM/tree.h, src/io/tree.cpp (numerical and
+//! categorical splits; no linear trees).
 
 use std::collections::HashMap;
 
@@ -21,6 +22,29 @@ pub fn is_zero(v: f64) -> bool {
 #[inline]
 pub fn maybe_round_to_zero(v: f64) -> f64 {
     if is_zero(v) { 0.0 } else { v }
+}
+
+/// upstream: utils/common.h `ConstructBitset`.
+pub fn construct_bitset(vals: impl Iterator<Item = i32>) -> Vec<u32> {
+    let mut ret: Vec<u32> = Vec::new();
+    for v in vals {
+        let (i1, i2) = ((v / 32) as usize, v % 32);
+        if ret.len() < i1 + 1 {
+            ret.resize(i1 + 1, 0);
+        }
+        ret[i1] |= 1u32 << i2;
+    }
+    ret
+}
+
+/// upstream: utils/common.h `FindInBitset` (`pos >= 0`).
+#[inline]
+pub fn find_in_bitset(bits: &[u32], pos: i32) -> bool {
+    let i1 = (pos / 32) as usize;
+    if i1 >= bits.len() {
+        return false;
+    }
+    (bits[i1] >> (pos % 32)) & 1 == 1
 }
 
 /// One element of a TreeSHAP decision path (upstream `Tree::PathElement`).
@@ -108,6 +132,16 @@ pub struct Tree {
     pub internal_weight: Vec<f64>,
     pub internal_count: Vec<i32>,
     pub shrinkage: f64,
+    /// Number of categorical splits; node `n` of such a split stores its
+    /// index in `threshold`/`threshold_in_bin`.
+    pub num_cat: i32,
+    /// Bitset word ranges per categorical split (`num_cat + 1` entries).
+    pub cat_boundaries: Vec<i32>,
+    /// Bitsets of the categories sent left.
+    pub cat_threshold: Vec<u32>,
+    pub cat_boundaries_inner: Vec<i32>,
+    /// Bitsets of the bins sent left (training data only; not saved).
+    pub cat_threshold_inner: Vec<u32>,
 }
 
 /// Arguments of one numerical split (upstream `Tree::Split`).
@@ -151,7 +185,29 @@ impl Tree {
             internal_weight: Vec::with_capacity(m - 1),
             internal_count: Vec::with_capacity(m - 1),
             shrinkage: 1.0,
+            num_cat: 0,
+            cat_boundaries: vec![0],
+            cat_threshold: Vec::new(),
+            cat_boundaries_inner: vec![0],
+            cat_threshold_inner: Vec::new(),
         }
+    }
+
+    /// Categorical split of `leaf` (`a.threshold*` and `a.default_left` are
+    /// ignored); returns the index of the new (right) leaf.
+    ///
+    /// upstream: `Tree::SplitCategorical`.
+    pub fn split_categorical(&mut self, a: &SplitArgs, bitset_inner: &[u32], bitset: &[u32]) -> usize {
+        let args = SplitArgs { threshold_bin: self.num_cat as u32, threshold: self.num_cat as f64, default_left: false, ..*a };
+        let right = self.split(&args);
+        let node = self.decision_type.len() - 1;
+        self.decision_type[node] |= K_CATEGORICAL_MASK;
+        self.num_cat += 1;
+        self.cat_boundaries.push(self.cat_boundaries.last().unwrap() + bitset.len() as i32);
+        self.cat_threshold.extend_from_slice(bitset);
+        self.cat_boundaries_inner.push(self.cat_boundaries_inner.last().unwrap() + bitset_inner.len() as i32);
+        self.cat_threshold_inner.extend_from_slice(bitset_inner);
+        right
     }
 
     /// Split `leaf`; returns the index of the new (right) leaf.
@@ -275,6 +331,41 @@ impl Tree {
         if fval <= self.threshold[node] { self.left_child[node] } else { self.right_child[node] }
     }
 
+    #[inline]
+    pub fn is_categorical(&self, node: usize) -> bool {
+        self.decision_type[node] & K_CATEGORICAL_MASK > 0
+    }
+
+    /// Category bitset of categorical node `node`.
+    pub fn cat_bitset(&self, node: usize) -> &[u32] {
+        let c = self.threshold[node] as usize;
+        &self.cat_threshold[self.cat_boundaries[c] as usize..self.cat_boundaries[c + 1] as usize]
+    }
+
+    /// upstream: `Tree::CategoricalDecision` (NaN and negatives go right).
+    #[inline]
+    fn categorical_decision(&self, fval: f64, node: usize) -> i32 {
+        if fval.is_nan() {
+            return self.right_child[node];
+        }
+        let v = fval as i32;
+        if v >= 0 && find_in_bitset(self.cat_bitset(node), v) {
+            self.left_child[node]
+        } else {
+            self.right_child[node]
+        }
+    }
+
+    /// upstream: `Tree::Decision`.
+    #[inline]
+    pub fn decision(&self, fval: f64, node: usize) -> i32 {
+        if self.is_categorical(node) {
+            self.categorical_decision(fval, node)
+        } else {
+            self.numerical_decision(fval, node)
+        }
+    }
+
     /// Leaf index for one row of raw feature values (indexed by real feature).
     #[inline]
     pub fn get_leaf(&self, row: &[f64]) -> usize {
@@ -286,7 +377,7 @@ impl Tree {
             let n = node as usize;
             let f = self.split_feature[n] as usize;
             let v = if f < row.len() { row[f] } else { 0.0 };
-            node = self.numerical_decision(v, n);
+            node = self.decision(v, n);
         }
         !node as usize
     }
@@ -368,7 +459,7 @@ impl Tree {
             let n = node as usize;
             let feature = self.split_feature[n];
             let fval = row.get(feature as usize).copied().unwrap_or(0.0);
-            let hot_index = self.numerical_decision(fval, n);
+            let hot_index = self.decision(fval, n);
             let cold_index = if hot_index == self.left_child[n] { self.right_child[n] } else { self.left_child[n] };
             let w = self.data_count(node);
             let hot_zero_fraction = self.data_count(hot_index) / w;
@@ -406,6 +497,14 @@ impl Tree {
             let inner = self.split_feature_inner[n] as usize;
             let m = data.feature_bin_mapper(inner);
             let b = data.feature_bins(inner).get(i);
+            if self.is_categorical(n) {
+                // upstream: Tree::CategoricalDecisionInner
+                let c = self.threshold_in_bin[n] as usize;
+                let bits = &self.cat_threshold_inner
+                    [self.cat_boundaries_inner[c] as usize..self.cat_boundaries_inner[c + 1] as usize];
+                node = if find_in_bitset(bits, b as i32) { self.left_child[n] } else { self.right_child[n] };
+                continue;
+            }
             let mt = self.missing_type(n);
             let is_default = (mt == MissingType::Zero as i8 && b == m.default_bin)
                 || (mt == MissingType::NaN as i8 && b == (m.num_bin - 1) as u32);
@@ -465,7 +564,7 @@ impl Tree {
         let ni = n - 1;
         let mut s = String::new();
         s.push_str(&format!("num_leaves={n}\n"));
-        s.push_str("num_cat=0\n");
+        s.push_str(&format!("num_cat={}\n", self.num_cat));
         s.push_str(&format!("split_feature={}\n", join(&self.split_feature[..ni], |x| x.to_string())));
         s.push_str(&format!("split_gain={}\n", join(&self.split_gain[..ni], |x| fmt_g6(*x as f64))));
         s.push_str(&format!("threshold={}\n", join(&self.threshold[..ni], |x| fmt_g17(*x))));
@@ -480,6 +579,11 @@ impl Tree {
         s.push_str(&format!("internal_value={}\n", join(&self.internal_value[..ni], |x| fmt_g6(*x))));
         s.push_str(&format!("internal_weight={}\n", join(&self.internal_weight[..ni], |x| fmt_g6(*x))));
         s.push_str(&format!("internal_count={}\n", join(&self.internal_count[..ni], |x| x.to_string())));
+        if self.num_cat > 0 {
+            let nb = self.num_cat as usize + 1;
+            s.push_str(&format!("cat_boundaries={}\n", join(&self.cat_boundaries[..nb], |x| x.to_string())));
+            s.push_str(&format!("cat_threshold={}\n", join(&self.cat_threshold, |x| x.to_string())));
+        }
         s.push_str("is_linear=0\n");
         s.push_str(&format!("shrinkage={}\n", fmt_g6(self.shrinkage)));
         s.push('\n');
@@ -489,8 +593,9 @@ impl Tree {
     /// upstream: `Tree::ToJSON` (stream precision 17, i.e. `%.17g`).
     pub fn to_json(&self) -> String {
         let mut s = format!(
-            "\"num_leaves\":{},\n\"num_cat\":0,\n\"shrinkage\":{},\n",
+            "\"num_leaves\":{},\n\"num_cat\":{},\n\"shrinkage\":{},\n",
             self.num_leaves,
+            self.num_cat,
             fmt_g17(self.shrinkage)
         );
         if self.num_leaves == 1 {
@@ -516,13 +621,22 @@ impl Tree {
                 1 => "Zero",
                 _ => "NaN",
             };
+            let (threshold, op) = if self.is_categorical(i) {
+                let bits = self.cat_bitset(i);
+                let cats: Vec<String> = (0..bits.len() as i32 * 32)
+                    .filter(|&c| find_in_bitset(bits, c))
+                    .map(|c| c.to_string())
+                    .collect();
+                (format!("\"{}\"", cats.join("||")), "==")
+            } else {
+                (fmt_g17(avoid_inf_f64(self.threshold[i])), "<=")
+            };
             s.push_str(&format!(
-                "{{\n\"split_index\":{index},\n\"split_feature\":{},\n\"split_gain\":{},\n\"threshold\":{},\n\
-                 \"decision_type\":\"<=\",\n\"default_left\":{},\n\"missing_type\":\"{missing}\",\n\
+                "{{\n\"split_index\":{index},\n\"split_feature\":{},\n\"split_gain\":{},\n\"threshold\":{threshold},\n\
+                 \"decision_type\":\"{op}\",\n\"default_left\":{},\n\"missing_type\":\"{missing}\",\n\
                  \"internal_value\":{},\n\"internal_weight\":{},\n\"internal_count\":{},\n\"left_child\":",
                 self.split_feature[i],
                 fmt_g17(avoid_inf_f32(self.split_gain[i]) as f64),
-                fmt_g17(avoid_inf_f64(self.threshold[i])),
                 self.default_left(i),
                 fmt_g17(self.internal_value[i]),
                 fmt_g17(self.internal_weight[i]),
@@ -617,10 +731,12 @@ impl Tree {
         if num_leaves == 0 {
             return Err(LgbmError::ModelFormat("num_leaves must be >= 1".into()));
         }
-        let num_cat: i32 = need(&kv, "num_cat")?.trim().parse().unwrap_or(-1);
-        if num_cat != 0 {
-            return Err(LgbmError::Unsupported("models with categorical splits".into()));
-        }
+        let num_cat: i32 = need(&kv, "num_cat")?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&c| c >= 0)
+            .ok_or_else(|| LgbmError::ModelFormat("bad num_cat".into()))?;
         if kv.get("is_linear").is_some_and(|v| v.trim() != "0") {
             return Err(LgbmError::Unsupported("linear trees".into()));
         }
@@ -628,6 +744,7 @@ impl Tree {
         let ni = n - 1;
         let mut t = Tree::new(n);
         t.num_leaves = n;
+        t.num_cat = num_cat;
         t.leaf_value = arr_f64(need(&kv, "leaf_value")?, n, "leaf_value")?;
         t.shrinkage = kv.get("shrinkage").and_then(|s| crate::fmt::atof_legacy(s.trim())).unwrap_or(1.0);
         t.leaf_count = match kv.get("leaf_count") {
@@ -667,8 +784,31 @@ impl Tree {
                 Some(s) => arr(s, ni, "decision_type")?,
                 None => vec![0; ni],
             };
-            if t.decision_type.iter().any(|d| d & K_CATEGORICAL_MASK > 0) {
-                return Err(LgbmError::Unsupported("models with categorical splits".into()));
+            if num_cat > 0 {
+                let nb = num_cat as usize + 1;
+                t.cat_boundaries = arr(
+                    kv.get("cat_boundaries")
+                        .ok_or_else(|| LgbmError::ModelFormat("Tree model should contain cat_boundaries field.".into()))?,
+                    nb,
+                    "cat_boundaries",
+                )?;
+                if t.cat_boundaries[0] != 0 || t.cat_boundaries.windows(2).any(|w| w[0] > w[1]) {
+                    return Err(LgbmError::ModelFormat("cat_boundaries must be non-decreasing from 0".into()));
+                }
+                t.cat_threshold = arr(
+                    kv.get("cat_threshold")
+                        .ok_or_else(|| LgbmError::ModelFormat("Tree model should contain cat_threshold field".into()))?,
+                    t.cat_boundaries[nb - 1] as usize,
+                    "cat_threshold",
+                )?;
+            }
+            for node in 0..ni {
+                if t.decision_type[node] & K_CATEGORICAL_MASK > 0 {
+                    let c = t.threshold[node];
+                    if !(c >= 0.0 && (c as i32) < num_cat) {
+                        return Err(LgbmError::ModelFormat(format!("categorical split index {c} out of range")));
+                    }
+                }
             }
             for &c in t.left_child.iter().chain(&t.right_child) {
                 let ok = if c >= 0 { (c as usize) < ni } else { ((!c) as usize) < n };
@@ -759,6 +899,40 @@ mod tests {
         assert_eq!(t.get_leaf(&[2.0, 0.0, 0.1]), 1);
         assert_eq!(t.get_leaf(&[2.0, 0.0, f64::NAN]), 1); // NaN -> 0 for None missing
         assert_eq!(t.get_leaf(&[2.0, 0.0, 0.3]), 2);
+    }
+
+    #[test]
+    fn categorical_split_roundtrip() {
+        let mut t = two_split_tree();
+        let args = SplitArgs {
+            leaf: 2,
+            feature_inner: 2,
+            feature_real: 1,
+            threshold_bin: 0,
+            threshold: 0.0,
+            left_value: 3.0,
+            right_value: 4.0,
+            left_count: 7,
+            right_count: 8,
+            left_weight: 7.0,
+            right_weight: 8.0,
+            gain: 1.0,
+            missing_type: MissingType::NaN,
+            default_left: true,
+        };
+        // categories 1 and 33 go left
+        t.split_categorical(&args, &construct_bitset([2, 5].into_iter()), &construct_bitset([1, 33].into_iter()));
+        assert_eq!(t.num_cat, 1);
+        assert_eq!(t.decision_type[2], 1 | (2 << 2));
+        assert_eq!(t.cat_threshold, vec![2, 2]);
+        let leaf = |c: f64| t.get_leaf(&[2.0, c, 0.3]);
+        assert_eq!((leaf(1.0), leaf(33.9), leaf(2.0), leaf(-1.0), leaf(f64::NAN)), (2, 2, 3, 3, 3));
+        let s = t.to_model_string();
+        assert!(s.contains("num_cat=1\n") && s.contains("cat_boundaries=0 2\ncat_threshold=2 2\n"));
+        let (u, _) = Tree::from_model_str(&s).unwrap();
+        assert_eq!(u.to_model_string(), s);
+        assert_eq!(u.get_leaf(&[2.0, 33.0, 0.3]), 2);
+        assert!(t.to_json().contains("\"threshold\":\"1||33\",\n\"decision_type\":\"==\""));
     }
 
     #[test]

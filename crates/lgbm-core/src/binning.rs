@@ -3,10 +3,13 @@
 //! upstream: src/io/bin.cpp (`GreedyFindBin`, `FindBinWithZeroAsOneBin`,
 //! `BinMapper::FindBin`, `NeedFilter`) and include/LightGBM/bin.h
 //! (`BinMapper::ValueToBin`). Ported line-by-line, including integer/float
-//! promotion rules, so bin boundaries match upstream bit-for-bit.
+//! promotion rules, so bin boundaries and category bins match upstream
+//! bit-for-bit.
+
+use std::collections::HashMap;
 
 use crate::consts::{K_SPARSE_THRESHOLD, K_ZERO_THRESHOLD};
-use crate::error::{LgbmError, Result};
+use crate::error::Result;
 use crate::fmt::fmt_g17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,11 @@ pub struct BinMapper {
     pub max_val: f64,
     pub default_bin: u32,
     pub most_freq_bin: u32,
+    /// Category of each bin (bin 0 is the `-1` "other/NaN" bin); empty for
+    /// numerical features.
+    pub bin_2_categorical: Vec<i32>,
+    /// Inverse of `bin_2_categorical`.
+    pub categorical_2_bin: HashMap<i32, u32>,
 }
 
 impl Default for BinMapper {
@@ -70,6 +78,8 @@ impl Default for BinMapper {
             max_val: 0.0,
             default_bin: 0,
             most_freq_bin: 0,
+            bin_2_categorical: Vec::new(),
+            categorical_2_bin: HashMap::new(),
         }
     }
 }
@@ -84,13 +94,24 @@ fn check_double_equal_ordered(a: f64, b: f64) -> bool {
     b <= a.next_up()
 }
 
-/// upstream: src/io/bin.cpp `NeedFilter` (numerical branch).
-fn need_filter(cnt_in_bin: &[i32], total_cnt: i32, filter_cnt: i32) -> bool {
-    let mut sum_left = 0;
-    for &c in &cnt_in_bin[..cnt_in_bin.len() - 1] {
-        sum_left += c;
-        if sum_left >= filter_cnt && total_cnt - sum_left >= filter_cnt {
+/// upstream: src/io/bin.cpp `NeedFilter`.
+fn need_filter(cnt_in_bin: &[i32], total_cnt: i32, filter_cnt: i32, bin_type: BinType) -> bool {
+    if bin_type == BinType::Numerical {
+        let mut sum_left = 0;
+        for &c in &cnt_in_bin[..cnt_in_bin.len() - 1] {
+            sum_left += c;
+            if sum_left >= filter_cnt && total_cnt - sum_left >= filter_cnt {
+                return false;
+            }
+        }
+    } else {
+        if cnt_in_bin.len() > 2 {
             return false;
+        }
+        for &sum_left in &cnt_in_bin[..cnt_in_bin.len() - 1] {
+            if sum_left >= filter_cnt && total_cnt - sum_left >= filter_cnt {
+                return false;
+            }
         }
     }
     true
@@ -254,7 +275,7 @@ pub fn find_bin_with_zero_as_one_bin(
 }
 
 impl BinMapper {
-    /// Build a numerical bin mapper from sampled values.
+    /// Build a bin mapper from sampled values.
     ///
     /// `values` must contain only the sampled values with
     /// `|v| > kZeroThreshold` or `NaN` (as upstream's dataset constructors
@@ -267,9 +288,17 @@ impl BinMapper {
         bin_type: BinType,
         p: &BinParams,
     ) -> Result<Self> {
-        if bin_type == BinType::Categorical {
-            return Err(LgbmError::Unsupported("categorical features".into()));
-        }
+        Self::find_bin_logged(values, total_sample_cnt, bin_type, p, &mut Vec::new())
+    }
+
+    /// Like [`BinMapper::find_bin`], appending upstream's `Log::Warning`s to `warnings`.
+    pub fn find_bin_logged(
+        values: &[f64],
+        total_sample_cnt: usize,
+        bin_type: BinType,
+        p: &BinParams,
+        warnings: &mut Vec<String>,
+    ) -> Result<Self> {
         let num_sample_values_in = values.len() as i32;
         let mut vals: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
         let non_na_cnt = vals.len() as i32;
@@ -320,6 +349,12 @@ impl BinMapper {
         let min_val = distinct_values[0];
         let max_val = *distinct_values.last().unwrap();
 
+        if bin_type == BinType::Categorical {
+            return Ok(Self::finish_categorical(
+                &distinct_values, &counts, na_cnt, missing_type, min_val, max_val, total_sample_cnt, p, warnings,
+            ));
+        }
+
         let mut bin_upper_bound = match missing_type {
             MissingType::Zero => {
                 let b = find_bin_with_zero_as_one_bin(
@@ -364,17 +399,111 @@ impl BinMapper {
             num_bin,
             missing_type,
             bin_upper_bound: std::mem::take(&mut bin_upper_bound),
-            is_trivial: num_bin <= 1,
+            is_trivial: true,
             sparse_rate: 1.0,
             bin_type,
             min_val,
             max_val,
-            default_bin: 0,
-            most_freq_bin: 0,
+            ..Default::default()
         };
+        m.finish(&cnt_in_bin, total_sample_cnt, p);
+        Ok(m)
+    }
+
+    /// upstream: the categorical branch of `BinMapper::FindBin`.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_categorical(
+        distinct_values: &[f64],
+        counts: &[i32],
+        mut na_cnt: i32,
+        missing_type: MissingType,
+        min_val: f64,
+        max_val: f64,
+        total_sample_cnt: usize,
+        p: &BinParams,
+        warnings: &mut Vec<String>,
+    ) -> Self {
+        let mut m = BinMapper {
+            missing_type,
+            bin_type: BinType::Categorical,
+            min_val,
+            max_val,
+            ..Default::default()
+        };
+        // upstream converts with static_cast<int> (truncation toward zero)
+        let mut distinct_values_int: Vec<i32> = Vec::new();
+        let mut counts_int: Vec<i32> = Vec::new();
+        for (&v, &c) in distinct_values.iter().zip(counts) {
+            let val = v as i32;
+            if val < 0 {
+                na_cnt += c;
+                warnings.push("Met negative value in categorical features, will convert it to NaN".into());
+            } else if distinct_values_int.last() != Some(&val) {
+                distinct_values_int.push(val);
+                counts_int.push(c);
+            } else {
+                *counts_int.last_mut().unwrap() += c;
+            }
+        }
+        let mut cnt_in_bin: Vec<i32> = Vec::new();
+        let rest_cnt = (total_sample_cnt as i64 - na_cnt as i64) as i32;
+        if rest_cnt > 0 {
+            const SPARSE_RATIO: i32 = 100;
+            if distinct_values_int.last().unwrap() / SPARSE_RATIO > distinct_values_int.len() as i32 {
+                warnings.push(
+                    "Met categorical feature which contains sparse values. \
+                     Consider renumbering to consecutive integers started from zero"
+                        .into(),
+                );
+            }
+            // upstream: Common::SortForPair(.., is_reverse = true) — stable, by count descending
+            let mut pairs: Vec<(i32, i32)> = counts_int.iter().copied().zip(distinct_values_int.iter().copied()).collect();
+            pairs.sort_by_key(|p| std::cmp::Reverse(p.0));
+            let (counts_int, distinct_values_int): (Vec<i32>, Vec<i32>) = pairs.into_iter().unzip();
+            // upstream: RoundInt((total_sample_cnt - na_cnt) * 0.99f), a float product
+            let cut_cnt = ((total_sample_cnt.wrapping_sub(na_cnt as usize) as f32 * 0.99f32) as f64 + 0.5f32 as f64) as i32;
+            let mut distinct_cnt = distinct_values_int.len() as i32;
+            if na_cnt > 0 {
+                distinct_cnt += 1;
+            }
+            let max_bin = distinct_cnt.min(p.max_bin);
+            m.bin_2_categorical.push(-1);
+            m.categorical_2_bin.insert(-1, 0);
+            cnt_in_bin.push(0);
+            m.num_bin = 1;
+            let mut used_cnt = 0i32;
+            let mut cur_cat_idx = 0usize;
+            while cur_cat_idx < distinct_values_int.len() && (used_cnt < cut_cnt || m.num_bin < max_bin) {
+                if counts_int[cur_cat_idx] < p.min_data_in_bin && cur_cat_idx > 1 {
+                    break;
+                }
+                m.bin_2_categorical.push(distinct_values_int[cur_cat_idx]);
+                m.categorical_2_bin.insert(distinct_values_int[cur_cat_idx], m.num_bin as u32);
+                used_cnt += counts_int[cur_cat_idx];
+                cnt_in_bin.push(counts_int[cur_cat_idx]);
+                m.num_bin += 1;
+                cur_cat_idx += 1;
+            }
+            // MissingType::None means every category got its own bin
+            m.missing_type = if cur_cat_idx == distinct_values_int.len() && na_cnt == 0 {
+                MissingType::None
+            } else {
+                MissingType::NaN
+            };
+            cnt_in_bin[0] = (total_sample_cnt as i64 - used_cnt as i64) as i32;
+        }
+        m.finish(&cnt_in_bin, total_sample_cnt, p);
+        m
+    }
+
+    /// upstream: the tail of `BinMapper::FindBin` (trivial check, pre-filter,
+    /// default / most frequent bin, sparse rate).
+    fn finish(&mut self, cnt_in_bin: &[i32], total_sample_cnt: usize, p: &BinParams) {
+        let m = self;
+        m.is_trivial = m.num_bin <= 1;
         if !m.is_trivial
             && p.pre_filter
-            && need_filter(&cnt_in_bin, total_sample_cnt as i32, p.min_split_data)
+            && need_filter(cnt_in_bin, total_sample_cnt as i32, p.min_split_data, m.bin_type)
         {
             m.is_trivial = true;
         }
@@ -395,12 +524,19 @@ impl BinMapper {
         } else {
             m.sparse_rate = 1.0;
         }
-        Ok(m)
     }
 
-    /// upstream: include/LightGBM/bin.h `BinMapper::ValueToBin` (numerical).
+    /// upstream: include/LightGBM/bin.h `BinMapper::ValueToBin`.
     #[inline]
     pub fn value_to_bin(&self, value: f64) -> u32 {
+        if self.bin_type == BinType::Categorical {
+            if value.is_nan() {
+                return 0;
+            }
+            // negative values (and unseen categories) go to the "other" bin 0
+            let v = value as i32;
+            return if v < 0 { 0 } else { self.categorical_2_bin.get(&v).copied().unwrap_or(0) };
+        }
         let mut value = value;
         if value.is_nan() {
             if self.missing_type == MissingType::NaN {
@@ -424,14 +560,23 @@ impl BinMapper {
         l as u32
     }
 
-    /// upstream: Dataset::RealThreshold — upper bound of a numerical bin.
+    /// upstream: `BinMapper::BinToValue` — upper bound of a numerical bin,
+    /// or the category of a categorical bin.
     pub fn bin_to_value(&self, bin: u32) -> f64 {
-        self.bin_upper_bound[bin as usize]
+        if self.bin_type == BinType::Categorical {
+            self.bin_2_categorical[bin as usize] as f64
+        } else {
+            self.bin_upper_bound[bin as usize]
+        }
     }
 
-    /// upstream: include/LightGBM/bin.h `bin_info_string` (numerical).
+    /// upstream: include/LightGBM/bin.h `bin_info_string`.
     pub fn bin_info_string(&self) -> String {
-        format!("[{}:{}]", fmt_g17(self.min_val), fmt_g17(self.max_val))
+        if self.bin_type == BinType::Categorical {
+            self.bin_2_categorical.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(":")
+        } else {
+            format!("[{}:{}]", fmt_g17(self.min_val), fmt_g17(self.max_val))
+        }
     }
 }
 
@@ -483,6 +628,30 @@ mod tests {
         for w in m.bin_upper_bound.windows(2) {
             assert!(w[0] < w[1]);
         }
+    }
+
+    #[test]
+    fn categorical_bins_by_count() {
+        // category 3 x30, 1 x20, 2 x10, -1 x5 (-> NaN), zeros x15 (implicit)
+        let mut vals = Vec::new();
+        vals.extend(std::iter::repeat_n(3.0, 30));
+        vals.extend(std::iter::repeat_n(1.0, 20));
+        vals.extend(std::iter::repeat_n(2.7, 10));
+        vals.extend(std::iter::repeat_n(-1.0, 5));
+        let total = vals.len() + 15;
+        let mut w = Vec::new();
+        let m = BinMapper::find_bin_logged(&vals, total, BinType::Categorical, &params(255), &mut w).unwrap();
+        assert_eq!(m.bin_2_categorical, vec![-1, 3, 1, 0, 2]);
+        assert_eq!(m.missing_type, MissingType::NaN);
+        assert_eq!(m.bin_info_string(), "-1:3:1:0:2");
+        assert_eq!(m.value_to_bin(2.9), 4);
+        assert_eq!(m.value_to_bin(0.0), 3);
+        assert_eq!(m.value_to_bin(-3.0), 0);
+        assert_eq!(m.value_to_bin(f64::NAN), 0);
+        assert_eq!(m.value_to_bin(7.0), 0);
+        assert_eq!(m.bin_to_value(2), 1.0);
+        assert_eq!(m.default_bin, 3);
+        assert!(w[0].starts_with("Met negative value"));
     }
 
     #[test]

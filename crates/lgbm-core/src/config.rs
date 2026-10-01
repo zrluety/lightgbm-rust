@@ -97,7 +97,8 @@ const HONORED: &[&str] = &[
     "feature_fraction_bynode", "feature_fraction_seed", "extra_trees", "extra_seed",
     "data_sample_strategy", "top_rate", "other_rate", "objective_seed",
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
-    "lambdarank_position_bias_regularization", "eval_at",
+    "lambdarank_position_bias_regularization", "eval_at", "categorical_feature",
+    "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -118,8 +119,6 @@ const NO_EFFECT: &[&str] = &[
     "auc_mu_weights",
     // DART knobs are inert unless boosting selects it (gated).
     "drop_rate", "max_drop", "skip_drop", "xgboost_dart_mode", "uniform_drop",
-    // Categorical knobs are inert without categorical features (gated separately).
-    "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
     // Quantization sub-options are inert unless use_quantized_grad (gated).
     "num_grad_quant_bins", "quant_train_renew_leaf", "stochastic_rounding",
     "monotone_constraints_method", "monotone_penalty", "top_k", "refit_decay_rate",
@@ -365,6 +364,13 @@ pub struct Config {
     pub eval_at: Vec<i32>,
     pub saved_feature_importance_type: i32,
     pub is_provide_training_metric: bool,
+    /// Raw `categorical_feature` value; see [`Config::categorical_indices`].
+    pub categorical_feature: String,
+    pub max_cat_to_onehot: i32,
+    pub max_cat_threshold: i32,
+    pub cat_l2: f64,
+    pub cat_smooth: f64,
+    pub min_data_per_group: i32,
     /// Canonical key -> value string as supplied (after alias resolution).
     pub explicit: BTreeMap<String, String>,
     /// Non-fatal diagnostics (unknown keys, duplicate aliases), mirroring upstream warnings.
@@ -437,6 +443,12 @@ impl Default for Config {
             eval_at: Vec::new(),
             saved_feature_importance_type: 0,
             is_provide_training_metric: false,
+            categorical_feature: String::new(),
+            max_cat_to_onehot: 4,
+            max_cat_threshold: 32,
+            cat_l2: 10.0,
+            cat_smooth: 10.0,
+            min_data_per_group: 100,
             explicit: BTreeMap::new(),
             warnings: Vec::new(),
         }
@@ -680,6 +692,14 @@ impl Config {
         }
         set_int!(saved_feature_importance_type);
         set_bool!(is_provide_training_metric);
+        if let Some(v) = p.get("categorical_feature") {
+            self.categorical_feature = v.clone();
+        }
+        set_int!(max_cat_to_onehot);
+        set_int!(max_cat_threshold);
+        set_f64!(cat_l2);
+        set_f64!(cat_smooth);
+        set_int!(min_data_per_group);
 
         if self.objective != "custom" && !SUPPORTED_OBJECTIVES.contains(&self.objective.as_str()) {
             return Err(LgbmError::Unsupported(format!("objective={}", self.objective)));
@@ -745,6 +765,40 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// Column indices listed in `categorical_feature`. Out-of-range indices
+    /// are ignored by dataset construction, like upstream.
+    ///
+    /// upstream: src/io/dataset_loader.cpp `DatasetLoader::SetHeader`. Only
+    /// file-based loading has column names, so `name:` lists always fail here.
+    pub fn categorical_indices(&self) -> Result<Vec<i32>> {
+        let v = self.categorical_feature.as_str();
+        if v.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(names) = v.strip_prefix("name:") {
+            let name = split_tokens(names).next().unwrap_or("");
+            return Err(LgbmError::InvalidParameter(format!(
+                "Could not find categorical_feature {name} in data file"
+            )));
+        }
+        split_tokens(v)
+            .map(|t| {
+                let b = t.trim_start_matches(' ');
+                let digits = b.strip_prefix(['-', '+']).unwrap_or(b);
+                let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+                if digits[n..].trim_start_matches(' ').is_empty() {
+                    Ok(atoi(t))
+                } else {
+                    Err(LgbmError::InvalidParameter(
+                        "categorical_feature is not a number,\nif you want to use a column name,\n\
+                         please add the prefix \"name:\" to the column name"
+                            .into(),
+                    ))
+                }
+            })
+            .collect()
     }
 
     /// Render the `parameters:` block of the model text format.

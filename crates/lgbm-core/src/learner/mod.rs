@@ -16,7 +16,7 @@ pub mod split;
 
 use std::sync::Arc;
 
-use crate::binning::MissingType;
+use crate::binning::{BinType, MissingType};
 use crate::config::Config;
 use crate::consts::K_MIN_SCORE;
 use crate::dataset::Dataset;
@@ -24,7 +24,7 @@ use crate::histogram::{self, HistLayout};
 use crate::multi_val_bin::{HistSlots, MultiValBin, merge_blocks};
 use crate::random::Random;
 use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
-use crate::tree::{SplitArgs, Tree};
+use crate::tree::{SplitArgs, Tree, construct_bitset, find_in_bitset};
 use col_sampler::ColSampler;
 use partition::DataPartition;
 use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_output};
@@ -95,6 +95,7 @@ impl SerialTreeLearner {
                     offset: if m.most_freq_bin == 0 { 1 } else { 0 },
                     default_bin: m.default_bin,
                     most_freq_bin: m.most_freq_bin,
+                    bin_type: m.bin_type,
                 }
             })
             .collect();
@@ -128,6 +129,11 @@ impl SerialTreeLearner {
                 min_data_in_leaf: cfg.min_data_in_leaf,
                 min_sum_hessian_in_leaf: cfg.min_sum_hessian_in_leaf,
                 min_gain_to_split: cfg.min_gain_to_split,
+                max_cat_to_onehot: cfg.max_cat_to_onehot,
+                max_cat_threshold: cfg.max_cat_threshold,
+                cat_l2: cfg.cat_l2,
+                cat_smooth: cfg.cat_smooth,
+                min_data_per_group: cfg.min_data_per_group,
             },
             num_leaves,
             max_depth: cfg.max_depth,
@@ -228,8 +234,7 @@ impl SerialTreeLearner {
                     best_leaf = i;
                 }
             }
-            let best = self.best_split_per_leaf[best_leaf];
-            if !(best.gain > 0.0) {
+            if !(self.best_split_per_leaf[best_leaf].gain > 0.0) {
                 break;
             }
             let (l, r) = self.split(&mut tree, best_leaf);
@@ -429,33 +434,37 @@ impl SerialTreeLearner {
     }
 
     fn split(&mut self, tree: &mut Tree, best_leaf: usize) -> (i32, i32) {
-        let mut info = self.best_split_per_leaf[best_leaf];
+        let mut info = self.best_split_per_leaf[best_leaf].clone();
         let inner = self
             .data
             .inner_feature_index(info.feature as usize)
             .expect("split feature is used");
         let mapper = self.data.feature_bin_mapper(inner);
         let next_leaf = tree.num_leaves;
-        let threshold_double = mapper.bin_to_value(info.threshold);
         let meta = self.metas[inner];
-        self.partition.split(
-            &self.team,
-            best_leaf,
-            self.data.feature_bins(inner),
-            &meta,
-            info.threshold,
-            info.default_left,
-            next_leaf,
-        );
+        let num_bin = meta.num_bin.max(1) as u32;
+        let numerical = meta.bin_type == BinType::Numerical;
+        // upstream: SerialTreeLearner::SplitInner (Common::ConstructBitset of
+        // the bins, and of their categories via RealThreshold)
+        let (lut, cat_bitset_inner, cat_bitset) = if numerical {
+            let lut: Vec<bool> = (0..num_bin).map(|b| goes_left(b, &meta, info.threshold, info.default_left)).collect();
+            (lut, Vec::new(), Vec::new())
+        } else {
+            let inner_bits = construct_bitset(info.cat_threshold.iter().map(|&b| b as i32));
+            let bits = construct_bitset(info.cat_threshold.iter().map(|&b| mapper.bin_to_value(b) as i32));
+            let lut = (0..num_bin).map(|b| goes_left_categorical(b, &meta, &inner_bits)).collect();
+            (lut, inner_bits, bits)
+        };
+        self.partition.split(&self.team, best_leaf, self.data.feature_bins(inner), &lut, next_leaf);
         info.left_count = self.partition.leaf_count(best_leaf) as i32;
         info.right_count = self.partition.leaf_count(next_leaf) as i32;
         let gain = (info.gain + self.params.min_gain_to_split) as f32;
-        let right = tree.split(&SplitArgs {
+        let args = SplitArgs {
             leaf: best_leaf,
             feature_inner: inner as i32,
             feature_real: info.feature,
             threshold_bin: info.threshold,
-            threshold: threshold_double,
+            threshold: if numerical { mapper.bin_to_value(info.threshold) } else { 0.0 },
             left_value: info.left_output,
             right_value: info.right_output,
             left_count: info.left_count,
@@ -465,7 +474,12 @@ impl SerialTreeLearner {
             gain,
             missing_type: mapper.missing_type,
             default_left: info.default_left,
-        });
+        };
+        let right = if numerical {
+            tree.split(&args)
+        } else {
+            tree.split_categorical(&args, &cat_bitset_inner, &cat_bitset)
+        };
         if let Some(t) = self.trace.as_mut() {
             t.splits.push((best_leaf, info.feature, info.threshold, info.gain));
         }
@@ -509,6 +523,18 @@ pub(crate) fn goes_left(b: u32, meta: &FeatureMeta, threshold: u32, default_left
     let is_missing = (meta.missing_type == MissingType::Zero && b == meta.default_bin)
         || (meta.missing_type == MissingType::NaN && b == (meta.num_bin - 1) as u32);
     if is_missing { default_left } else { b <= threshold }
+}
+
+/// Route one bin the way upstream `DenseBin::SplitCategorical` does for a
+/// single-feature group: the most frequent bin is stored as 0 and follows
+/// the bitset test of `most_freq_bin` (only when it is not bin 0).
+#[inline]
+pub(crate) fn goes_left_categorical(b: u32, meta: &FeatureMeta, bitset: &[u32]) -> bool {
+    if b == meta.most_freq_bin {
+        meta.most_freq_bin > 0 && find_in_bitset(bitset, meta.most_freq_bin as i32)
+    } else {
+        find_in_bitset(bitset, b as i32)
+    }
 }
 
 #[cfg(test)]

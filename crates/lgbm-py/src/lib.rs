@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use lgbm_core::arrow::{ArrowArrayStream, ArrowChunkedArray};
 use lgbm_core::boosting::PredictKind;
+use lgbm_core::tree::find_in_bitset;
 use lgbm_core::{
     Config, Dataset, DatasetFields, DenseMatrix, DenseValues, Gbdt, LgbmError, Matrix as Matrix2, SparseIndptr,
     SparseMatrix,
@@ -260,6 +261,22 @@ impl RsDataset {
             return Err(PyValueError::new_err("column index out of range"));
         }
         Ok(self.inner.bin_mapper_by_real(col).bin_upper_bound.clone())
+    }
+
+    /// upstream: `LGBM_DatasetGetFeatureNumBin` (0 for unused features).
+    fn feature_num_bin(&self, feature: i64) -> PyResult<usize> {
+        let n = self.inner.num_total_features();
+        if feature < 0 || feature as usize >= n {
+            return Err(LightGBMError::new_err(format!(
+                "Tried to retrieve number of bins for feature index {feature}, but the valid feature indices are [0, {}].",
+                n as i64 - 1
+            )));
+        }
+        let col = feature as usize;
+        Ok(match self.inner.inner_feature_index(col) {
+            Some(_) => self.inner.bin_mapper_by_real(col).num_bin as usize,
+            None => 0,
+        })
     }
 
     /// Per-row bin indices of input column `col`, or `None` for trivial features.
@@ -570,6 +587,15 @@ impl RsBooster {
                 d.set_item("split_feature", t.split_feature[..ni].to_vec())?;
                 d.set_item("split_gain", t.split_gain[..ni].iter().map(|&g| g as f64).collect::<Vec<_>>())?;
                 d.set_item("threshold", t.threshold[..ni].to_vec())?;
+                let cats: Vec<Option<Vec<i32>>> = (0..ni)
+                    .map(|i| {
+                        t.is_categorical(i).then(|| {
+                            let bits = t.cat_bitset(i);
+                            (0..bits.len() as i32 * 32).filter(|&c| find_in_bitset(bits, c)).collect()
+                        })
+                    })
+                    .collect();
+                d.set_item("cat_threshold", cats)?;
                 d.set_item("decision_type", t.decision_type[..ni].to_vec())?;
                 d.set_item("left_child", t.left_child[..ni].to_vec())?;
                 d.set_item("right_child", t.right_child[..ni].to_vec())?;

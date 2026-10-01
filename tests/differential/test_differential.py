@@ -28,7 +28,7 @@ from .conftest import (
 )
 
 _BIN_PARAMS = ("max_bin", "min_data_in_bin", "bin_construct_sample_cnt", "data_random_seed", "seed", "use_missing",
-               "zero_as_missing", "feature_pre_filter", "min_data_in_leaf")
+               "zero_as_missing", "feature_pre_filter", "min_data_in_leaf", "categorical_feature")
 
 
 @pytest.mark.parametrize("case", CASES, ids=case_ids())
@@ -368,7 +368,7 @@ def test_metrics_and_early_stopping(case, recorder):
 MT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_basic", "reg_100_rounds", "bin_100_rounds",
                                            "l1_weighted", "quantile_basic", "mape_weighted", "poisson_weighted",
                                            "tweedie_basic", "mc_weighted", "ova_basic", "bag_basic", "goss_basic",
-                                           "goss_no_subset", "sampling_combo")]
+                                           "goss_no_subset", "sampling_combo", "cat_basic", "cat_100_rounds")]
 
 
 @pytest.mark.parametrize("case", MT_CASES, ids=[c.name for c in MT_CASES])
@@ -445,7 +445,7 @@ def test_dump_model(case, recorder):
 
 
 CV_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
-                                           "bin_init_score")]
+                                           "bin_init_score", "cat_basic", "cat_binary")]
 
 
 @pytest.mark.parametrize("case", CV_CASES, ids=[c.name for c in CV_CASES])
@@ -472,7 +472,7 @@ def test_cv(case, recorder):
 
 
 CONT_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
-                                             "goss_basic", "bin_init_score", "ova_basic")]
+                                             "goss_basic", "bin_init_score", "ova_basic", "cat_basic")]
 
 
 @pytest.mark.parametrize("init_kind", ["booster", "model_file", "reused_dataset"])
@@ -523,7 +523,7 @@ def test_cv_init_model(case, recorder):
 
 
 ARROW_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_weighted", "mc_basic", "bin_init_score",
-                                              "reg_sparse")]
+                                              "reg_sparse", "cat_basic")]
 
 
 def _arrow_table(pa, X):
@@ -595,7 +595,7 @@ def _most_freq_not_zero(case):
 
 
 SPARSE_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "reg_sparse", "bin_weighted", "mc_basic",
-                                               "bag_basic", "bin_init_score")]
+                                               "bag_basic", "bin_init_score", "cat_basic")]
 SPARSE_CASES.append(_most_freq_not_zero(next(c for c in CASES if c.name == "reg_sparse")))
 SPARSE_FORMATS = ["csr", "csc", "csr_f32_int64_indptr", "csr_explicit_zeros", "coo"]
 
@@ -874,6 +874,94 @@ def test_ranking_multithread(case, recorder):
     rec.compare("model_text", "model_text", models[0].model_to_string(), models[1].model_to_string())
     rec.compare("valid_0[per iteration]", "metrics", hist["lightgbm_rust"], hist["lightgbm"])
     rec.finish()
+
+
+# --------------------------------------------------------------------------- pandas categorical
+
+
+def _pandas_frames(case):
+    pd = pytest.importorskip("pandas")
+
+    def frame(X, categories=None):
+        df = pd.DataFrame({f"f{j}": X[:, j] for j in range(X.shape[1])})
+        # f1: unordered strings with missing values; f3: ordered (numerical unless named); f4: unordered ints
+        f1 = np.where(np.isnan(X[:, 1]) | (X[:, 1] < 0), None, np.char.add("c", np.nan_to_num(X[:, 1]).astype(int).astype(str)))
+        df["f1"] = pd.Categorical(f1, categories=categories)
+        df["f3"] = pd.Categorical(X[:, 3].astype(int), ordered=True)
+        df["f4"] = pd.Categorical(X[:, 4].astype(int))
+        return df
+
+    train = frame(case.X)
+    # validation frame: categories in a different order, one category unseen in training
+    cats = list(reversed(train["f1"].cat.categories)) + ["unseen"]
+    valid = frame(case.Xv, categories=cats)
+    valid.loc[valid.index[:20], "f1"] = "unseen"
+    return train, valid
+
+
+PANDAS_CAT_CASES = [c for c in CASES if c.name in ("cat_basic", "cat_binary", "cat_multiclass")]
+
+
+@pytest.mark.parametrize("categorical_feature", ["auto", ["f1", "f3", "f4"], [1, 4]])
+@pytest.mark.parametrize("case", PANDAS_CAT_CASES, ids=[c.name for c in PANDAS_CAT_CASES])
+def test_pandas_categorical(case, categorical_feature, recorder):
+    """pandas category columns (upstream _data_from_pandas), pandas_categorical footer, validation re-coding."""
+    cf_id = categorical_feature if isinstance(categorical_feature, str) else ",".join(map(str, categorical_feature))
+    rec = recorder(f"{case.name}[{cf_id}]")
+    train, valid = _pandas_frames(case)
+    params = {k: v for k, v in case.full_params.items() if k != "categorical_feature"}
+    hist = {}
+
+    def run(mod):
+        ds = mod.Dataset(train, label=case.y, categorical_feature=categorical_feature, free_raw_data=False)
+        h = hist.setdefault(mod.__name__, {})
+        return mod.train(params, ds, num_boost_round=case.num_boost_round,
+                         valid_sets=[ds.create_valid(valid, label=case.yv)], callbacks=[mod.record_evaluation(h)])
+
+    rs, up = run(lgb_rs), run(lgb_up)
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    rec.compare("pandas_categorical", "model_text", repr(rs.pandas_categorical), repr(up.pandas_categorical))
+    rec.compare("valid_0[per iteration]", "metrics", hist["lightgbm_rust"], hist["lightgbm"])
+    rec.compare("prediction[valid frame]", "predictions", rs.predict(valid), up.predict(valid))
+    rec.compare("pred_contrib[valid frame]", "predictions", rs.predict(valid, pred_contrib=True),
+                up.predict(valid, pred_contrib=True))
+    reloaded = lgb_rs.Booster(model_str=up.model_to_string())
+    rec.compare("rust(upstream model).pandas_categorical", "model_text", repr(reloaded.pandas_categorical),
+                repr(up.pandas_categorical))
+    rec.compare("rust(upstream model) prediction[valid frame]", "predictions", reloaded.predict(valid),
+                up.predict(valid))
+    rec.compare("dump_model", "model_text", repr(rs.dump_model()), repr(up.dump_model()))
+    rec.compare("trees_to_dataframe", "model_text", rs.trees_to_dataframe().to_csv(),
+                up.trees_to_dataframe().to_csv())
+    rec.finish()
+
+
+def test_categorical_errors_and_warnings():
+    """Messages from upstream config.cpp / dataset_loader.cpp / basic.py for categorical inputs."""
+    pd = pytest.importorskip("pandas")
+    X = np.column_stack([np.arange(200) % 7, np.arange(200) * 0.5])
+    y = np.arange(200, dtype=float)
+    for mod in (lgb_rs, lgb_up):
+        with pytest.raises(mod.basic.LightGBMError, match="categorical_feature is not a number"):
+            mod.Dataset(X, y, params={"categorical_feature": "a", "verbose": -1}).construct()
+        with pytest.raises(mod.basic.LightGBMError, match="Could not find categorical_feature x in data file"):
+            mod.Dataset(X, y, params={"categorical_feature": "name:x", "verbose": -1}).construct()
+        with pytest.raises(TypeError, match=r"Wrong type\(str\) or unknown name\(zz\) in categorical_feature"):
+            mod.Dataset(X, y, feature_name=["a", "b"], categorical_feature=["zz"]).construct()
+        df = pd.DataFrame({"a": pd.Categorical(["x", "y"] * 100), "b": X[:, 1]})
+        bst = mod.train({"verbose": -1, "min_data_in_leaf": 5}, mod.Dataset(df, y), 2)
+        with pytest.raises(ValueError, match="train and valid dataset categorical_feature do not match."):
+            bst.predict(df.assign(c=pd.Categorical(["u"] * 200)))
+    # out-of-range indices are ignored; params alias overridden by the Dataset argument (warning text from basic.py)
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        with pytest.warns(UserWarning) as record:
+            mod.Dataset(X, y, categorical_feature=[0], params={"cat_feature": "1", "verbose": -1}).construct()
+        out[mod.__name__] = [str(w.message) for w in record]
+        ds2 = mod.Dataset(X, y, params={"categorical_feature": "0,9", "verbose": -1}).construct()
+        assert ds2.num_feature() == 2
+    assert out["lightgbm_rust"] == out["lightgbm"]
+    assert "cat_feature in param dict is overridden." in out["lightgbm"]
 
 
 def leaf_values(b):

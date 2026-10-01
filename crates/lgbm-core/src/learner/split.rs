@@ -2,11 +2,12 @@
 //!
 //! upstream: src/treelearner/feature_histogram.hpp
 //! (`FindBestThresholdSequentially`, `GetSplitGains`, `GetLeafGain`,
-//! `CalculateSplittedLeafOutput`, `FuncForNumricalL3`). Monotone
+//! `CalculateSplittedLeafOutput`, `FuncForNumricalL3`) and
+//! feature_histogram.cpp (`FindBestThresholdCategoricalInner`). Monotone
 //! constraints, quantized gradients, and feature penalties are not
 //! implemented, so their template branches are omitted.
 
-use crate::binning::MissingType;
+use crate::binning::{BinType, MissingType};
 use crate::consts::{K_EPSILON, K_MIN_SCORE};
 use crate::random::Random;
 
@@ -19,6 +20,7 @@ pub struct FeatureMeta {
     pub offset: i32,
     pub default_bin: u32,
     pub most_freq_bin: u32,
+    pub bin_type: BinType,
 }
 
 /// Regularization and stopping parameters used during split search.
@@ -31,6 +33,11 @@ pub struct SplitParams {
     pub min_data_in_leaf: i32,
     pub min_sum_hessian_in_leaf: f64,
     pub min_gain_to_split: f64,
+    pub max_cat_to_onehot: i32,
+    pub max_cat_threshold: i32,
+    pub cat_l2: f64,
+    pub cat_smooth: f64,
+    pub min_data_per_group: i32,
 }
 
 impl SplitParams {
@@ -45,11 +52,13 @@ impl SplitParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SplitInfo {
     /// Real (column) feature index; -1 if none.
     pub feature: i32,
     pub threshold: u32,
+    /// Bins sent left by a categorical split (empty for numerical splits).
+    pub cat_threshold: Vec<u32>,
     pub left_output: f64,
     pub right_output: f64,
     pub gain: f64,
@@ -67,6 +76,7 @@ impl Default for SplitInfo {
         Self {
             feature: -1,
             threshold: 0,
+            cat_threshold: Vec::new(),
             left_output: 0.0,
             right_output: 0.0,
             gain: K_MIN_SCORE,
@@ -215,6 +225,11 @@ pub fn find_best_threshold(
     out.default_left = true;
     out.gain = K_MIN_SCORE;
     let sum_hessian = sum_hessian + 2.0 * K_EPSILON;
+    if meta.bin_type == BinType::Categorical {
+        return find_best_threshold_categorical(
+            hist, meta, p, sum_gradient, sum_hessian, num_data, parent_output, extra_rand, out,
+        );
+    }
     let min_gain_shift =
         leaf_gain(sum_gradient, sum_hessian, p, num_data, parent_output) + p.min_gain_to_split;
     // upstream: BeforeNumerical
@@ -241,6 +256,219 @@ pub fn find_best_threshold(
         }
     }
     splittable
+}
+
+/// upstream `FindBestThresholdCategoricalInner` (no MC). One-vs-rest for at
+/// most `max_cat_to_onehot` bins; otherwise bins with enough data are sorted
+/// by `sum_grad / (sum_hess + cat_smooth)` and prefixes are scanned from both
+/// ends with `lambda_l2 + cat_l2`. `sum_hessian` already includes `2 * kEpsilon`.
+#[allow(clippy::too_many_arguments)]
+fn find_best_threshold_categorical(
+    hist: &[f64],
+    meta: &FeatureMeta,
+    p: &SplitParams,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    parent_output: f64,
+    extra_rand: Option<&mut Random>,
+    out: &mut SplitInfo,
+) -> bool {
+    let g = |t: i32| hist[2 * t as usize];
+    let h = |t: i32| hist[2 * t as usize + 1];
+    let mut is_splittable = false;
+    out.default_left = false;
+    let mut best_gain = K_MIN_SCORE;
+    let mut best_left_count: i32 = 0;
+    let mut best_sum_left_gradient = 0.0f64;
+    let mut best_sum_left_hessian = 0.0f64;
+    // Without smoothing the shift uses the plain lambda_l2, the children the
+    // categorical one (upstream keeps this for backwards compatibility).
+    let gain_shift = if p.use_smoothing() {
+        leaf_gain_given_output(sum_gradient, sum_hessian, p, parent_output)
+    } else {
+        leaf_gain(sum_gradient, sum_hessian, p, num_data, 0.0)
+    };
+    let min_gain_shift = gain_shift + p.min_gain_to_split;
+    let offset = meta.offset;
+    let bin_start = 1 - offset;
+    let bin_end = meta.num_bin - offset;
+    let mut used_bin: i32 = -1;
+    let mut sorted_idx: Vec<i32> = Vec::new();
+    let mut pc = *p;
+    let use_onehot = meta.num_bin <= p.max_cat_to_onehot;
+    let mut best_threshold: i32 = -1;
+    let mut best_dir: i32 = 1;
+    let cnt_factor = num_data as f64 / sum_hessian;
+    let mut rand_threshold = 0;
+    let mut extra_rand = extra_rand;
+    if use_onehot {
+        if let Some(r) = extra_rand.as_deref_mut() {
+            if bin_end - bin_start > 0 {
+                rand_threshold = r.next_int(bin_start, bin_end);
+            }
+        }
+        for t in bin_start..bin_end {
+            let grad = g(t);
+            let hess = h(t);
+            let cnt = round_int(hess * cnt_factor);
+            if cnt < p.min_data_in_leaf || hess < p.min_sum_hessian_in_leaf {
+                continue;
+            }
+            let other_count = num_data - cnt;
+            if other_count < p.min_data_in_leaf {
+                continue;
+            }
+            let sum_other_hessian = sum_hessian - hess - K_EPSILON;
+            if sum_other_hessian < p.min_sum_hessian_in_leaf {
+                continue;
+            }
+            let sum_other_gradient = sum_gradient - grad;
+            if extra_rand.is_some() && t != rand_threshold {
+                continue;
+            }
+            let current_gain = split_gain(
+                sum_other_gradient,
+                sum_other_hessian,
+                grad,
+                hess + K_EPSILON,
+                &pc,
+                other_count,
+                cnt,
+                parent_output,
+            );
+            if current_gain <= min_gain_shift {
+                continue;
+            }
+            is_splittable = true;
+            if current_gain > best_gain {
+                best_threshold = t;
+                best_sum_left_gradient = grad;
+                best_sum_left_hessian = hess + K_EPSILON;
+                best_left_count = cnt;
+                best_gain = current_gain;
+            }
+        }
+    } else {
+        for i in bin_start..bin_end {
+            if round_int(h(i) * cnt_factor) as f64 >= p.cat_smooth {
+                sorted_idx.push(i);
+            }
+        }
+        used_bin = sorted_idx.len() as i32;
+        pc.lambda_l2 += p.cat_l2;
+        let ctr = |i: i32| g(i) / (h(i) + p.cat_smooth);
+        // std::stable_sort with `ctr(i) < ctr(j)`
+        sorted_idx.sort_by(|&i, &j| {
+            let (a, b) = (ctr(i), ctr(j));
+            if a < b {
+                std::cmp::Ordering::Less
+            } else if b < a {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        let max_num_cat = p.max_cat_threshold.min((used_bin + 1) / 2);
+        let max_threshold = (max_num_cat.min(used_bin) - 1).max(0);
+        if let Some(r) = extra_rand.as_deref_mut() {
+            if max_threshold > 0 {
+                rand_threshold = r.next_int(0, max_threshold);
+            }
+        }
+        is_splittable = false;
+        for (dir, start) in [(1i32, 0i32), (-1, used_bin - 1)] {
+            let mut start_pos = start;
+            let mut cnt_cur_group: i32 = 0;
+            let mut sum_left_gradient = 0.0f64;
+            let mut sum_left_hessian = K_EPSILON;
+            let mut left_count: i32 = 0;
+            let mut i = 0;
+            while i < used_bin && i < max_num_cat {
+                let t = sorted_idx[start_pos as usize];
+                start_pos += dir;
+                let grad = g(t);
+                let hess = h(t);
+                let cnt = round_int(hess * cnt_factor);
+                sum_left_gradient += grad;
+                sum_left_hessian += hess;
+                left_count += cnt;
+                cnt_cur_group += cnt;
+                if left_count < p.min_data_in_leaf || sum_left_hessian < p.min_sum_hessian_in_leaf {
+                    i += 1;
+                    continue;
+                }
+                let right_count = num_data - left_count;
+                if right_count < p.min_data_in_leaf || right_count < p.min_data_per_group {
+                    break;
+                }
+                let sum_right_hessian = sum_hessian - sum_left_hessian;
+                if sum_right_hessian < p.min_sum_hessian_in_leaf {
+                    break;
+                }
+                if cnt_cur_group < p.min_data_per_group {
+                    i += 1;
+                    continue;
+                }
+                cnt_cur_group = 0;
+                let sum_right_gradient = sum_gradient - sum_left_gradient;
+                if extra_rand.is_some() && i != rand_threshold {
+                    i += 1;
+                    continue;
+                }
+                let current_gain = split_gain(
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    &pc,
+                    left_count,
+                    right_count,
+                    parent_output,
+                );
+                if current_gain <= min_gain_shift {
+                    i += 1;
+                    continue;
+                }
+                is_splittable = true;
+                if current_gain > best_gain {
+                    best_left_count = left_count;
+                    best_sum_left_gradient = sum_left_gradient;
+                    best_sum_left_hessian = sum_left_hessian;
+                    best_threshold = i;
+                    best_gain = current_gain;
+                    best_dir = dir;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    if is_splittable {
+        out.left_output = leaf_output(best_sum_left_gradient, best_sum_left_hessian, &pc, best_left_count, parent_output);
+        out.left_count = best_left_count;
+        out.left_sum_gradient = best_sum_left_gradient;
+        out.left_sum_hessian = best_sum_left_hessian - K_EPSILON;
+        out.right_output = leaf_output(
+            sum_gradient - best_sum_left_gradient,
+            sum_hessian - best_sum_left_hessian,
+            &pc,
+            num_data - best_left_count,
+            parent_output,
+        );
+        out.right_count = num_data - best_left_count;
+        out.right_sum_gradient = sum_gradient - best_sum_left_gradient;
+        out.right_sum_hessian = sum_hessian - best_sum_left_hessian - K_EPSILON;
+        out.gain = best_gain - min_gain_shift;
+        out.cat_threshold = if use_onehot {
+            vec![(best_threshold + offset) as u32]
+        } else if best_dir == 1 {
+            sorted_idx[..=best_threshold as usize].iter().map(|&t| (t + offset) as u32).collect()
+        } else {
+            (0..=best_threshold as usize).map(|i| (sorted_idx[used_bin as usize - 1 - i] + offset) as u32).collect()
+        };
+    }
+    is_splittable
 }
 
 /// upstream `FindBestThresholdSequentially` (no MC; `rand_threshold` is
@@ -441,6 +669,11 @@ mod tests {
             min_data_in_leaf: 1,
             min_sum_hessian_in_leaf: 1e-3,
             min_gain_to_split: 0.0,
+            max_cat_to_onehot: 4,
+            max_cat_threshold: 32,
+            cat_l2: 10.0,
+            cat_smooth: 10.0,
+            min_data_per_group: 100,
         }
     }
 
@@ -454,6 +687,7 @@ mod tests {
             offset: 0,
             default_bin: 0,
             most_freq_bin: 0,
+            bin_type: BinType::Numerical,
         };
         let mut out = SplitInfo::default();
         let ok = find_best_threshold(&hist, &meta, &params(), 0.0, 20.0, 20, 0.0, None, &mut out);
@@ -464,6 +698,32 @@ mod tests {
         assert!((out.right_output + 1.0).abs() < 1e-12);
         // gain = 100/10 + 100/10 - 0
         assert!((out.gain - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn categorical_one_hot_and_sorted() {
+        let meta = FeatureMeta {
+            num_bin: 3,
+            missing_type: MissingType::NaN,
+            offset: 0,
+            default_bin: 1,
+            most_freq_bin: 1,
+            bin_type: BinType::Categorical,
+        };
+        let hist = [0.0, 10.0, -10.0, 10.0, 10.0, 10.0];
+        let mut out = SplitInfo::default();
+        assert!(find_best_threshold(&hist, &meta, &params(), 0.0, 30.0, 30, 0.0, None, &mut out));
+        assert_eq!(out.cat_threshold, vec![1]);
+        assert!(!out.default_left);
+        assert_eq!(out.left_count, 10);
+
+        // many-vs-many: 6 bins, sorted by ctr; the two most negative go left
+        let meta = FeatureMeta { num_bin: 6, offset: 1, most_freq_bin: 0, default_bin: 0, ..meta };
+        let hist = [5.0, 100.0, -50.0, 100.0, 2.0, 100.0, -40.0, 100.0, 3.0, 100.0];
+        let p = SplitParams { min_data_per_group: 1, cat_smooth: 1.0, ..params() };
+        let mut out = SplitInfo::default();
+        assert!(find_best_threshold(&hist, &meta, &p, -80.0, 600.0, 600, 0.0, None, &mut out));
+        assert_eq!(out.cat_threshold, vec![2, 4]);
     }
 
     #[test]
