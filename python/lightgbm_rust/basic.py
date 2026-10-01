@@ -1431,8 +1431,6 @@ class Booster:
     ) -> np.ndarray:
         if isinstance(data, Dataset):
             raise TypeError("Cannot use Dataset instance for prediction, please use raw data instead")
-        if pred_contrib:
-            raise _unsupported("pred_contrib (SHAP values)")
         if kwargs:
             _emit_engine_warnings(_rs.validate_params(_param_dict_to_pairs(kwargs)), kwargs)
         if num_iteration is None:
@@ -1451,18 +1449,38 @@ class Booster:
                 if e != got:
                     raise LightGBMError(f"Expected '{e}' at position {i} but found '{got}'")
         mat, _ = _to_float_matrix(data, predict=True)
-        kind = "leaf" if pred_leaf else ("raw" if raw_score else "normal")
         assert self._rs is not None
+        if pred_contrib and isinstance(mat, tuple):
+            sparse = self._predict_contrib_sparse(mat, int(start_iteration), int(num_iteration))
+            if pred_leaf:
+                return [m.astype(np.int32) for m in sparse] if isinstance(sparse, list) else sparse.astype(np.int32)
+            return sparse
+        # upstream: _InnerPredictor.predict (contrib overrides leaf, which overrides raw)
+        kind = "contrib" if pred_contrib else ("leaf" if pred_leaf else ("raw" if raw_score else "normal"))
         preds = self._rs.predict(mat, kind, int(start_iteration), int(num_iteration))
         nrow = _matrix_nrows(mat)
         flat = preds.ravel()
         if pred_leaf:
             flat = flat.astype(np.int32)
-        if flat.size != nrow:
+        if flat.size != nrow or pred_leaf or pred_contrib:
             if nrow > 0 and flat.size % nrow == 0:
                 return flat.reshape(nrow, -1)
             raise ValueError(f"Length of predict result ({flat.size}) cannot be divide nrow ({nrow})")
         return flat
+
+    def _predict_contrib_sparse(self, mat: _SparseParts, start_iteration: int, num_iteration: int) -> Any:
+        """upstream: ``_InnerPredictor.__inner_predict_csr_sparse`` / ``__inner_predict_sparse_csc``
+        and ``__create_sparse_native`` (output keeps the input's indptr and data dtypes)."""
+        import scipy.sparse
+
+        is_csr, indptr, _, values, nrow, ncol = mat
+        assert self._rs is not None
+        out = []
+        for out_indptr, out_indices, out_data in self._rs.predict_contrib_sparse(mat, start_iteration, num_iteration):
+            parts = (out_data.astype(values.dtype, copy=False), out_indices, out_indptr.astype(indptr.dtype, copy=False))
+            shape = (nrow, ncol + 1)
+            out.append(scipy.sparse.csr_matrix(parts, shape) if is_csr else scipy.sparse.csc_matrix(parts, shape))
+        return out[0] if len(out) == 1 else out
 
     # ---- persistence
 

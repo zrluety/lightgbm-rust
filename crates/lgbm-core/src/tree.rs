@@ -23,6 +23,71 @@ pub fn maybe_round_to_zero(v: f64) -> f64 {
     if is_zero(v) { 0.0 } else { v }
 }
 
+/// One element of a TreeSHAP decision path (upstream `Tree::PathElement`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathElement {
+    feature_index: i32,
+    zero_fraction: f64,
+    one_fraction: f64,
+    pweight: f64,
+}
+
+/// upstream: `Tree::ExtendPath`.
+fn extend_path(p: &mut [PathElement], unique_depth: usize, zero_fraction: f64, one_fraction: f64, feature_index: i32) {
+    p[unique_depth] = PathElement {
+        feature_index,
+        zero_fraction,
+        one_fraction,
+        pweight: if unique_depth == 0 { 1.0 } else { 0.0 },
+    };
+    let d1 = (unique_depth + 1) as f64;
+    for i in (0..unique_depth).rev() {
+        p[i + 1].pweight += one_fraction * p[i].pweight * (i + 1) as f64 / d1;
+        p[i].pweight = zero_fraction * p[i].pweight * (unique_depth - i) as f64 / d1;
+    }
+}
+
+/// upstream: `Tree::UnwindPath`.
+fn unwind_path(p: &mut [PathElement], unique_depth: usize, path_index: usize) {
+    let one_fraction = p[path_index].one_fraction;
+    let zero_fraction = p[path_index].zero_fraction;
+    let mut next_one_portion = p[unique_depth].pweight;
+    let d1 = (unique_depth + 1) as f64;
+    for i in (0..unique_depth).rev() {
+        if one_fraction != 0.0 {
+            let tmp = p[i].pweight;
+            p[i].pweight = next_one_portion * d1 / ((i + 1) as f64 * one_fraction);
+            next_one_portion = tmp - p[i].pweight * zero_fraction * (unique_depth - i) as f64 / d1;
+        } else {
+            p[i].pweight = (p[i].pweight * d1) / (zero_fraction * (unique_depth - i) as f64);
+        }
+    }
+    for i in path_index..unique_depth {
+        p[i].feature_index = p[i + 1].feature_index;
+        p[i].zero_fraction = p[i + 1].zero_fraction;
+        p[i].one_fraction = p[i + 1].one_fraction;
+    }
+}
+
+/// upstream: `Tree::UnwoundPathSum`.
+fn unwound_path_sum(p: &[PathElement], unique_depth: usize, path_index: usize) -> f64 {
+    let one_fraction = p[path_index].one_fraction;
+    let zero_fraction = p[path_index].zero_fraction;
+    let mut next_one_portion = p[unique_depth].pweight;
+    let mut total = 0.0;
+    let d1 = (unique_depth + 1) as f64;
+    for i in (0..unique_depth).rev() {
+        if one_fraction != 0.0 {
+            let tmp = next_one_portion * d1 / ((i + 1) as f64 * one_fraction);
+            total += tmp;
+            next_one_portion = p[i].pweight - tmp * zero_fraction * ((unique_depth - i) as f64 / d1);
+        } else {
+            total += (p[i].pweight / zero_fraction) / ((unique_depth - i) as f64 / d1);
+        }
+    }
+    total
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tree {
     pub num_leaves: usize,
@@ -229,6 +294,103 @@ impl Tree {
     #[inline]
     pub fn predict(&self, row: &[f64]) -> f64 {
         self.leaf_value[self.get_leaf(row)]
+    }
+
+    #[inline]
+    fn data_count(&self, node: i32) -> f64 {
+        if node >= 0 { self.internal_count[node as usize] as f64 } else { self.leaf_count[!node as usize] as f64 }
+    }
+
+    /// upstream: `Tree::ExpectedValue`.
+    pub fn expected_value(&self) -> f64 {
+        if self.num_leaves == 1 {
+            return self.leaf_value[0];
+        }
+        let total_count = self.internal_count[0] as f64;
+        let mut exp_value = 0.0;
+        for i in 0..self.num_leaves {
+            exp_value += (self.leaf_count[i] as f64 / total_count) * self.leaf_value[i];
+        }
+        exp_value
+    }
+
+    /// Add this tree's SHAP values for `row` to `out[..num_features]` and its
+    /// expected value to `out[num_features]`. `path` is scratch space.
+    ///
+    /// upstream: `Tree::PredictContrib`.
+    pub fn predict_contrib(
+        &self,
+        row: &[f64],
+        num_features: usize,
+        expected_value: f64,
+        out: &mut [f64],
+        path: &mut Vec<PathElement>,
+    ) {
+        out[num_features] += expected_value;
+        if self.num_leaves > 1 {
+            let max_path_len = self.max_depth() as usize + 1;
+            path.clear();
+            path.resize(max_path_len * (max_path_len + 1) / 2, PathElement::default());
+            self.tree_shap(row, out, 0, 0, path, 0, 1.0, 1.0, -1);
+        }
+    }
+
+    /// upstream: `Tree::TreeSHAP`; the unique path of depth `unique_depth`
+    /// lives at `path[parent + unique_depth..]`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_shap(
+        &self,
+        row: &[f64],
+        phi: &mut [f64],
+        node: i32,
+        mut unique_depth: usize,
+        path: &mut [PathElement],
+        parent: usize,
+        parent_zero_fraction: f64,
+        parent_one_fraction: f64,
+        parent_feature_index: i32,
+    ) {
+        let base = parent + unique_depth;
+        if unique_depth > 0 {
+            path.copy_within(parent..parent + unique_depth, base);
+        }
+        extend_path(&mut path[base..], unique_depth, parent_zero_fraction, parent_one_fraction, parent_feature_index);
+
+        if node < 0 {
+            let unique_path = &path[base..];
+            let leaf_value = self.leaf_value[!node as usize];
+            for i in 1..=unique_depth {
+                let w = unwound_path_sum(unique_path, unique_depth, i);
+                let el = unique_path[i];
+                phi[el.feature_index as usize] += w * (el.one_fraction - el.zero_fraction) * leaf_value;
+            }
+        } else {
+            let n = node as usize;
+            let feature = self.split_feature[n];
+            let fval = row.get(feature as usize).copied().unwrap_or(0.0);
+            let hot_index = self.numerical_decision(fval, n);
+            let cold_index = if hot_index == self.left_child[n] { self.right_child[n] } else { self.left_child[n] };
+            let w = self.data_count(node);
+            let hot_zero_fraction = self.data_count(hot_index) / w;
+            let cold_zero_fraction = self.data_count(cold_index) / w;
+            let mut incoming_zero_fraction = 1.0;
+            let mut incoming_one_fraction = 1.0;
+
+            // undo an earlier split on the same feature so it can be redone here
+            let unique_path = &mut path[base..];
+            let path_index = (0..=unique_depth).find(|&i| unique_path[i].feature_index == feature);
+            if let Some(path_index) = path_index {
+                incoming_zero_fraction = unique_path[path_index].zero_fraction;
+                incoming_one_fraction = unique_path[path_index].one_fraction;
+                unwind_path(unique_path, unique_depth, path_index);
+                unique_depth -= 1;
+            }
+
+            self.tree_shap(row, phi, hot_index, unique_depth + 1, path, base,
+                           hot_zero_fraction * incoming_zero_fraction, incoming_one_fraction, feature);
+            self.tree_shap(row, phi, cold_index, unique_depth + 1, path, base,
+                           cold_zero_fraction * incoming_zero_fraction, 0.0, feature);
+        }
     }
 
     /// Leaf index of row `i` of a binned dataset. Requires the tree to have

@@ -26,6 +26,8 @@ pub enum PredictKind {
     Raw,
     /// Leaf index of every tree.
     LeafIndex,
+    /// SHAP feature contributions plus the expected value, per class.
+    Contrib,
 }
 
 /// One evaluation result: (dataset name, metric name, value, higher_is_better).

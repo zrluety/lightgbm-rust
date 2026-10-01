@@ -131,13 +131,10 @@ impl Gbdt {
         start_iteration: i32,
         num_iteration: i32,
     ) -> Result<Vec<f64>> {
-        if mat.ncols() != self.num_feature() {
-            return Err(LgbmError::InvalidData(format!(
-                "The number of features in data ({}) is not the same as it was in training data ({}).",
-                mat.ncols(),
-                self.num_feature()
-            )));
+        if kind == PredictKind::Contrib {
+            return self.predict_contrib(mat, start_iteration, num_iteration);
         }
+        self.check_num_features(mat)?;
         let ntpi = self.num_tree_per_iteration;
         let (start, num) = self.predict_window(start_iteration, num_iteration);
         let models = &self.models[start * ntpi..(start + num) * ntpi];
@@ -202,4 +199,173 @@ impl Gbdt {
         });
         Ok(out)
     }
+
+    fn check_num_features(&self, mat: &Matrix<'_>) -> Result<()> {
+        if mat.ncols() != self.num_feature() {
+            return Err(LgbmError::InvalidData(format!(
+                "The number of features in data ({}) is not the same as it was in training data ({}).",
+                mat.ncols(),
+                self.num_feature()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Per-row SHAP values, `nrows x (num_tree_per_iteration * (num_feature + 1))`
+    /// row-major; the last entry of each class block is the expected value.
+    ///
+    /// upstream: `GBDT::PredictContrib`, `Predictor` (`predict_contrib`).
+    pub fn predict_contrib(&self, mat: &Matrix<'_>, start_iteration: i32, num_iteration: i32) -> Result<Vec<f64>> {
+        self.check_num_features(mat)?;
+        let nf = self.num_feature();
+        let ntpi = self.num_tree_per_iteration;
+        let width = ntpi * (nf + 1);
+        let mut out = vec![0.0; mat.nrows() * width];
+        self.for_each_contrib_row(mat, start_iteration, num_iteration, &mut out, width, |_, o, phi| {
+            o.copy_from_slice(phi);
+        });
+        Ok(out)
+    }
+
+    /// SHAP values as one sparse matrix per class, with `num_feature + 1`
+    /// columns, in CSR (`csr`) or CSC layout.
+    ///
+    /// Like upstream, every row stores the columns of all features split on
+    /// by that class's trees, plus the expected-value column, even where the
+    /// value is 0. Column indices within a CSR row are sorted (upstream's
+    /// order is that of an `unordered_map`).
+    ///
+    /// upstream: `Booster::PredictSparseCSR`, `Booster::PredictSparseCSC`,
+    /// `GBDT::PredictContribByMap`.
+    pub fn predict_contrib_sparse(
+        &self,
+        mat: &Matrix<'_>,
+        start_iteration: i32,
+        num_iteration: i32,
+        csr: bool,
+    ) -> Result<Vec<SparseContrib>> {
+        self.check_num_features(mat)?;
+        let nf = self.num_feature();
+        let ntpi = self.num_tree_per_iteration;
+        let (start, num) = self.predict_window(start_iteration, num_iteration);
+        let keys: Vec<Vec<usize>> = (0..ntpi)
+            .map(|k| {
+                let mut used = vec![false; nf + 1];
+                for it in start..start + num {
+                    let t = &self.models[it * ntpi + k];
+                    used[nf] = true;
+                    if t.num_leaves > 1 {
+                        for &f in &t.split_feature {
+                            used[f as usize] = true;
+                        }
+                    }
+                }
+                (0..=nf).filter(|&c| used[c]).collect()
+            })
+            .collect();
+        let offsets: Vec<usize> = std::iter::once(0).chain(keys.iter().scan(0, |s, k| { *s += k.len(); Some(*s) })).collect();
+        let width = offsets[ntpi];
+        let nrows = mat.nrows();
+        let mut values = vec![0.0; nrows * width];
+        self.for_each_contrib_row(mat, start_iteration, num_iteration, &mut values, width, |_, o, phi| {
+            for (k, ks) in keys.iter().enumerate() {
+                let block = &phi[k * (nf + 1)..(k + 1) * (nf + 1)];
+                for (dst, &c) in o[offsets[k]..offsets[k + 1]].iter_mut().zip(ks) {
+                    *dst = block[c];
+                }
+            }
+        });
+        if csr && ntpi == 1 {
+            let nk = keys[0].len();
+            return Ok(vec![SparseContrib {
+                indptr: (0..=nrows).map(|r| (r * nk) as i64).collect(),
+                indices: (0..nrows).flat_map(|_| keys[0].iter().map(|&c| c as i32)).collect(),
+                values,
+            }]);
+        }
+        Ok(keys
+            .iter()
+            .enumerate()
+            .map(|(k, ks)| {
+                let nk = ks.len();
+                let cell = |r: usize, j: usize| values[r * width + offsets[k] + j];
+                if csr {
+                    SparseContrib {
+                        indptr: (0..=nrows).map(|r| (r * nk) as i64).collect(),
+                        indices: (0..nrows).flat_map(|_| ks.iter().map(|&c| c as i32)).collect(),
+                        values: (0..nrows).flat_map(|r| (0..nk).map(move |j| (r, j))).map(|(r, j)| cell(r, j)).collect(),
+                    }
+                } else {
+                    let mut indptr = Vec::with_capacity(nf + 2);
+                    let mut stored = 0i64;
+                    indptr.push(0);
+                    let mut next_key = ks.iter().peekable();
+                    for c in 0..=nf {
+                        if next_key.peek() == Some(&&c) {
+                            next_key.next();
+                            stored += nrows as i64;
+                        }
+                        indptr.push(stored);
+                    }
+                    SparseContrib {
+                        indptr,
+                        indices: (0..nk).flat_map(|_| 0..nrows as i32).collect(),
+                        values: (0..nk).flat_map(|j| (0..nrows).map(move |r| (r, j))).map(|(r, j)| cell(r, j)).collect(),
+                    }
+                }
+            })
+            .collect())
+    }
+
+    /// Run TreeSHAP for every row and hand `(row, out_row, phi)` to `emit`,
+    /// where `phi` is `num_tree_per_iteration * (num_feature + 1)` wide.
+    fn for_each_contrib_row(
+        &self,
+        mat: &Matrix<'_>,
+        start_iteration: i32,
+        num_iteration: i32,
+        out: &mut [f64],
+        width: usize,
+        emit: impl Fn(usize, &mut [f64], &[f64]) + Sync + Send,
+    ) {
+        let nf = self.num_feature();
+        let ntpi = self.num_tree_per_iteration;
+        let (start, num) = self.predict_window(start_iteration, num_iteration);
+        let models = &self.models[start * ntpi..(start + num) * ntpi];
+        let expected: Vec<f64> = models.iter().map(|t| t.expected_value()).collect();
+        let reader = mat.rows();
+        if width == 0 {
+            return;
+        }
+        self.install(|| {
+            out.par_chunks_mut(width).enumerate().for_each_init(
+                || (vec![0.0f64; nf], vec![0.0f64; ntpi * (nf + 1)], Vec::new()),
+                |(row, phi, path), (r, o)| {
+                    reader.row_into(r, row);
+                    for v in row.iter_mut() {
+                        // upstream predictor drops |v| <= kZeroThreshold (sparse row pairs)
+                        if !v.is_nan() && v.abs() <= K_ZERO_THRESHOLD {
+                            *v = 0.0;
+                        }
+                    }
+                    phi.fill(0.0);
+                    for it in 0..num {
+                        for k in 0..ntpi {
+                            let m = it * ntpi + k;
+                            models[m].predict_contrib(row, nf, expected[m], &mut phi[k * (nf + 1)..(k + 1) * (nf + 1)], path);
+                        }
+                    }
+                    emit(r, o, phi);
+                },
+            );
+        });
+    }
+}
+
+/// One class's SHAP values from [`Gbdt::predict_contrib_sparse`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SparseContrib {
+    pub indptr: Vec<i64>,
+    pub indices: Vec<i32>,
+    pub values: Vec<f64>,
 }

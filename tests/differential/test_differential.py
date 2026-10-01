@@ -650,6 +650,51 @@ def test_sparse_inputs(case, fmt, recorder):
     rec.finish()
 
 
+@pytest.mark.parametrize("case", CASES, ids=case_ids())
+def test_pred_contrib(case, recorder):
+    """SHAP values (dense output) of identically trained models, and of upstream's model loaded into lightgbm-rust."""
+    rec = recorder(case.name)
+    rs, up = train_both(case, valid=False)
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    rec.compare("pred_contrib[holdout]", "predictions", rs.predict(case.Xv, pred_contrib=True),
+                up.predict(case.Xv, pred_contrib=True))
+    window = dict(start_iteration=3, num_iteration=10)
+    rec.compare("pred_contrib[holdout, iterations 3..13]", "predictions",
+                rs.predict(case.Xv, pred_contrib=True, **window), up.predict(case.Xv, pred_contrib=True, **window))
+    loaded = lgb_rs.Booster(model_str=up.model_to_string())
+    rec.compare("pred_contrib[upstream model]", "predictions", loaded.predict(case.Xv, pred_contrib=True),
+                up.predict(case.Xv, pred_contrib=True))
+    rec.finish()
+
+
+CONTRIB_SPARSE_CASES = [c for c in SPARSE_CASES if c.name in ("reg_nan_zero", "reg_sparse", "mc_basic",
+                                                              "reg_sparse_most_freq_one")]
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc", "csr_f32_int64_indptr"])
+@pytest.mark.parametrize("case", CONTRIB_SPARSE_CASES, ids=[c.name for c in CONTRIB_SPARSE_CASES])
+def test_pred_contrib_sparse(case, fmt, recorder):
+    """Sparse SHAP output: matrix type, dtypes, shape, stored cells and values, against upstream."""
+    import scipy.sparse as sp
+
+    rec = recorder(f"{case.name}[{fmt}]")
+    rs, up = train_both(case, valid=False)
+    Xv = _to_sparse(case.Xv, fmt)
+    got, want = rs.predict(Xv, pred_contrib=True), up.predict(Xv, pred_contrib=True)
+    got, want = (got, want) if isinstance(want, list) else ([got], [want])
+    rec.compare("num_matrices", "tree_structure", len(got), len(want))
+    for k, (g, w) in enumerate(zip(got, want)):
+        rec.compare(f"[{k}] format", "tree_structure", float(sp.isspmatrix_csr(g)), float(sp.isspmatrix_csr(w)))
+        rec.compare(f"[{k}] dtypes", "tree_structure", float(g.dtype == w.dtype and g.indptr.dtype == w.indptr.dtype),
+                    1.0)
+        rec.compare(f"[{k}] shape", "tree_structure", list(g.shape), list(w.shape))
+        cells = lambda m: sorted(zip(*m.nonzero())) if m.nnz == 0 else sorted(zip(*m.tocoo().coords))  # noqa: E731
+        rec.compare(f"[{k}] nnz", "tree_structure", g.nnz, w.nnz)
+        rec.compare(f"[{k}] stored cells equal", "tree_structure", float(cells(g) == cells(w)), 1.0)
+        rec.compare(f"[{k}] values", "predictions", g.toarray(), w.toarray())
+    rec.finish()
+
+
 def test_sparse_input_errors():
     """upstream argument checks in Dataset.__init_from_csr and the predictor."""
     sp = pytest.importorskip("scipy.sparse")

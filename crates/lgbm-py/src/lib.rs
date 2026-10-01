@@ -349,6 +349,7 @@ fn predict_kind(kind: &str) -> PyResult<PredictKind> {
         "normal" => Ok(PredictKind::Normal),
         "raw" => Ok(PredictKind::Raw),
         "leaf" => Ok(PredictKind::LeafIndex),
+        "contrib" => Ok(PredictKind::Contrib),
         _ => Err(PyValueError::new_err(format!("unknown prediction kind `{kind}`"))),
     }
 }
@@ -471,6 +472,30 @@ impl RsBooster {
         let out = detached(py, || g.predict_matrix(&view, kind, start_iteration, num_iteration))?;
         let width = if nrows == 0 { 0 } else { out.len() / nrows };
         out.into_pyarray(py).reshape([nrows, width])
+    }
+
+    /// SHAP values of a CSR/CSC matrix as one `(indptr, indices, data)` per
+    /// class, in the input's layout.
+    #[pyo3(signature = (data, start_iteration=0, num_iteration=-1))]
+    #[allow(clippy::type_complexity)]
+    fn predict_contrib_sparse<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        start_iteration: i32,
+        num_iteration: i32,
+    ) -> PyResult<Vec<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<f64>>)>> {
+        let mat = Matrix::extract(data)?;
+        let view = mat.view()?;
+        let Matrix2::Sparse(sp) = view else {
+            return Err(PyTypeError::new_err("expected a CSR or CSC matrix"));
+        };
+        let g = &self.inner;
+        let out = detached(py, || g.predict_contrib_sparse(&view, start_iteration, num_iteration, sp.is_csr()))?;
+        Ok(out
+            .into_iter()
+            .map(|m| (m.indptr.into_pyarray(py), m.indices.into_pyarray(py), m.values.into_pyarray(py)))
+            .collect())
     }
 
     #[pyo3(signature = (start_iteration=0, num_iteration=-1, importance_type=0))]
