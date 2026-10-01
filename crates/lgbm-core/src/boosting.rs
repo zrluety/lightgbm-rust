@@ -1,0 +1,579 @@
+//! Gradient boosting driver.
+//!
+//! upstream: src/boosting/gbdt.cpp (`GBDT::Init`, `TrainOneIter`,
+//! `BoostFromAverage`, `UpdateScore`, `GetEvalAt`, `InitPredict`,
+//! `PredictRaw`, `FeatureImportance`).
+
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::consts::K_EPSILON;
+use crate::dataset::Dataset;
+use crate::error::{LgbmError, Result};
+use crate::learner::SerialTreeLearner;
+use crate::metric::{Metric, MetricKind};
+use crate::objective::{Objective, ScoreView, create_objective};
+use crate::tree::Tree;
+
+/// Which prediction to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictKind {
+    /// Objective-transformed output (e.g. probability for `binary`).
+    Normal,
+    /// Raw additive score.
+    Raw,
+    /// Leaf index of every tree.
+    LeafIndex,
+}
+
+/// One evaluation result: (dataset name, metric name, value, higher_is_better).
+pub type EvalResult = (String, String, f64, bool);
+
+struct ValidSet {
+    name: String,
+    data: Arc<Dataset>,
+    scores: Vec<f64>,
+    metrics: Vec<Metric>,
+}
+
+struct TrainState {
+    data: Arc<Dataset>,
+    learner: SerialTreeLearner,
+    scores: Vec<f64>,
+    has_init_score: bool,
+    grad: Vec<f32>,
+    hess: Vec<f32>,
+    class_need_train: Vec<bool>,
+    metrics: Vec<Metric>,
+    valid: Vec<ValidSet>,
+    iter: usize,
+}
+
+pub struct Gbdt {
+    pub(crate) config: Option<Config>,
+    pub(crate) loaded_parameters: Option<String>,
+    pub(crate) objective: Option<Objective>,
+    pub(crate) models: Vec<Tree>,
+    pub(crate) num_tree_per_iteration: usize,
+    pub(crate) num_class: usize,
+    pub(crate) label_index: i32,
+    pub(crate) max_feature_idx: i32,
+    pub(crate) feature_names: Vec<String>,
+    pub(crate) feature_infos: Vec<String>,
+    train: Option<TrainState>,
+    pool: Option<Arc<rayon::ThreadPool>>,
+}
+
+fn build_pool(num_threads: i32) -> Result<Option<Arc<rayon::ThreadPool>>> {
+    if num_threads <= 0 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads as usize)
+        .build()
+        .map(|p| Some(Arc::new(p)))
+        .map_err(|e| LgbmError::Internal(format!("cannot build thread pool: {e}")))
+}
+
+impl Gbdt {
+    /// A model with no trees and no training state.
+    pub(crate) fn empty() -> Self {
+        Self {
+            config: None,
+            loaded_parameters: None,
+            objective: None,
+            models: Vec::new(),
+            num_tree_per_iteration: 1,
+            num_class: 1,
+            label_index: 0,
+            max_feature_idx: -1,
+            feature_names: Vec::new(),
+            feature_infos: Vec::new(),
+            train: None,
+            pool: None,
+        }
+    }
+
+    /// Create a booster for training. `objective` overrides the built-in one
+    /// chosen by `config.objective` (pass `None` to use the config).
+    pub fn new(config: Config, train: Arc<Dataset>, objective: Option<Objective>) -> Result<Self> {
+        // upstream: Dataset::GetShareStates
+        if config.force_col_wise && config.force_row_wise {
+            return Err(LgbmError::InvalidParameter(
+                "Cannot set both of `force_col_wise` and `force_row_wise` to `true` at the same time".into(),
+            ));
+        }
+        let mut objective = match objective {
+            Some(o) => Some(o),
+            None => create_objective(&config)?,
+        };
+        let n = train.num_data();
+        if let Some(o) = objective.as_mut() {
+            o.init(&train.metadata, n)?;
+        }
+        let ntpi = objective.as_ref().map_or(1, |o| o.num_outputs());
+        let class_need_train = (0..ntpi)
+            .map(|k| objective.as_ref().is_none_or(|o| o.class_need_train(k)))
+            .collect();
+        let mut scores = vec![0.0; n * ntpi];
+        let has_init_score = match train.init_score() {
+            Some(s) => {
+                if s.len() != n * ntpi {
+                    return Err(LgbmError::InvalidData(format!(
+                        "init_score has {} values, expected {}",
+                        s.len(),
+                        n * ntpi
+                    )));
+                }
+                scores.copy_from_slice(s);
+                true
+            }
+            None => false,
+        };
+        let metrics = if config.is_provide_training_metric {
+            Self::make_metrics(&config, &train)?
+        } else {
+            Vec::new()
+        };
+        let pool = build_pool(config.num_threads)?;
+        let learner = SerialTreeLearner::new(train.clone(), &config);
+        Ok(Self {
+            num_tree_per_iteration: ntpi,
+            num_class: 1,
+            label_index: 0,
+            max_feature_idx: train.num_total_features() as i32 - 1,
+            feature_names: train.feature_names().to_vec(),
+            feature_infos: train.feature_infos(),
+            objective,
+            models: Vec::new(),
+            train: Some(TrainState {
+                data: train,
+                learner,
+                scores,
+                has_init_score,
+                grad: vec![0.0; n * ntpi],
+                hess: vec![0.0; n * ntpi],
+                class_need_train,
+                metrics,
+                valid: Vec::new(),
+                iter: 0,
+            }),
+            config: Some(config),
+            loaded_parameters: None,
+            pool,
+        })
+    }
+
+    fn make_metrics(config: &Config, data: &Dataset) -> Result<Vec<Metric>> {
+        config
+            .metric
+            .iter()
+            .filter(|m| m.as_str() != "custom")
+            .map(|m| Ok(Metric::new(MetricKind::from_name(m)?, &data.metadata)))
+            .collect()
+    }
+
+    pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        match &self.pool {
+            Some(p) => p.install(f),
+            None => f(),
+        }
+    }
+
+    /// Attach a validation set (must share the training set's bin mappers).
+    pub fn add_valid(&mut self, data: Arc<Dataset>, name: &str) -> Result<()> {
+        let config = self.config.as_ref().ok_or_else(|| LgbmError::Internal("no config".into()))?;
+        let metrics = Self::make_metrics(config, &data)?;
+        let ntpi = self.num_tree_per_iteration;
+        let st = self.train.as_mut().ok_or_else(|| LgbmError::InvalidData("booster is not training".into()))?;
+        if !data.same_bins_as(&st.data) {
+            return Err(LgbmError::InvalidData(
+                "validation data must be constructed with reference to the training data".into(),
+            ));
+        }
+        let n = data.num_data();
+        let mut scores = vec![0.0; n * ntpi];
+        if let Some(s) = data.init_score() {
+            if s.len() != n * ntpi {
+                return Err(LgbmError::InvalidData("validation init_score size mismatch".into()));
+            }
+            scores.copy_from_slice(s);
+        }
+        // Bring scores up to date with trees trained so far.
+        for (i, t) in self.models.iter().enumerate() {
+            let k = i % ntpi;
+            t.add_prediction_to_score(&data, &mut scores[k * n..(k + 1) * n]);
+        }
+        st.valid.push(ValidSet { name: name.to_string(), data, scores, metrics });
+        Ok(())
+    }
+
+    pub fn num_tree_per_iteration(&self) -> usize {
+        self.num_tree_per_iteration
+    }
+
+    pub fn num_trees(&self) -> usize {
+        self.models.len()
+    }
+
+    pub fn current_iteration(&self) -> usize {
+        self.models.len() / self.num_tree_per_iteration
+    }
+
+    pub fn num_feature(&self) -> usize {
+        (self.max_feature_idx + 1) as usize
+    }
+
+    pub fn feature_names(&self) -> &[String] {
+        &self.feature_names
+    }
+
+    pub fn trees(&self) -> &[Tree] {
+        &self.models
+    }
+
+    pub fn objective(&self) -> Option<&Objective> {
+        self.objective.as_ref()
+    }
+
+    pub fn config(&self) -> Option<&Config> {
+        self.config.as_ref()
+    }
+
+    /// Enable split tracing on the tree learner (for differential tests).
+    pub fn enable_trace(&mut self) {
+        if let Some(st) = self.train.as_mut() {
+            st.learner.trace = Some(Default::default());
+        }
+    }
+
+    pub fn last_trace(&self) -> Option<&crate::learner::TreeTrace> {
+        self.train.as_ref().and_then(|s| s.learner.trace.as_ref())
+    }
+
+    /// Current training scores (class-major).
+    pub fn train_scores(&self) -> Option<&[f64]> {
+        self.train.as_ref().map(|s| s.scores.as_slice())
+    }
+
+    /// Gradients and Hessians computed for the most recent iteration.
+    pub fn last_gradients(&self) -> Option<(&[f32], &[f32])> {
+        self.train.as_ref().map(|s| (s.grad.as_slice(), s.hess.as_slice()))
+    }
+
+    /// upstream: `GBDT::BoostFromAverage`.
+    fn boost_from_average(&mut self, k: usize) -> f64 {
+        let cfg = self.config.as_ref().expect("training config");
+        let st = self.train.as_mut().expect("training state");
+        if self.models.is_empty() && !st.has_init_score {
+            if let Some(obj) = self.objective.as_ref() {
+                if cfg.boost_from_average || st.data.num_features() == 0 {
+                    let init = obj.boost_from_score(k);
+                    if init.abs() > K_EPSILON {
+                        add_const(&mut st.scores, k, st.data.num_data(), init);
+                        for v in st.valid.iter_mut() {
+                            let n = v.data.num_data();
+                            add_const(&mut v.scores, k, n, init);
+                        }
+                        return init;
+                    }
+                }
+            }
+        }
+        0.0
+    }
+
+    /// One boosting iteration. With `custom = Some((grad, hess))` the given
+    /// gradients are used instead of the objective's. Returns `true` when
+    /// training cannot continue (no tree could split).
+    pub fn train_one_iter(&mut self, custom: Option<(&[f32], &[f32])>) -> Result<bool> {
+        if self.train.is_none() {
+            return Err(LgbmError::InvalidData("booster has no training data".into()));
+        }
+        let ntpi = self.num_tree_per_iteration;
+        let n = self.train.as_ref().unwrap().data.num_data();
+        let mut init_scores = vec![0.0; ntpi];
+        match custom {
+            None => {
+                if self.objective.is_none() {
+                    return Err(LgbmError::InvalidParameter(
+                        "no objective function; provide gradients and hessians".into(),
+                    ));
+                }
+                for (k, s) in init_scores.iter_mut().enumerate() {
+                    *s = self.boost_from_average(k);
+                }
+                let st = self.train.as_mut().unwrap();
+                let obj = self.objective.as_ref().unwrap();
+                let view = ScoreView { scores: &st.scores, num_data: n, num_outputs: ntpi };
+                let pool = self.pool.clone();
+                match pool {
+                    Some(p) => p.install(|| obj.gradients(view, &mut st.grad, &mut st.hess)),
+                    None => obj.gradients(view, &mut st.grad, &mut st.hess),
+                }
+            }
+            Some((g, h)) => {
+                if self.objective.is_some() {
+                    return Err(LgbmError::InvalidParameter(
+                        "custom gradients require objective=none/custom".into(),
+                    ));
+                }
+                if g.len() != n * ntpi || h.len() != n * ntpi {
+                    return Err(LgbmError::InvalidData(format!(
+                        "gradient/hessian length must be {} (got {} and {})",
+                        n * ntpi,
+                        g.len(),
+                        h.len()
+                    )));
+                }
+                let st = self.train.as_mut().unwrap();
+                st.grad.copy_from_slice(g);
+                st.hess.copy_from_slice(h);
+            }
+        }
+
+        let cfg = self.config.clone().expect("training config");
+        let mut should_continue = false;
+        for k in 0..ntpi {
+            let offset = k * n;
+            let need_train = {
+                let st = self.train.as_ref().unwrap();
+                st.class_need_train[k] && st.data.num_features() > 0
+            };
+            let mut tree = if need_train {
+                let st = self.train.as_mut().unwrap();
+                let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
+                let learner = &mut st.learner;
+                match &self.pool {
+                    Some(p) => p.install(|| learner.train(g, h)),
+                    None => learner.train(g, h),
+                }
+            } else {
+                Tree::new(2)
+            };
+
+            if tree.num_leaves > 1 {
+                should_continue = true;
+                tree.shrink(cfg.learning_rate);
+                let st = self.train.as_mut().unwrap();
+                let mut update = || {
+                    st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
+                    for v in st.valid.iter_mut() {
+                        let vn = v.data.num_data();
+                        tree.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
+                    }
+                };
+                match &self.pool {
+                    Some(p) => p.install(update),
+                    None => update(),
+                }
+                if init_scores[k].abs() > K_EPSILON {
+                    tree.add_bias(init_scores[k]);
+                }
+            } else if self.models.len() < ntpi {
+                let has_init = self.train.as_ref().unwrap().has_init_score;
+                if self.objective.is_some() && !cfg.boost_from_average && !has_init {
+                    init_scores[k] = self.objective.as_ref().unwrap().boost_from_score(k);
+                    let st = self.train.as_mut().unwrap();
+                    add_const(&mut st.scores, k, n, init_scores[k]);
+                    for v in st.valid.iter_mut() {
+                        let vn = v.data.num_data();
+                        add_const(&mut v.scores, k, vn, init_scores[k]);
+                    }
+                }
+                tree.as_constant(init_scores[k], n as i32);
+            } else {
+                tree.as_constant(0.0, n as i32);
+            }
+            self.models.push(tree);
+        }
+
+        if !should_continue {
+            if self.models.len() > ntpi {
+                for _ in 0..ntpi {
+                    self.models.pop();
+                }
+            }
+            return Ok(true);
+        }
+        self.train.as_mut().unwrap().iter += 1;
+        Ok(false)
+    }
+
+    /// Remove the last iteration's trees and their score contributions.
+    pub fn rollback_one_iter(&mut self) -> Result<()> {
+        let ntpi = self.num_tree_per_iteration;
+        let st = self.train.as_mut().ok_or_else(|| LgbmError::InvalidData("not training".into()))?;
+        if st.iter == 0 || self.models.len() < ntpi {
+            return Ok(());
+        }
+        let n = st.data.num_data();
+        let start = self.models.len() - ntpi;
+        for k in 0..ntpi {
+            let mut t = self.models[start + k].clone();
+            t.shrink(-1.0);
+            t.add_prediction_to_score(&st.data, &mut st.scores[k * n..(k + 1) * n]);
+            for v in st.valid.iter_mut() {
+                let vn = v.data.num_data();
+                t.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
+            }
+        }
+        self.models.truncate(start);
+        st.iter -= 1;
+        Ok(())
+    }
+
+    /// Evaluate the built-in metrics on the training data.
+    pub fn eval_train(&self) -> Vec<EvalResult> {
+        let Some(st) = self.train.as_ref() else { return Vec::new() };
+        let metrics: Vec<Metric> = if st.metrics.is_empty() {
+            self.config
+                .as_ref()
+                .and_then(|c| Self::make_metrics(c, &st.data).ok())
+                .unwrap_or_default()
+        } else {
+            st.metrics.clone()
+        };
+        metrics
+            .iter()
+            .map(|m| {
+                (
+                    "training".to_string(),
+                    m.kind.name().to_string(),
+                    m.eval(&st.scores, self.objective.as_ref()),
+                    m.kind.higher_better(),
+                )
+            })
+            .collect()
+    }
+
+    /// Evaluate the built-in metrics on every validation set.
+    pub fn eval_valid(&self) -> Vec<EvalResult> {
+        let Some(st) = self.train.as_ref() else { return Vec::new() };
+        let mut out = Vec::new();
+        for v in &st.valid {
+            for m in &v.metrics {
+                out.push((
+                    v.name.clone(),
+                    m.kind.name().to_string(),
+                    m.eval(&v.scores, self.objective.as_ref()),
+                    m.kind.higher_better(),
+                ));
+            }
+        }
+        out
+    }
+
+    pub fn num_valid(&self) -> usize {
+        self.train.as_ref().map_or(0, |s| s.valid.len())
+    }
+
+    /// Raw scores of validation set `i` (class-major).
+    pub fn valid_scores(&self, i: usize) -> Option<&[f64]> {
+        self.train.as_ref().and_then(|s| s.valid.get(i)).map(|v| v.scores.as_slice())
+    }
+
+    /// Train up to `num_iterations` with optional early stopping on the
+    /// first validation set's metrics (upstream `GBDT::Train` semantics with
+    /// `early_stopping_round`). Returns the best iteration (1-based) when
+    /// early stopping triggered, else 0.
+    pub fn train(&mut self) -> Result<usize> {
+        let cfg = self.config.clone().ok_or_else(|| LgbmError::Internal("no config".into()))?;
+        let rounds = cfg.early_stopping_round.max(0) as usize;
+        let mut best: Vec<f64> = Vec::new();
+        let mut best_iter: Vec<usize> = Vec::new();
+        for _ in 0..cfg.num_iterations.max(0) {
+            if self.train_one_iter(None)? {
+                break;
+            }
+            if rounds == 0 {
+                continue;
+            }
+            let evals = self.eval_valid();
+            if evals.is_empty() {
+                continue;
+            }
+            let iter = self.current_iteration();
+            if best.is_empty() {
+                best = evals.iter().map(|e| if e.3 { f64::NEG_INFINITY } else { f64::INFINITY }).collect();
+                best_iter = vec![0; evals.len()];
+            }
+            let limit = if cfg.first_metric_only { 1 } else { evals.len() };
+            for (j, e) in evals.iter().enumerate().take(limit) {
+                let improved = if e.3 {
+                    e.2 > best[j] + cfg.early_stopping_min_delta
+                } else {
+                    e.2 < best[j] - cfg.early_stopping_min_delta
+                };
+                if improved {
+                    best[j] = e.2;
+                    best_iter[j] = iter;
+                } else if iter - best_iter[j] >= rounds {
+                    let keep = best_iter[j];
+                    while self.current_iteration() > keep {
+                        self.rollback_one_iter()?;
+                    }
+                    return Ok(keep);
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    /// upstream: `GBDT::FeatureImportance` (0 = split count, 1 = total gain).
+    pub fn feature_importance(&self, num_iteration: i32, importance_type: i32) -> Result<Vec<f64>> {
+        let mut n_models = self.models.len();
+        if num_iteration > 0 {
+            n_models = n_models.min(num_iteration as usize * self.num_tree_per_iteration);
+        }
+        let mut imp = vec![0.0f64; self.num_feature()];
+        for t in &self.models[..n_models] {
+            for s in 0..t.num_leaves.saturating_sub(1) {
+                if t.split_gain[s] > 0.0 {
+                    let f = t.split_feature[s] as usize;
+                    match importance_type {
+                        0 => imp[f] += 1.0,
+                        1 => imp[f] += t.split_gain[s] as f64,
+                        _ => {
+                            return Err(LgbmError::InvalidParameter(
+                                "Unknown importance type: only support split=0 and gain=1".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(imp)
+    }
+
+    /// Parameters block of a loaded model (`[name: value]` lines).
+    pub fn loaded_parameters(&self) -> Option<&str> {
+        self.loaded_parameters.as_deref()
+    }
+
+    /// Switch to caller-supplied gradients (upstream: `reset_parameter({"objective": "none"})`).
+    /// Scores accumulated so far are kept.
+    pub fn clear_objective(&mut self) {
+        self.objective = None;
+        if let Some(c) = self.config.as_mut() {
+            c.objective = "custom".into();
+        }
+    }
+
+    /// Drop the training state (datasets, scores, learner) and keep the model.
+    pub fn free_training_state(&mut self) {
+        self.train = None;
+    }
+
+    /// Set the thread count used by prediction.
+    pub fn set_num_threads(&mut self, n: i32) -> Result<()> {
+        self.pool = build_pool(n)?;
+        Ok(())
+    }
+}
+
+fn add_const(scores: &mut [f64], k: usize, n: usize, v: f64) {
+    for s in &mut scores[k * n..(k + 1) * n] {
+        *s += v;
+    }
+}

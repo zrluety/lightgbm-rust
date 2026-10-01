@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+.venv/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+/dist/
+/build/
+/tests/report/*.json
+/tests/report/cargo_test.txt
+/tests/report/raw/
+/benches/results/raw/

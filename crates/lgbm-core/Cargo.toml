@@ -1,0 +1,19 @@
+[package]
+name = "lgbm-core"
+description = "Pure-Rust gradient boosting engine targeting LightGBM v4.7.0 behavior"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+
+[[bench]]
+name = "train"
+harness = false

@@ -1,0 +1,17 @@
+[package]
+name = "lgbm-py"
+description = "PyO3 bindings for lgbm-core (Python package lightgbm_rust)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "_lightgbm_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+pyo3 = { version = "0.29.3", features = ["abi3-py310"] }
+numpy = "0.29.0"

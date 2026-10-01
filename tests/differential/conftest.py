@@ -1,0 +1,328 @@
+"""Shared helpers for differential tests against upstream LightGBM 4.7.0.
+
+Every comparison goes through ``Recorder.compare``, which applies the
+tolerance from ``tests/tolerances.toml``, records the measured maximum
+absolute/relative differences, and fails the test if the tolerance is
+exceeded. Records are written to ``tests/report/differential.json`` for the
+summary report.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import tomllib
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+import lightgbm as lgb_up
+import numpy as np
+import pytest
+
+import lightgbm_rust as lgb_rs
+
+ROOT = Path(__file__).resolve().parents[2]
+TOLERANCES: Dict[str, Dict[str, Any]] = tomllib.loads((ROOT / "tests" / "tolerances.toml").read_text())
+REPORT = ROOT / "tests" / "report" / "differential.json"
+
+assert lgb_up.__version__ == "4.7.0", f"reference must be lightgbm 4.7.0, found {lgb_up.__version__}"
+assert not hasattr(lgb_rs.basic, "_LIB"), "lightgbm_rust must not load the upstream library"
+
+DETERMINISTIC = {"deterministic": True, "force_row_wise": True, "num_threads": 1, "verbosity": -1}
+
+
+@dataclass
+class Record:
+    test: str
+    case: str
+    quantity: str
+    tolerance: str
+    n: int
+    max_abs: float
+    max_rel: float
+    exact: bool
+    passed: bool
+    note: str = ""
+
+
+_RECORDS: List[Record] = []
+
+
+def _as_float_array(x: Any) -> np.ndarray:
+    return np.asarray(x, dtype=np.float64).ravel()
+
+
+@dataclass
+class Recorder:
+    test: str
+    case: str
+    failures: List[str] = field(default_factory=list)
+
+    def compare(self, quantity: str, tolerance: str, rust: Any, upstream: Any, note: str = "") -> bool:
+        tol = TOLERANCES[tolerance]
+
+        def numeric(x: Any) -> bool:
+            try:
+                _as_float_array(x)
+                return True
+            except (TypeError, ValueError):
+                return False
+
+        if isinstance(rust, str) or isinstance(upstream, str) or not (numeric(rust) and numeric(upstream)):
+            exact = rust == upstream
+            rec = Record(self.test, self.case, quantity, tolerance, 1, 0.0 if exact else math.inf,
+                         0.0 if exact else math.inf, exact, exact, note)
+            if not exact:
+                detail = _first_text_diff(upstream, rust) if isinstance(rust, str) else f"upstream={upstream!r} rust={rust!r}"
+                rec.note = (note + " " + detail).strip()
+        else:
+            a = _as_float_array(rust)
+            b = _as_float_array(upstream)
+            if a.shape != b.shape:
+                rec = Record(self.test, self.case, quantity, tolerance, int(b.size), math.inf, math.inf, False, False,
+                             f"shape mismatch: rust {a.shape} vs upstream {b.shape}")
+            else:
+                both_nan = np.isnan(a) & np.isnan(b)
+                diff = np.where(both_nan, 0.0, np.abs(a - b))
+                diff = np.where(np.isnan(diff), np.inf, diff)
+                denom = np.abs(b)
+                rel = np.divide(diff, denom, out=np.where(diff > 0, np.inf, 0.0), where=denom > 0)
+                exact = bool(np.all((a == b) | both_nan))
+                if tol["mode"] == "exact":
+                    passed = exact
+                else:
+                    passed = bool(np.all(diff <= tol["atol"] + tol["rtol"] * denom))
+                rec = Record(self.test, self.case, quantity, tolerance, int(b.size),
+                             float(diff.max(initial=0.0)), float(rel.max(initial=0.0)), exact, passed, note)
+        _RECORDS.append(rec)
+        if not rec.passed:
+            self.failures.append(
+                f"{quantity} [{tolerance}]: max_abs={rec.max_abs:.3e} max_rel={rec.max_rel:.3e} {rec.note}".strip()
+            )
+        return rec.passed
+
+    def finish(self) -> None:
+        if self.failures:
+            pytest.fail(f"{self.case}: " + "; ".join(self.failures), pytrace=False)
+
+
+def _first_text_diff(a: str, b: str) -> str:
+    al, bl = a.splitlines(), b.splitlines()
+    for i, (x, y) in enumerate(zip(al, bl)):
+        if x != y:
+            return f"first difference at line {i + 1}: upstream={x[:120]!r} rust={y[:120]!r}"
+    if len(al) != len(bl):
+        return f"line count differs: upstream={len(al)} rust={len(bl)}"
+    return "texts differ"
+
+
+@pytest.fixture
+def recorder(request: pytest.FixtureRequest) -> Callable[[str], Recorder]:
+    def make(case: str) -> Recorder:
+        return Recorder(request.node.originalname or request.node.name, case)
+
+    return make
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if not _RECORDS:
+        return
+    REPORT.parent.mkdir(parents=True, exist_ok=True)
+    REPORT.write_text(json.dumps(
+        {"upstream_version": lgb_up.__version__, "records": [asdict(r) for r in _RECORDS]},
+        indent=1,
+        allow_nan=True,
+    ))
+
+
+# --------------------------------------------------------------------------- cases
+
+
+@dataclass
+class Case:
+    name: str
+    objective: str
+    params: Dict[str, Any]
+    X: np.ndarray
+    y: np.ndarray
+    Xv: np.ndarray
+    yv: np.ndarray
+    weight: Optional[np.ndarray] = None
+    init_score: Optional[np.ndarray] = None
+    num_boost_round: int = 30
+
+    @property
+    def full_params(self) -> Dict[str, Any]:
+        return {"objective": self.objective, **DETERMINISTIC, **self.params}
+
+
+def _features(rng: np.random.Generator, n: int, p: int, kind: str) -> np.ndarray:
+    X = rng.normal(size=(n, p))
+    if kind == "nan_zero":
+        X[rng.random(X.shape) < 0.1] = np.nan
+        X[rng.random(X.shape) < 0.3] = 0.0
+    elif kind == "discrete":
+        X = rng.integers(0, 6, size=(n, p)).astype(np.float64)
+        X[:, -1] = 3.0  # constant -> trivial feature, dropped from training
+        X[:, 0] = np.round(rng.normal(size=n), 1)  # many ties
+    elif kind == "heavy_tail":
+        X = rng.standard_cauchy(size=(n, p))
+        X[:, 1] = np.exp(rng.normal(size=n) * 3)
+    return X
+
+
+def _target(rng: np.random.Generator, X: np.ndarray, objective: str) -> np.ndarray:
+    Z = np.nan_to_num(X)
+    f = np.tanh(Z[:, 0]) * 2 + 0.5 * Z[:, 1] - 0.3 * Z[:, 2] * (Z[:, 0] > 0)
+    if objective == "regression":
+        return f + rng.normal(scale=0.5, size=len(f))
+    return (rng.random(len(f)) < 1 / (1 + np.exp(-f))).astype(np.float64)
+
+
+def make_case(name: str, objective: str, params: Dict[str, Any], *, n: int = 3000, p: int = 6,
+              kind: str = "normal", weighted: bool = False, init_score: bool = False, seed: int = 0,
+              rounds: int = 30, imbalance: float = 0.0) -> Case:
+    rng = np.random.default_rng(seed)
+    X = _features(rng, n, p, kind)
+    Xv = _features(rng, n // 3, p, kind)
+    y = _target(rng, X, objective)
+    yv = _target(rng, Xv, objective)
+    if imbalance:
+        keep = (y == 1) | (rng.random(n) > imbalance)
+        X, y = X[keep], y[keep]
+    w = rng.uniform(0.2, 3.0, size=len(y)) if weighted else None
+    s = rng.normal(scale=0.3, size=len(y)) if init_score else None
+    return Case(name, objective, params, X, y, Xv, yv, w, s, rounds)
+
+
+CASES = [
+    make_case("reg_basic", "regression", {}),
+    make_case("reg_nan_zero", "regression", {}, kind="nan_zero"),
+    make_case("reg_zero_as_missing", "regression", {"zero_as_missing": True}, kind="nan_zero"),
+    make_case("reg_no_missing", "regression", {"use_missing": False}, kind="nan_zero"),
+    make_case("reg_discrete", "regression", {"min_data_in_bin": 1}, kind="discrete"),
+    make_case("reg_heavy_tail", "regression", {"metric": ["l1", "rmse"]}, kind="heavy_tail"),
+    make_case("reg_weighted", "regression", {}, weighted=True),
+    make_case("reg_regularized", "regression",
+              {"lambda_l1": 1.0, "lambda_l2": 5.0, "min_gain_to_split": 0.1, "max_delta_step": 0.5,
+               "path_smooth": 2.0, "min_sum_hessian_in_leaf": 1.0}),
+    make_case("reg_depth", "regression", {"max_depth": 3, "num_leaves": 50, "min_data_in_leaf": 5}),
+    make_case("reg_depth_without_num_leaves", "regression", {"max_depth": 2}),
+    make_case("reg_sqrt", "regression", {"reg_sqrt": True}),
+    make_case("reg_init_score", "regression", {}, init_score=True),
+    make_case("reg_no_boost_from_average", "regression", {"boost_from_average": False}),
+    make_case("reg_sampled_bins", "regression",
+              {"bin_construct_sample_cnt": 500, "max_bin": 31, "min_data_in_bin": 5, "data_random_seed": 7}),
+    make_case("reg_max_bin_1023", "regression", {"max_bin": 1023}, n=6000),
+    make_case("reg_seed", "regression", {"seed": 123, "learning_rate": 0.3, "num_leaves": 7}),
+    make_case("reg_100_rounds", "regression", {"num_leaves": 63}, n=8000, rounds=100),
+    make_case("bin_basic", "binary", {"metric": ["binary_logloss", "auc", "binary_error"]}),
+    make_case("bin_nan_zero", "binary", {}, kind="nan_zero"),
+    make_case("bin_weighted", "binary", {}, weighted=True),
+    make_case("bin_unbalance", "binary", {"is_unbalance": True}, imbalance=0.8),
+    make_case("bin_scale_pos_weight", "binary", {"scale_pos_weight": 3.0}),
+    make_case("bin_sigmoid", "binary", {"sigmoid": 0.7}),
+    make_case("bin_init_score", "binary", {}, init_score=True),
+    make_case("bin_100_rounds", "binary", {"num_leaves": 63, "min_data_in_leaf": 10}, n=8000, rounds=100),
+]
+
+
+def case_ids() -> List[str]:
+    return [c.name for c in CASES]
+
+
+# --------------------------------------------------------------------------- engines
+
+
+def train_both(case: Case, params: Optional[Dict[str, Any]] = None, rounds: Optional[int] = None,
+               valid: bool = True, callbacks_factory: Optional[Callable[[Any], List[Any]]] = None):
+    params = dict(case.full_params if params is None else params)
+    rounds = case.num_boost_round if rounds is None else rounds
+    out = []
+    for mod in (lgb_rs, lgb_up):
+        train = mod.Dataset(case.X, label=case.y, weight=case.weight, init_score=case.init_score,
+                            free_raw_data=False)
+        valid_sets = [train.create_valid(case.Xv, label=case.yv)] if valid else None
+        cbs = callbacks_factory(mod) if callbacks_factory else None
+        out.append(mod.train(params, train, num_boost_round=rounds, valid_sets=valid_sets, callbacks=cbs))
+    return out[0], out[1]
+
+
+_MISSING = {"None": 0, "Zero": 1, "NaN": 2}
+
+
+def avoid_inf(x: float) -> float:
+    """upstream: Common::AvoidInf."""
+    if math.isnan(x):
+        return 0.0
+    if x >= 1e300:
+        return 1e300
+    if x <= -1e300:
+        return -1e300
+    return x
+
+
+def upstream_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
+    """Flatten upstream ``dump_model()`` trees into the layout of ``RsBooster.tree_arrays``.
+
+    ``dump_model`` prints doubles with 17 significant digits, so values
+    round-trip exactly.
+    """
+    trees = []
+    for info in booster.dump_model()["tree_info"]:
+        nl = info["num_leaves"]
+        ni = nl - 1
+        t: Dict[str, Any] = {"num_leaves": nl, "shrinkage": info["shrinkage"]}
+        for k in ("split_feature", "split_gain", "threshold", "decision_type", "left_child", "right_child",
+                  "internal_value", "internal_weight", "internal_count"):
+            t[k] = [None] * ni
+        for k in ("leaf_value", "leaf_weight", "leaf_count"):
+            t[k] = [None] * nl
+
+        def idx(node: Dict[str, Any]) -> int:
+            return node["split_index"] if "split_index" in node else ~node.get("leaf_index", 0)
+
+        def visit(node: Dict[str, Any]) -> None:
+            if "split_index" in node:
+                s = node["split_index"]
+                t["split_feature"][s] = node["split_feature"]
+                t["split_gain"][s] = node["split_gain"]
+                t["threshold"][s] = node["threshold"]
+                t["decision_type"][s] = (2 if node["default_left"] else 0) | (_MISSING[node["missing_type"]] << 2)
+                t["left_child"][s] = idx(node["left_child"])
+                t["right_child"][s] = idx(node["right_child"])
+                t["internal_value"][s] = node["internal_value"]
+                t["internal_weight"][s] = node["internal_weight"]
+                t["internal_count"][s] = node["internal_count"]
+                visit(node["left_child"])
+                visit(node["right_child"])
+            else:
+                leaf = node.get("leaf_index", 0)
+                t["leaf_value"][leaf] = node["leaf_value"]
+                t["leaf_weight"][leaf] = node.get("leaf_weight", 0.0)
+                t["leaf_count"][leaf] = node.get("leaf_count", 0)
+
+        visit(info["tree_structure"])
+        trees.append(t)
+    return trees
+
+
+def rust_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
+    trees = booster._tree_arrays()
+    for t in trees:
+        t["threshold"] = [avoid_inf(v) for v in t["threshold"]]
+        t["split_gain"] = [avoid_inf(v) for v in t["split_gain"]]
+    return trees
+
+
+def parse_dump_text(path: Path, num_data: int) -> List[Optional[np.ndarray]]:
+    """Per-column bin indices from ``Dataset._dump_text`` (``None`` for unused features)."""
+    lines = path.read_text().splitlines()
+    rows = [ln.split(", ")[:-1] for ln in lines[-num_data:]]
+    ncol = len(rows[0])
+    cols: List[Optional[np.ndarray]] = []
+    for j in range(ncol):
+        vals = [r[j] for r in rows]
+        cols.append(None if vals[0] == "NA" else np.array([int(v) for v in vals], dtype=np.int64))
+    return cols

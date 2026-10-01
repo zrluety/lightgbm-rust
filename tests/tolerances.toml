@@ -1,0 +1,83 @@
+# Tolerances for differential tests against LightGBM 4.7.0 (PyPI wheel).
+#
+# Every comparison in tests/differential reads its tolerance from this file;
+# tests never hard-code or loosen tolerances. A comparison passes when
+#   |rust - upstream| <= atol + rtol * |upstream|   (elementwise)
+# "exact" means rtol = atol = 0 and, for floats, bitwise-equal values
+# (NaN == NaN).
+#
+# Unless a section says otherwise, both engines run with
+#   deterministic=true, force_row_wise=true, num_threads=1
+# Multithreaded runs use the [multithread] section and are reported separately.
+
+[bins]
+# Per-row bin index of every feature (upstream Dataset._dump_text) and the
+# feature_infos ([min:max]) recorded in the model file.
+mode = "exact"
+rationale = """Bin boundaries come from the same sampled values, the same RNG, and
+the same greedy algorithm; any difference is a bug, not round-off."""
+
+[gradients]
+# First-iteration gradients/Hessians of the built-in objectives.
+mode = "exact"
+rationale = """Upstream does not expose gradients, so the reference is a float64 NumPy
+evaluation of the upstream formulas rounded to float32 (the score_t/float
+type upstream uses). Engine-level gradient parity is established indirectly
+by exact leaf values, which are sums of these gradients."""
+
+[tree_structure]
+# split_feature, threshold, decision_type, left/right child, leaf_count,
+# internal_count, num_leaves per tree.
+mode = "exact"
+rationale = """Discrete decisions. Thresholds are bin upper bounds copied from the
+bin mapper, so they must be bitwise equal."""
+
+[split_gain]
+mode = "rtol"
+rtol = 1e-6
+atol = 0.0
+rationale = """Gains are computed in double and stored as float32. A last-ulp
+difference in the double sum of histogram entries can flip one float32
+rounding; 1e-6 is ~8 float32 ulps. Exact equality is also recorded."""
+
+[leaf_value]
+# leaf_value, leaf_weight, internal_value, internal_weight.
+mode = "rtol"
+rtol = 1e-6
+atol = 1e-12
+rationale = """Leaf outputs are ratios of double sums of float32 gradients. With one
+thread the summation order is the same as upstream, so differences should be
+0; 1e-6 allows for a different but valid reduction order."""
+
+[predictions]
+# raw scores and transformed predictions after all iterations.
+mode = "rtol"
+rtol = 1e-5
+atol = 1e-9
+rationale = """Errors in leaf values (above) accumulate additively over up to a few
+hundred trees; 1e-5 relative bounds that accumulation."""
+
+[metrics]
+# per-iteration evaluation metrics (record_evaluation).
+mode = "rtol"
+rtol = 1e-9
+atol = 1e-12
+rationale = """Metrics are double sums over identical predictions; only summation
+order can differ."""
+
+[model_text]
+# Complete model file produced by save_model/model_to_string.
+mode = "exact"
+rationale = """The text format is deterministic given identical trees and
+parameters; exact equality is the model-format compatibility criterion."""
+
+[multithread]
+# num_threads=4, deterministic=true, force_row_wise=true on both sides.
+mode = "rtol"
+rtol = 1e-5
+atol = 1e-9
+rationale = """Upstream sums row-wise histograms per thread and then merges them, so the
+float summation order depends on the thread count; lightgbm-rust builds
+histograms per feature and its result does not depend on thread count.
+Structure may legitimately differ after a near-tie, so only predictions are
+compared, and results are reported separately from single-thread parity."""

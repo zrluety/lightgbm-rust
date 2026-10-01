@@ -1,0 +1,381 @@
+suite,file,test,line,area,disposition,upstream_markers
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_fuzzy,137,input-arrow,deferred,"pytest.mark.parametrize(('arrow_table_fn', 'dataset_params'), [(generate_simple_arrow_table, dummy_dataset_params()), (l"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_fuzzy_boolean,149,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_fields_fuzzy,167,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_labels,204,input-arrow,deferred,"pytest.mark.parametrize('label_data', [[[0, 1, 0, 0, 1]], [[0], [1, 0, 0, 1]], [[], [0], [1, 0, 0, 1]], [[0], [], [1, 0] | pytest.mark.parametrize('arrow_type', _INTEGER_TYPES + _FLOAT_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_labels_boolean,223,input-arrow,deferred,"pytest.mark.parametrize('label_data', [[[False, True, False, False, True]], [[False], [True, False, False, True]], [[], "
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_weights_none,236,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_weights,255,input-arrow,deferred,"pytest.mark.parametrize('weight_data', [[[3, 0.7, 1.5, 0.5, 0.1]], [[3], [0.7, 1.5, 0.5, 0.1]], [[], [3], [0.7, 1.5, 0.5 | pytest.mark.parametrize('arrow_type', _FLOAT_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_groups,278,input-arrow,deferred,"pytest.mark.parametrize('group_data', [[[2, 3]], [[2], [3]], [[], [2, 3]], [[2], [], [3], []]]) | pytest.mark.parametrize('arrow_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_position,301,input-arrow,deferred,"pytest.mark.parametrize('position_data', [[[0, 1, 2, 3, 4]], [[0, 1, 2], [3, 4]], [[], [0, 1, 2], [3, 4]], [[0, 1], [],  | pytest.mark.parametrize('arrow_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_position_with_duplicates_and_out_of_order,312,input-arrow,deferred,"pytest.mark.parametrize('arrow_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_init_scores_array,337,input-arrow,deferred,"pytest.mark.parametrize('init_score_data', [[[0, 1, 2, 3, 3]], [[0, 1, 2], [3, 3]], [[], [0, 1, 2], [3, 3]], [[0, 1], [] | pytest.mark.parametrize('arrow_type', _INTEGER_TYPES + _FLOAT_TYPES)"
+python,tests/python_package_test/test_arrow.py,test_dataset_construct_init_scores_table,347,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_predict_regression,390,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_predict_binary_classification,408,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_predict_multiclass_classification,423,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_predict_ranking,438,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_arrow_feature_name_auto,454,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_arrow_feature_name_manual,466,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_get_data_arrow_table,493,input-arrow,deferred,
+python,tests/python_package_test/test_arrow.py,test_get_data_arrow_table_subset,517,input-arrow,deferred,
+python,tests/python_package_test/test_basic.py,test_basic,21,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_booster_rollback_one_iter,98,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_sequence,182,general,target-m2-m4,"pytest.mark.parametrize('sample_count', [11, 100, None]) | pytest.mark.parametrize('batch_size', [3, None]) | pytest.mark.parametrize('include_0_and_nan', [False, True]) | pytest.mark.parametrize('num_seq', [1, 3])"
+python,tests/python_package_test/test_basic.py,test_sequence_get_data,246,general,target-m2-m4,"pytest.mark.parametrize('num_seq', [1, 2])"
+python,tests/python_package_test/test_basic.py,test_chunked_dataset,262,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_chunked_dataset_linear,277,linear-tree,deferred,
+python,tests/python_package_test/test_basic.py,test_save_dataset_subset_and_load_from_file,291,persistence,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_save_binary_raises_on_truncated_write,299,persistence,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_subset_group,318,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_throws_if_num_data_unequal,331,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_throws_if_datasets_unconstructed,342,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_equal_data_on_alternating_used_unused,360,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_same_booster_behaviour,380,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_from_different_sources,408,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_add_features_does_not_fail_if_initial_dataset_has_zero_informative_features,447,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_cegb_affects_behavior,469,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_cegb_scaling_equalities,500,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_consistent_state_for_dataset_fields,538,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_dataset_construction_overwrites_user_provided_metadata_fields,571,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_set_position_updates_self_position_with_remapped_int32_values,646,general,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Positions in learning to rank is not supported in CUDA version yet')"
+python,tests/python_package_test/test_basic.py,test_choose_param_value,678,parameters,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_choose_param_value_preserves_nones,716,parameters,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_choose_param_value_objective,739,parameters,target-m2-m4,"pytest.mark.parametrize('objective_alias', lgb.basic._ConfigAliases.get('objective'))"
+python,tests/python_package_test/test_basic.py,test_list_to_1d_numpy,758,general,target-m2-m4,"pytest.mark.parametrize('collection', ['1d_np', '2d_np', 'pd_float', 'pd_str', '1d_list', '2d_list']) | pytest.mark.parametrize('dtype', [np.float32, np.float64])"
+python,tests/python_package_test/test_basic.py,test_init_score_for_multiclass_classification,806,continued-training,target-m2-m4,"pytest.mark.parametrize('init_score_type', ['array', 'dataframe', 'list'])"
+python,tests/python_package_test/test_basic.py,test_smoke_custom_parser,819,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_param_aliases,832,parameters,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_custom_objective_safety,861,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_no_copy_when_single_float_dtype_dataframe,884,general,target-m2-m4,"pytest.mark.parametrize('dtype', [np.float32, np.float64]) | pytest.mark.parametrize('feature_name', [['x1', 'x2'], 'auto'])"
+python,tests/python_package_test/test_basic.py,test_feature_num_bin,899,dataset-binning,target-m2-m4,"pytest.mark.parametrize('min_data_in_bin', [2, 10])"
+python,tests/python_package_test/test_basic.py,test_feature_num_bin_with_max_bin_by_feature,947,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_set_leaf_output,955,prediction,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_feature_names_are_set_correctly_when_no_feature_names_passed_into_Dataset,967,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_set_feature_name_updates_has_non_default_feature_names,974,general,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_max_depth_warning_is_not_raised_if_num_leaves_is_also_provided,987,general,target-m2-m4,"pytest.mark.parametrize(('max_depth', 'num_leaves'), [(-1, 3), (-1, 50), (5, 3), (5, 31), (5, 32), (8, 3), (8, 31)])"
+python,tests/python_package_test/test_basic.py,test_max_depth_warning_is_not_raised_if_max_depth_gt_1_and_lt_5_and_num_leaves_omitted,1005,general,target-m2-m4,"pytest.mark.parametrize('max_depth', [1, 2, 3, 4])"
+python,tests/python_package_test/test_basic.py,test_max_depth_warning_is_raised_if_max_depth_gte_5_and_num_leaves_omitted,1020,general,target-m2-m4,"pytest.mark.parametrize('max_depth', [5, 6, 7, 8, 9])"
+python,tests/python_package_test/test_basic.py,test_no_copy_in_dataset_from_numpy_2d,1041,dataset-binning,target-m2-m4,"pytest.mark.parametrize('order', ['C', 'F']) | pytest.mark.parametrize('dtype', ['float32', 'int64'])"
+python,tests/python_package_test/test_basic.py,test_equal_datasets_from_row_major_and_col_major_data,1056,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_equal_datasets_from_one_and_several_matrices_w_different_layouts,1077,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_set_field_none_removes_field,1106,general,target-m2-m4,"pytest.mark.parametrize('field_name', ['group', 'init_score', pytest.param('position', marks=pytest.mark.skipif(BuildInf"
+python,tests/python_package_test/test_basic.py,test_booster_eval_adds_new_valid_dataset,1129,metrics,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_refit_correctly_handles_categorical_features_in_params,1176,categorical-pandas,deferred,
+python,tests/python_package_test/test_basic.py,test_eval_result_no_std_dev_works,1239,metrics,target-m2-m4,
+python,tests/python_package_test/test_basic.py,test_eval_result_with_std_dev_works,1294,metrics,target-m2-m4,
+python,tests/python_package_test/test_callback.py,test_early_stopping_callback_is_picklable,14,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('serializer', SERIALIZERS)"
+python,tests/python_package_test/test_callback.py,test_early_stopping_callback_rejects_invalid_stopping_rounds_with_informative_errors,24,callbacks-early-stopping,target-m2-m4,
+python,tests/python_package_test/test_callback.py,test_early_stopping_callback_accepts_non_positive_stopping_rounds,30,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('stopping_rounds', [-10, -1, 0])"
+python,tests/python_package_test/test_callback.py,test_log_evaluation_callback_is_picklable,36,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('serializer', SERIALIZERS)"
+python,tests/python_package_test/test_callback.py,test_record_evaluation_callback_is_picklable,47,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('serializer', SERIALIZERS)"
+python,tests/python_package_test/test_callback.py,test_reset_parameter_callback_is_picklable,58,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('serializer', SERIALIZERS)"
+python,tests/python_package_test/test_consistency.py,test_binary,67,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_consistency.py,test_binary_linear,80,linear-tree,deferred,
+python,tests/python_package_test/test_consistency.py,test_multiclass,93,multiclass,deferred,
+python,tests/python_package_test/test_consistency.py,test_regression,105,objectives,target-m2-m4,
+python,tests/python_package_test/test_consistency.py,test_lambdarank,118,ranking,deferred,
+python,tests/python_package_test/test_consistency.py,test_xendcg,133,ranking,deferred,
+python,tests/python_package_test/test_dask.py,test_classifier,253,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('task', ['binary-classification', 'multiclass-classification']) | pytest.mark.parametrize('boosting_type', boosting_types) | pytest.mark.parametrize('tree_learner', distributed_training_algorithms)"
+python,tests/python_package_test/test_dask.py,test_classifier_pred_contrib,328,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output + ['scipy_csc_matrix']) | pytest.mark.parametrize('task', ['binary-classification', 'multiclass-classification'])"
+python,tests/python_package_test/test_dask.py,test_classifier_custom_objective,410,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('task', ['binary-classification', 'multiclass-classification'])"
+python,tests/python_package_test/test_dask.py,test_machines_to_worker_map_unparsable_host_names,475,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dask.py,test_training_does_not_fail_on_port_conflicts,482,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dask.py,test_regressor,503,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('boosting_type', boosting_types) | pytest.mark.parametrize('tree_learner', distributed_training_algorithms)"
+python,tests/python_package_test/test_dask.py,test_regressor_pred_contrib,571,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output)"
+python,tests/python_package_test/test_dask.py,test_regressor_quantile,606,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('alpha', [0.1, 0.5, 0.9])"
+python,tests/python_package_test/test_dask.py,test_regressor_custom_objective,637,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output)"
+python,tests/python_package_test/test_dask.py,test_ranker,685,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', ['array', 'dataframe', 'dataframe-with-categorical']) | pytest.mark.parametrize('group', [None, group_sizes]) | pytest.mark.parametrize('boosting_type', boosting_types) | pytest.mark.parametrize('tree_learner', distributed_training_algorithms)"
+python,tests/python_package_test/test_dask.py,test_ranker_custom_objective,769,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', ['array', 'dataframe', 'dataframe-with-categorical'])"
+python,tests/python_package_test/test_dask.py,test_eval_set_no_early_stopping,820,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks) | pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('eval_sizes', [[0.5, 1, 1.5], [0]]) | pytest.mark.parametrize('eval_names_prefix', ['specified', None])"
+python,tests/python_package_test/test_dask.py,test_eval_set_with_custom_eval_metric,955,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', ['binary-classification', 'regression', 'ranking'])"
+python,tests/python_package_test/test_dask.py,test_training_works_if_client_not_provided_or_set_after_construction,1005,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks)"
+python,tests/python_package_test/test_dask.py,test_model_and_local_version_are_picklable_whether_or_not_client_set_explicitly,1068,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('serializer', ['pickle', 'joblib', 'cloudpickle']) | pytest.mark.parametrize('task', tasks) | pytest.mark.parametrize('set_client', [True, False])"
+python,tests/python_package_test/test_dask.py,test_warns_and_continues_on_unrecognized_tree_learner,1201,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dask.py,test_training_respects_tree_learner_aliases,1215,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('tree_learner', ['data_parallel', 'voting_parallel'])"
+python,tests/python_package_test/test_dask.py,test_error_on_feature_parallel_tree_learner,1227,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dask.py,test_errors,1241,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dask.py,test_training_succeeds_even_if_some_workers_do_not_have_any_data,1256,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks) | pytest.mark.parametrize('output', data_output)"
+python,tests/python_package_test/test_dask.py,test_network_params_not_required_but_respected_if_given,1307,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks)"
+python,tests/python_package_test/test_dask.py,test_machines_should_be_used_if_provided,1358,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks)"
+python,tests/python_package_test/test_dask.py,test_dask_classes_and_sklearn_equivalents_have_identical_constructors_except_client_arg,1404,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize(('dask_est', 'sklearn_est'), [(lgb.DaskLGBMClassifier, lgb.LGBMClassifier), (lgb.DaskLGBMRegress"
+python,tests/python_package_test/test_dask.py,test_dask_methods_and_sklearn_equivalents_have_similar_signatures,1447,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('methods', [(lgb.DaskLGBMClassifier.fit, lgb.LGBMClassifier.fit), (lgb.DaskLGBMClassifier.predic"
+python,tests/python_package_test/test_dask.py,test_training_succeeds_when_data_is_dataframe_and_label_is_column_array,1464,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks)"
+python,tests/python_package_test/test_dask.py,test_init_score,1483,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks) | pytest.mark.parametrize('output', data_output)"
+python,tests/python_package_test/test_dask.py,test_sklearn_integration,1538,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('estimator', _tested_estimators()) | pytest.mark.parametrize('check', sklearn_checks_to_run())"
+python,tests/python_package_test/test_dask.py,test_parameters_default_constructible,1547,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('estimator', list(_tested_estimators()))"
+python,tests/python_package_test/test_dask.py,test_predict_with_raw_score,1555,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('task', tasks) | pytest.mark.parametrize('output', data_output)"
+python,tests/python_package_test/test_dask.py,test_predict_returns_expected_dtypes,1584,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('task', tasks)"
+python,tests/python_package_test/test_dask.py,test_predict_stump,1644,distributed-dask,out-of-scope-m1-3,"pytest.mark.parametrize('output', data_output) | pytest.mark.parametrize('use_init_score', [False, True])"
+python,tests/python_package_test/test_dask.py,test_distributed_quantized_training,1675,distributed-dask,out-of-scope-m1-3,
+python,tests/python_package_test/test_dual.py,test_cpu_and_gpu_work,19,gpu,out-of-scope-m1-3,"pytest.mark.skipif(os.environ.get('LIGHTGBM_TEST_DUAL_CPU_GPU', '0') != '1', reason='Set LIGHTGBM_TEST_DUAL_CPU_GPU=1 to"
+python,tests/python_package_test/test_engine.py,test_binary,89,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_rf,110,boosting-sampling,deferred,
+python,tests/python_package_test/test_engine.py,test_regression,135,objectives,target-m2-m4,"pytest.mark.parametrize('objective', ['regression', 'regression_l1', 'huber', 'fair', 'poisson', 'quantile'])"
+python,tests/python_package_test/test_engine.py,test_weighted_percentile_inside_label_range,164,dataset-binning,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='CUDA version has a different implementation of WeightedPercentileFun, not | pytest.mark.parametrize('objective', ['regression_l1', 'quantile', 'mape'])"
+python,tests/python_package_test/test_engine.py,test_missing_value_handle,201,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_missing_value_handle_more_na,221,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_missing_value_handle_na,241,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_missing_value_handle_zero,272,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_missing_value_handle_none,303,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_categorical_handle,348,categorical-pandas,deferred,"pytest.mark.parametrize('use_quantized_grad', [pytest.param(True, marks=pytest.mark.skipif(BuildInfo.has_cuda, reason='S"
+python,tests/python_package_test/test_engine.py,test_categorical_handle_na,398,categorical-pandas,deferred,"pytest.mark.parametrize('use_quantized_grad', [pytest.param(True, marks=pytest.mark.skipif(BuildInfo.has_cuda, reason='S"
+python,tests/python_package_test/test_engine.py,test_categorical_non_zero_inputs,448,categorical-pandas,deferred,"pytest.mark.parametrize('use_quantized_grad', [pytest.param(True, marks=pytest.mark.skipif(BuildInfo.has_cuda, reason='S"
+python,tests/python_package_test/test_engine.py,test_multiclass,485,multiclass,deferred,
+python,tests/python_package_test/test_engine.py,test_multiclass_rf,500,boosting-sampling,deferred,
+python,tests/python_package_test/test_engine.py,test_multiclass_prediction_early_stopping,527,callbacks-early-stopping,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_multi_class_error,544,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_auc_mu,608,metrics,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_engine.py,test_ranking_prediction_early_stopping,697,callbacks-early-stopping,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_ranking_with_position_information_with_file,780,ranking,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Positions in learning to rank is not supported in CUDA version yet')"
+python,tests/python_package_test/test_engine.py,test_ranking_with_position_information_with_dataset_constructor,831,ranking,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Positions in learning to rank is not supported in CUDA version yet')"
+python,tests/python_package_test/test_engine.py,test_early_stopping,900,callbacks-early-stopping,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_early_stopping_ignores_training_set,934,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('use_valid', [True, False])"
+python,tests/python_package_test/test_engine.py,test_early_stopping_via_global_params,972,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('first_metric_only', [True, False])"
+python,tests/python_package_test/test_engine.py,test_early_stopping_is_not_enabled_for_non_positive_stopping_rounds,1000,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('early_stopping_round', [-10, -1, 0, None, 'None'])"
+python,tests/python_package_test/test_engine.py,test_early_stopping_min_delta,1050,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('first_only', [True, False]) | pytest.mark.parametrize('single_metric', [True, False]) | pytest.mark.parametrize('greater_is_better', [True, False])"
+python,tests/python_package_test/test_engine.py,test_early_stopping_min_delta_via_global_params,1129,callbacks-early-stopping,target-m2-m4,"pytest.mark.parametrize('early_stopping_min_delta', [1000.0, 0.0])"
+python,tests/python_package_test/test_engine.py,test_early_stopping_can_be_triggered_via_custom_callback,1151,callbacks-early-stopping,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_continue_train,1173,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_continue_train_reused_dataset,1199,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_continue_train_dart,1210,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_continue_train_multiclass,1231,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_cv,1252,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_cv_works_with_init_model,1319,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_cvbooster,1361,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_cvbooster_save_load,1410,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_cvbooster_picklable,1447,cv,deferred,"pytest.mark.parametrize('serializer', SERIALIZERS)"
+python,tests/python_package_test/test_engine.py,test_feature_name,1479,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_feature_name_with_non_ascii,1493,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_parameters_are_loaded_from_model_file,1510,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_string_serialized_params_retrieval,1560,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_save_load_copy_pickle,1604,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_all_expected_params_are_written_out_to_model_text,1637,parameters,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_pandas_categorical,1818,categorical-pandas,deferred,
+python,tests/python_package_test/test_engine.py,test_pandas_sparse,1903,categorical-pandas,deferred,
+python,tests/python_package_test/test_engine.py,test_reference_chain,1933,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_contribs,1953,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_contribs_sparse,1970,input-sparse,deferred,
+python,tests/python_package_test/test_engine.py,test_contribs_sparse_multiclass,2006,input-sparse,deferred,
+python,tests/python_package_test/test_engine.py,test_predict_contrib_int64,2060,prediction,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip because int64 sparse matrix indices are not supported for CUDA versi"
+python,tests/python_package_test/test_engine.py,test_int32_max_sparse_contribs,2085,input-sparse,deferred,"pytest.mark.skipif(psutil.virtual_memory().available / 1024 / 1024 / 1024 < 3, reason='not enough RAM')"
+python,tests/python_package_test/test_engine.py,test_sliced_data,2105,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_init_with_subset,2155,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_training_on_constructed_subset_without_params,2182,parameters,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_monotone_constraints,2227,constraints,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Monotone constraints are not yet supported by CUDA version') | pytest.mark.parametrize('test_with_categorical_variable', [True, False])"
+python,tests/python_package_test/test_engine.py,test_monotone_penalty,2311,constraints,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Monotone constraints are not yet supported by CUDA version')"
+python,tests/python_package_test/test_engine.py,test_monotone_penalty_max,2354,constraints,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Monotone constraints are not yet supported by CUDA version')"
+python,tests/python_package_test/test_engine.py,test_max_bin_by_feature,2386,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_small_max_bin,2410,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_refit,2424,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_refit_with_one_tree_regression,2436,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_refit_with_one_tree_binary_classification,2445,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_refit_with_one_tree_multiclass_classification,2454,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_refit_dataset_params,2463,continued-training,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_mape_for_specific_boosting_types,2494,objectives,target-m2-m4,"pytest.mark.parametrize('boosting_type', ['rf', 'dart'])"
+python,tests/python_package_test/test_engine.py,test_constant_features_regression,2539,objectives,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_constant_features_binary,2546,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_constant_features_multiclass,2552,multiclass,deferred,
+python,tests/python_package_test/test_engine.py,test_constant_features_multiclassova,2558,multiclass,deferred,
+python,tests/python_package_test/test_engine.py,test_fpreproc,2564,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_metrics,2585,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_multiple_feval_train,2992,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_objective_callable_train_binary_classification,3017,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_objective_callable_train_regression,3030,objectives,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_objective_callable_cv_binary_classification,3041,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_objective_callable_cv_regression,3053,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_multiple_feval_cv,3065,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_default_objective_and_metric,3086,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_multiclass_custom_objective,3108,multiclass,deferred,"pytest.mark.parametrize('use_weight', [True, False])"
+python,tests/python_package_test/test_engine.py,test_multiclass_custom_eval,3133,multiclass,deferred,"pytest.mark.parametrize('use_weight', [True, False])"
+python,tests/python_package_test/test_engine.py,test_model_size,3172,general,target-m2-m4,"pytest.mark.skipif(psutil.virtual_memory().available / 1024 / 1024 / 1024 < 3, reason='not enough RAM')"
+python,tests/python_package_test/test_engine.py,test_get_split_value_histogram,3200,general,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_engine.py,test_early_stopping_for_only_first_metric,3287,callbacks-early-stopping,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_engine.py,test_node_level_subcol,3432,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_forced_split_feature_indices,3457,constraints,deferred,
+python,tests/python_package_test/test_engine.py,test_forced_bins,3473,constraints,deferred,
+python,tests/python_package_test/test_engine.py,test_binning_same_sign,3514,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_dataset_update_params,3542,parameters,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_dataset_params_with_reference,3634,parameters,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_extra_trees,3647,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_path_smoothing,3662,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_trees_to_dataframe,3677,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_interaction_constraints,3733,constraints,deferred,
+python,tests/python_package_test/test_engine.py,test_linear_trees_num_threads,3765,linear-tree,deferred,
+python,tests/python_package_test/test_engine.py,test_linear_trees,3780,linear-tree,deferred,
+python,tests/python_package_test/test_engine.py,test_save_and_load_linear,3894,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_linear_single_leaf,3920,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_linear_raises_informative_errors_on_unsupported_params,3929,linear-tree,deferred,
+python,tests/python_package_test/test_engine.py,test_predict_with_start_iteration,3945,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_predict_stump,4017,prediction,target-m2-m4,"pytest.mark.parametrize('use_init_score', [False, True])"
+python,tests/python_package_test/test_engine.py,test_predict_regression_output_shape,4044,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_predict_binary_classification_output_shape,4066,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_predict_multiclass_classification_output_shape,4088,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_average_precision_metric,4111,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_r2_metric,4130,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_reset_params_works_with_metric_num_class_and_boosting,4153,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_dump_model_stump,4179,persistence,target-m2-m4,"pytest.mark.parametrize('linear_tree', [False, True])"
+python,tests/python_package_test/test_engine.py,test_dump_model,4192,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_dump_model_linear,4220,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_dump_model_hook,4239,persistence,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_force_split_with_feature_fraction,4256,general,target-m2-m4,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Forced splits are not yet supported by CUDA version')"
+python,tests/python_package_test/test_engine.py,test_goss_boosting_and_strategy_equivalent,4286,boosting-sampling,deferred,
+python,tests/python_package_test/test_engine.py,test_sample_strategy_with_boosting,4313,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_record_evaluation_with_train,4431,metrics,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_record_evaluation_with_cv,4449,cv,deferred,"pytest.mark.parametrize('train_metric', [False, True])"
+python,tests/python_package_test/test_engine.py,test_pandas_with_numpy_regular_dtypes,4470,categorical-pandas,deferred,
+python,tests/python_package_test/test_engine.py,test_pandas_nullable_dtypes,4509,categorical-pandas,deferred,
+python,tests/python_package_test/test_engine.py,test_boost_from_average_with_single_leaf_trees,4556,prediction,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_cegb_split_buffer_clean,4588,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_verbosity_and_verbose,4631,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_verbosity_is_respected_when_using_custom_objective,4645,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_verbosity_can_suppress_alias_warnings,4661,parameters,target-m2-m4,"pytest.mark.parametrize('verbosity_param', lgb.basic._ConfigAliases.get('verbosity')) | pytest.mark.parametrize('verbosity', [-1, 0])"
+python,tests/python_package_test/test_engine.py,test_cv_only_raises_num_rounds_warning_when_expected,4683,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_train_only_raises_num_rounds_warning_when_expected,4738,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_validate_features,4792,general,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_train_and_cv_raise_informative_error_for_train_set_of_wrong_type,4817,cv,deferred,
+python,tests/python_package_test/test_engine.py,test_train_and_cv_raise_informative_error_for_impossible_num_boost_round,4825,cv,deferred,"pytest.mark.parametrize('num_boost_round', [-7, -1, 0])"
+python,tests/python_package_test/test_engine.py,test_train_raises_informative_error_if_any_valid_sets_are_not_dataset_objects,4834,dataset-binning,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_train_raises_informative_error_for_params_of_wrong_type,4847,parameters,target-m2-m4,
+python,tests/python_package_test/test_engine.py,test_quantized_training,4855,quantized-gradients,deferred,
+python,tests/python_package_test/test_engine.py,test_bagging_by_query_in_lambdarank,4873,boosting-sampling,deferred,
+python,tests/python_package_test/test_engine.py,test_equal_predict_from_row_major_and_col_major_data,4896,prediction,target-m2-m4,
+python,tests/python_package_test/test_pandas.py,test_pandas_categorical_encoding,17,categorical-pandas,deferred,
+python,tests/python_package_test/test_pandas.py,test_pandas_categorical_encoding_unseen_category,64,categorical-pandas,deferred,
+python,tests/python_package_test/test_pandas.py,test_pandas_dataset_construction_with_high_cardinality_categorical_succeeds,91,categorical-pandas,deferred,
+python,tests/python_package_test/test_pandas.py,test_pandas_categorical_code_conversion_doesnt_modify_original_data,109,categorical-pandas,deferred,"pytest.mark.parametrize('feature_name', [pytest.param(['x1'], id='feature-name'), pytest.param([42], id='feature-index') | pytest.mark.parametrize('categories', ['seen', 'unseen'])"
+python,tests/python_package_test/test_pandas.py,test_pandas_supported_dtypes,157,categorical-pandas,deferred,"pytest.mark.parametrize(('dtype', 'values'), [(pd.Int8Dtype(), [1, 2, 3]), (pd.Int16Dtype(), [1, 2, 3]), (pd.Int32Dtype("
+python,tests/python_package_test/test_pandas.py,test_pandas_unsupported_dtypes,186,categorical-pandas,deferred,"pytest.mark.parametrize(('dtype', 'values'), [(pd.StringDtype(), ['a', 'b', 'c']), (pd.DatetimeTZDtype(tz=ZoneInfo('UTC'"
+python,tests/python_package_test/test_plotting.py,test_plot_importance,47,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_plot_importance_zero_splits,157,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_plot_split_value_histogram,176,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_plot_tree,248,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_create_tree_digraph,264,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_tree_with_categories_below_max_category_values,301,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_tree_with_categories_above_max_category_values,346,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_numeric_split_direction,393,plotting,deferred,"pytest.mark.parametrize('use_missing', [True, False]) | pytest.mark.parametrize('zero_as_missing', [True, False])"
+python,tests/python_package_test/test_plotting.py,test_example_case_in_tree_digraph,444,plotting,deferred,
+python,tests/python_package_test/test_plotting.py,test_empty_example_case_on_tree_digraph_raises_error,511,plotting,deferred,"pytest.mark.parametrize('input_type', ['array', 'dataframe'])"
+python,tests/python_package_test/test_plotting.py,test_plot_metrics,526,plotting,deferred,
+python,tests/python_package_test/test_polars.py,test_dataset_construct_fuzzy,111,input-polars,deferred,"pytest.mark.parametrize(('polars_frame_fn', 'dataset_params'), [(generate_simple_polars_frame, dummy_dataset_params()), "
+python,tests/python_package_test/test_polars.py,test_dataset_construct_fuzzy_boolean,123,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_dataset_construct_fields_fuzzy,139,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_dataset_construct_labels,167,input-polars,deferred,"pytest.mark.parametrize('polars_type', _INTEGER_TYPES + _FLOAT_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_labels_boolean,177,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_dataset_construct_weights_none,190,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_dataset_construct_weights,200,input-polars,deferred,"pytest.mark.parametrize('polars_type', _FLOAT_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_groups,214,input-polars,deferred,"pytest.mark.parametrize('polars_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_position,228,input-polars,deferred,"pytest.mark.parametrize('polars_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_position_with_duplicates_and_out_of_order,239,input-polars,deferred,"pytest.mark.parametrize('polars_type', _INTEGER_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_init_scores_array,255,input-polars,deferred,"pytest.mark.parametrize('polars_type', _INTEGER_TYPES + _FLOAT_TYPES)"
+python,tests/python_package_test/test_polars.py,test_dataset_construct_init_scores_table,265,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_predict_regression,309,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_predict_binary_classification,327,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_predict_multiclass_classification,342,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_predict_ranking,357,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_polars_feature_name_auto,373,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_polars_feature_name_manual,385,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_get_data_polars_frame,398,input-polars,deferred,
+python,tests/python_package_test/test_polars.py,test_get_data_polars_frame_subset,412,input-polars,deferred,
+python,tests/python_package_test/test_sklearn.py,test_binary,167,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_regression,177,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_multiclass,188,sklearn,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_sklearn.py,test_lambdarank,201,sklearn,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_sklearn.py,test_xendcg,222,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_eval_at_aliases,244,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_objective_aliases,258,sklearn,deferred,"pytest.mark.parametrize('custom_objective', [True, False])"
+python,tests/python_package_test/test_sklearn.py,test_regression_with_custom_objective,287,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_binary_classification_with_custom_objective,297,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_dart,310,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_stacking_classifier,319,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_stacking_regressor,339,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_grid_search,357,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_random_search,385,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_multioutput_classifier,414,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_multioutput_regressor,430,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_classifier_chain,445,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_regressor_chain,470,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_clone_and_property,495,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_estimators_all_have_the_same_kwargs_and_defaults,524,sklearn,deferred,"pytest.mark.parametrize('estimator', (lgb.LGBMClassifier, lgb.LGBMRegressor, lgb.LGBMRanker))"
+python,tests/python_package_test/test_sklearn.py,test_subclassing_get_params_works,551,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_subclassing_works,645,sklearn,deferred,"pytest.mark.parametrize('task', all_tasks)"
+python,tests/python_package_test/test_sklearn.py,test_parameter_aliases_are_handled_correctly,682,sklearn,deferred,"pytest.mark.parametrize('estimator_to_task', [(lgb.LGBMClassifier, 'binary-classification'), (ExtendedLGBMClassifier, 'b"
+python,tests/python_package_test/test_sklearn.py,test_joblib,715,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_non_serializable_objects_in_callbacks,743,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_random_state_object,756,sklearn,deferred,"pytest.mark.parametrize('rng_constructor', [np.random.RandomState, np.random.default_rng])"
+python,tests/python_package_test/test_sklearn.py,test_feature_importances_single_leaf,787,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_feature_importances_type,795,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_pandas_categorical,811,categorical-pandas,deferred,
+python,tests/python_package_test/test_sklearn.py,test_pandas_sparse,874,categorical-pandas,deferred,
+python,tests/python_package_test/test_sklearn.py,test_predict,902,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_decision_function_and_predict_proba_consistency,993,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_calibrated_classifier_cv,1012,sklearn,deferred,"pytest.mark.parametrize('method', ['sigmoid', 'isotonic'])"
+python,tests/python_package_test/test_sklearn.py,test_predict_with_params_from_init,1054,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_evaluate_train_set,1098,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_metrics,1112,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_multiple_eval_metrics,1384,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_nan_handle,1421,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_first_metric_only,1434,sklearn,deferred,"pytest.mark.skipif(BuildInfo.has_cuda, reason='Skip due to differences in implementation details of CUDA version')"
+python,tests/python_package_test/test_sklearn.py,test_class_weight,1537,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_continue_training_with_model,1583,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_booster_does_not_hold_datasets,1593,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_actual_number_of_trees,1602,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_check_is_fitted,1613,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_max_depth_warning_is_never_raised,1634,sklearn,deferred,"pytest.mark.parametrize('estimator_class', estimator_classes) | pytest.mark.parametrize('max_depth', [3, 4, 5, 8])"
+python,tests/python_package_test/test_sklearn.py,test_verbosity_is_respected_when_using_custom_objective,1646,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_fit_only_raises_num_rounds_warning_when_expected,1659,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_cannot_access_feature_names_before_fitting,1712,sklearn,deferred,"pytest.mark.parametrize('estimator_class', estimator_classes)"
+python,tests/python_package_test/test_sklearn.py,test_feature_names_in_and_predict_warning,1743,sklearn,deferred,"pytest.mark.parametrize('predict_X_type', [pytest.param('numpy', id='predict=numpy'), pytest.param('pd_DataFrame', id='p | pytest.mark.parametrize('fit_X_type', [pytest.param('numpy', id='fit=numpy'), pytest.param('pd_DataFrame', id='fit=pd_Da"
+python,tests/python_package_test/test_sklearn.py,test_sklearn_integration,1879,sklearn,deferred,"parametrize_with_checks([ExtendedLGBMClassifier(), ExtendedLGBMRegressor(), lgb.LGBMClassifier(), lgb.LGBMRegressor()], "
+python,tests/python_package_test/test_sklearn.py,test_sklearn_tags_should_correctly_reflect_lightgbm_specific_values,1885,sklearn,deferred,"pytest.mark.parametrize('estimator_class', estimator_classes)"
+python,tests/python_package_test/test_sklearn.py,test_training_succeeds_when_data_is_dataframe_and_label_is_column_array,1913,sklearn,deferred,"pytest.mark.parametrize('task', all_tasks)"
+python,tests/python_package_test/test_sklearn.py,test_multiclass_custom_objective,1935,sklearn,deferred,"pytest.mark.parametrize('use_weight', [True, False])"
+python,tests/python_package_test/test_sklearn.py,test_multiclass_custom_eval,1954,sklearn,deferred,"pytest.mark.parametrize('use_weight', [True, False])"
+python,tests/python_package_test/test_sklearn.py,test_negative_n_jobs,1990,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_default_n_jobs,2006,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_validate_features,2018,sklearn,deferred,"pytest.mark.skipif(not PANDAS_INSTALLED, reason='pandas is not installed') | pytest.mark.parametrize('task', all_tasks)"
+python,tests/python_package_test/test_sklearn.py,test_predict_rejects_inputs_with_incorrect_number_of_features,2042,sklearn,deferred,"pytest.mark.parametrize('task', all_tasks) | pytest.mark.parametrize('predict_disable_shape_check', [True, False])"
+python,tests/python_package_test/test_sklearn.py,test_classification_and_regression_minimally_work_with_all_accepted_data_types,2230,sklearn,deferred,"pytest.mark.parametrize('X_type', all_x_types) | pytest.mark.parametrize('y_type', all_y_types) | pytest.mark.parametrize('task', [t for t in all_tasks if t != 'ranking'])"
+python,tests/python_package_test/test_sklearn.py,test_ranking_minimally_works_with_all_accepted_data_types,2244,sklearn,deferred,"pytest.mark.parametrize('X_type', all_x_types) | pytest.mark.parametrize('y_type', all_y_types) | pytest.mark.parametrize('g_type', all_group_types)"
+python,tests/python_package_test/test_sklearn.py,test_classifier_fit_detects_classes_every_time,2255,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_eval_set_deprecation,2272,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_eval_set_raises,2282,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_ranker_eval_set_raises,2309,sklearn,deferred,
+python,tests/python_package_test/test_sklearn.py,test_eval_X_eval_y_eval_set_equivalence,2332,sklearn,deferred,
+python,tests/python_package_test/test_utilities.py,test_register_logger,10,general,target-m2-m4,
+python,tests/python_package_test/test_utilities.py,test_register_invalid_logger,105,general,target-m2-m4,
+python,tests/python_package_test/test_utilities.py,test_register_custom_logger,131,general,target-m2-m4,
+cpp,tests/cpp_tests/test_array_args.cpp,Partition.JustWorks,19,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_array_args.cpp,Partition.PartitionOneElement,30,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_array_args.cpp,Partition.Empty,37,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_array_args.cpp,Partition.AllEqual,46,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_arrow.cpp,ArrowChunkedArrayTest.GetLength,82,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow.cpp,ArrowChunkedArrayTest.GetFields,113,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow.cpp,ArrowChunkedArrayTest.IteratorArithmetic,142,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow.cpp,ArrowChunkedArrayTest.BooleanIterator,174,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow.cpp,ArrowChunkedArrayTest.OffsetAndValidity,202,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow_deprecated.cpp,ArrowDeprecatedTest.DatasetCreateFromArrow,72,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow_deprecated.cpp,ArrowDeprecatedTest.DatasetSetFieldFromArrow,103,input-arrow,deferred,
+cpp,tests/cpp_tests/test_arrow_deprecated.cpp,ArrowDeprecatedTest.BoosterPredictForArrow,143,input-arrow,deferred,
+cpp,tests/cpp_tests/test_byte_buffer.cpp,ByteBuffer.JustWorks,16,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.constructorWithChunkSize0Throws,73,dataset-binning,target-m2-m4,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.constructorWithChunkSize,78,dataset-binning,target-m2-m4,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.getChunkSizeIsConstant,89,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.getChunksCount,101,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.getAddCount,116,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.coalesceTo,130,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.clear,142,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.doubleFreeSafe,159,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.totalArraySizeMatchesLastChunkAddCount,169,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.dataLayoutTestThroughGetitem,189,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_chunked_array.cpp,ChunkedArrayTest.testDataLayoutWithAdvancedInsertionAPI,218,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_common.cpp,AtofPreciseTest.Basic,46,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_common.cpp,AtofPreciseTest.CornerCases,70,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_common.cpp,AtofPreciseTest.ErrorInput,107,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_common.cpp,AtofPreciseTest.NaN,112,dataset-binning,target-m2-m4,
+cpp,tests/cpp_tests/test_common.cpp,AtofPreciseTest.Inf,136,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_serialize.cpp,Serialization.JustWorks,22,persistence,target-m2-m4,
+cpp,tests/cpp_tests/test_single_row.cpp,SingleRow.Normal,184,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_single_row.cpp,SingleRow.Contrib,188,prediction,target-m2-m4,
+cpp,tests/cpp_tests/test_stream.cpp,Stream.PushDenseRowsWithMetadata,253,c-api-internals,deferred,
+cpp,tests/cpp_tests/test_stream.cpp,Stream.PushSparseRowsWithMetadata,304,input-sparse,deferred,
