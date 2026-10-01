@@ -469,6 +469,57 @@ def test_cv(case, recorder):
     rec.finish()
 
 
+CONT_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
+                                             "goss_basic", "bin_init_score", "ova_basic")]
+
+
+@pytest.mark.parametrize("init_kind", ["booster", "model_file", "reused_dataset"])
+@pytest.mark.parametrize("case", CONT_CASES, ids=[c.name for c in CONT_CASES])
+def test_continued_training(case, init_kind, recorder, tmp_path):
+    """init_model: init trees merged first, init-model raw scores as init_score, validation, early stopping."""
+    rec = recorder(f"{case.name}[{init_kind}]")
+    hist = {}
+
+    def run(mod):
+        params = case.full_params
+        ds = mod.Dataset(case.X, label=case.y, weight=case.weight, init_score=case.init_score, free_raw_data=False)
+        first = mod.train(params, ds, num_boost_round=case.num_boost_round // 2)
+        init = first
+        if init_kind == "model_file":
+            init = tmp_path / f"{mod.__name__}.txt"
+            first.save_model(init)
+        ds2 = ds if init_kind == "reused_dataset" else mod.Dataset(case.X, label=case.y, weight=case.weight)
+        h = hist.setdefault(mod.__name__, {})
+        return mod.train(params, ds2, num_boost_round=case.num_boost_round, init_model=init,
+                         valid_sets=[ds2.create_valid(case.Xv, label=case.yv)],
+                         callbacks=[mod.record_evaluation(h), mod.early_stopping(5, verbose=False)])
+
+    rs, up = run(lgb_rs), run(lgb_up)
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    rec.compare("raw_score[holdout]", "predictions", rs.predict(case.Xv, raw_score=True),
+                up.predict(case.Xv, raw_score=True))
+    rec.compare("valid_0[per iteration]", "metrics", hist["lightgbm_rust"], hist["lightgbm"])
+    rec.compare("current/best iteration", "tree_structure", [rs.current_iteration(), rs.best_iteration],
+                [up.current_iteration(), up.best_iteration])
+    rec.finish()
+
+
+@pytest.mark.parametrize("case", [c for c in CONT_CASES if c.name in ("reg_basic", "mc_basic")], ids=lambda c: c.name)
+def test_cv_init_model(case, recorder):
+    rec = recorder(case.name)
+
+    def run(mod):
+        init = mod.train(case.full_params, mod.Dataset(case.X, label=case.y), num_boost_round=5)
+        r = mod.cv(case.full_params, mod.Dataset(case.X, label=case.y), num_boost_round=10, nfold=3, stratified=False,
+                   init_model=init, return_cvbooster=True, seed=3)
+        return r.pop("cvbooster"), r
+
+    (b_rs, r_rs), (b_up, r_up) = run(lgb_rs), run(lgb_up)
+    rec.compare("cv results", "metrics", r_rs, r_up)
+    rec.compare("fold models", "model_text", b_rs.model_to_string(), b_up.model_to_string())
+    rec.finish()
+
+
 def leaf_values(b):
     return np.concatenate([np.asarray(t["leaf_value"], dtype=float) for t in _trees_of(b)])
 

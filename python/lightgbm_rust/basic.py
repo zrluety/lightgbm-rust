@@ -459,6 +459,56 @@ _DATASET_PARAMS = (
 )
 
 
+class _InnerPredictor:
+    """Prediction-only view of a model, used for continued training (upstream ``_InnerPredictor``).
+
+    ``from_booster`` shares the booster, like upstream sharing the C++ handle,
+    so later training of that booster is visible here.
+    """
+
+    def __init__(self, booster: "Booster", pandas_categorical: Optional[List[List]], pred_parameter: Dict[str, Any]):
+        self._booster = booster
+        self.pandas_categorical = pandas_categorical
+        self.pred_parameter = pred_parameter
+        self.num_class = booster.num_model_per_iteration()
+
+    @classmethod
+    def from_booster(cls, booster: "Booster", pred_parameter: Dict[str, Any]) -> "_InnerPredictor":
+        return cls(booster=booster, pandas_categorical=booster.pandas_categorical, pred_parameter=pred_parameter)
+
+    @classmethod
+    def from_model_file(cls, model_file: Union[str, Path], pred_parameter: Dict[str, Any]) -> "_InnerPredictor":
+        booster = Booster(model_file=model_file)
+        return cls(booster=booster, pandas_categorical=booster.pandas_categorical, pred_parameter=pred_parameter)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        this = self.__dict__.copy()
+        this["_booster"] = self._booster.model_to_string(num_iteration=-1)
+        return this
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state["_booster"] = Booster(model_str=state["_booster"])
+        self.__dict__.update(state)
+
+    def predict(self, data: Any, start_iteration: int = 0, num_iteration: int = -1, raw_score: bool = False,
+                pred_leaf: bool = False, pred_contrib: bool = False, data_has_header: bool = False,
+                validate_features: bool = False) -> np.ndarray:
+        if isinstance(data, Dataset):
+            raise TypeError("Cannot use Dataset instance for prediction, please use raw data instead")
+        return self._booster.predict(
+            data,
+            start_iteration=start_iteration,
+            num_iteration=num_iteration if num_iteration > 0 else -1,
+            raw_score=raw_score,
+            pred_leaf=pred_leaf,
+            pred_contrib=pred_contrib,
+            validate_features=validate_features,
+        )
+
+    def current_iteration(self) -> int:
+        return self._booster.current_iteration()
+
+
 class Dataset:
     """Dataset in lightgbm-rust (same constructor and lazy construction as ``lightgbm.Dataset``)."""
 
@@ -548,8 +598,12 @@ class Dataset:
                     _log_warning("Overriding the parameters from Reference Dataset.")
                 self._update_params(reference_params)
         params = self.params
-        if self._predictor is not None:
-            raise _unsupported("init_model / continued training")
+        predictor = self._predictor
+        if predictor is not None and not isinstance(predictor, _InnerPredictor):
+            raise TypeError(f"Wrong predictor type {type(predictor).__name__}")
+        if predictor is not None and init_score is not None:
+            # upstream _lazy_init: the init model's prediction replaces init_score
+            init_score = None
         pairs = _param_dict_to_pairs(params)
         self._rs = _rs.RsDataset(
             mat,
@@ -564,7 +618,9 @@ class Dataset:
         # upstream: _lazy_init re-reads the fields, which the engine may have modified
         self.label = self.get_field("label")
         self.weight = self.get_field("weight")
-        if self.init_score is not None:
+        if predictor is not None:
+            self._set_init_score_by_predictor(predictor=predictor, data=self.data, used_indices=None)
+        elif self.init_score is not None:
             self.init_score = self.get_field("init_score")
         if self.free_raw_data:
             self.data = None
@@ -584,8 +640,6 @@ class Dataset:
             self._update_params(reference_params)
         if self.reference.group is not None:
             raise _unsupported("group / query data (ranking)")
-        if self._predictor is not None and self._predictor is not self.reference._predictor:
-            raise _unsupported("init_model / continued training")
         used_indices = _list_to_1d_numpy(data=self.used_indices, dtype=np.int32, name="used_indices")
         full = self.reference.construct()._rs
         assert full is not None
@@ -595,6 +649,9 @@ class Dataset:
             self.get_data()
         if self.get_label() is None:
             raise ValueError("Label should not be None.")
+        if isinstance(self._predictor, _InnerPredictor) and self._predictor is not self.reference._predictor:
+            self.get_data()
+            self._set_init_score_by_predictor(predictor=self._predictor, data=self.data, used_indices=used_indices)
         if self.free_raw_data:
             self.data = None
         self.feature_name = self.get_feature_name()
@@ -627,12 +684,46 @@ class Dataset:
         return ret
 
     def set_reference(self, reference: "Dataset") -> "Dataset":
-        if self.reference is reference:
+        self.set_categorical_feature(reference.categorical_feature).set_feature_name(
+            reference.feature_name
+        )._set_predictor(reference._predictor)
+        # we're done if self and reference share a common upstream reference
+        if self.get_ref_chain().intersection(reference.get_ref_chain()):
             return self
-        if self._rs is not None and self.data is None:
-            raise LightGBMError("Cannot set reference after freed raw data, set free_raw_data=False when construct Dataset to avoid this.")
-        self.reference = reference
+        if self.data is not None:
+            self.reference = reference
+            return self._free_handle()
+        raise LightGBMError(
+            "Cannot set reference after freed raw data, set free_raw_data=False when construct Dataset to avoid this."
+        )
+
+    def _free_handle(self) -> "Dataset":
         self._rs = None
+        self._need_slice = True
+        if self.used_indices is not None:
+            self.data = None
+        return self
+
+    def _set_init_score_by_predictor(
+        self, predictor: Optional[_InnerPredictor], data: Any, used_indices: Optional[Union[List[int], np.ndarray]]
+    ) -> "Dataset":
+        # upstream: Dataset._set_init_score_by_predictor (file inputs are not supported)
+        num_data = self.num_data()
+        if predictor is not None:
+            init_score = np.asarray(predictor.predict(data=data, raw_score=True), dtype=np.float64).ravel()
+            if used_indices is not None:
+                assert not self._need_slice
+            if predictor.num_class > 1:
+                new_init_score = np.empty(init_score.size, dtype=np.float64)
+                for i in range(num_data):
+                    for j in range(predictor.num_class):
+                        new_init_score[j * num_data + i] = init_score[i * predictor.num_class + j]
+                init_score = new_init_score
+        elif self.init_score is not None:
+            init_score = np.full_like(self.init_score, fill_value=0.0, dtype=np.float64)
+        else:
+            return self
+        self.set_init_score(init_score)
         return self
 
     def _update_params(self, params: Optional[Dict[str, Any]]) -> "Dataset":
@@ -666,12 +757,28 @@ class Dataset:
             self._params_back_up = None
         return self
 
-    def _set_predictor(self, predictor: Any) -> "Dataset":
+    def _set_predictor(self, predictor: Optional[_InnerPredictor]) -> "Dataset":
         if predictor is None and self._predictor is None:
             return self
-        if predictor is not None:
-            raise _unsupported("init_model / continued training")
-        self._predictor = predictor
+        elif isinstance(predictor, _InnerPredictor) and isinstance(self._predictor, _InnerPredictor):
+            if (predictor == self._predictor) and (
+                predictor.current_iteration() == self._predictor.current_iteration()
+            ):
+                return self
+        if self._rs is None:
+            self._predictor = predictor
+        elif self.data is not None:
+            self._predictor = predictor
+            self._set_init_score_by_predictor(predictor=self._predictor, data=self.data, used_indices=None)
+        elif self.used_indices is not None and self.reference is not None and self.reference.data is not None:
+            self._predictor = predictor
+            self._set_init_score_by_predictor(
+                predictor=self._predictor, data=self.reference.data, used_indices=self.used_indices
+            )
+        else:
+            raise LightGBMError(
+                "Cannot set predictor after freed raw data, set free_raw_data=False when construct Dataset to avoid this."
+            )
         return self
 
     # ---- fields
@@ -970,6 +1077,9 @@ class Booster:
             _emit_engine_warnings(self._rs.config_warnings(), params)
             self.__num_dataset = 1
             self.__init_predictor = train_set._predictor
+            if self.__init_predictor is not None:
+                assert self.__init_predictor._booster._rs is not None
+                self._rs.merge_from(self.__init_predictor._booster._rs)
             self.pandas_categorical = train_set.pandas_categorical
             objective = _choose_param_value("objective", params, None)["objective"]
             if objective is not None and str(objective).lower() in ("none", "null", "custom", "na"):

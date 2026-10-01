@@ -20,8 +20,8 @@ from .basic import (
     LightGBMError,
     _choose_param_value,
     _ConfigAliases,
+    _InnerPredictor,
     _log_warning,
-    _unsupported,
 )
 from .compat import SKLEARN_INSTALLED, _LGBMGroupKFold, _LGBMStratifiedKFold
 
@@ -68,9 +68,6 @@ def train(
                     "Every item in valid_sets must be a Dataset object. "
                     f"Item {i} has type '{type(valid_item).__name__}'."
                 )
-    if init_model is not None:
-        raise _unsupported("init_model / continued training")
-
     params = copy.deepcopy(params)
     params = _choose_param_value(main_param_name="objective", params=params, default_value=None)
     fobj = None
@@ -88,8 +85,18 @@ def train(
         params.pop("early_stopping_round")
     first_metric_only = params.get("first_metric_only", False)
 
-    init_iteration = 0
-    train_set._update_params(params)._set_predictor(None)
+    predictor: Optional[_InnerPredictor] = None
+    if isinstance(init_model, (str, Path)):
+        predictor = _InnerPredictor.from_model_file(model_file=init_model, pred_parameter=params)
+    elif isinstance(init_model, Booster):
+        predictor = _InnerPredictor.from_booster(booster=init_model, pred_parameter=dict(init_model.params, **params))
+
+    if predictor is not None:
+        init_iteration = predictor.current_iteration()
+    else:
+        init_iteration = 0
+
+    train_set._update_params(params)._set_predictor(predictor)
 
     is_valid_contain_train = False
     train_data_name = "training"
@@ -397,15 +404,19 @@ def cv(
         params.pop("early_stopping_round")
     first_metric_only = params.get("first_metric_only", False)
 
-    if init_model is not None:
-        raise _unsupported("init_model / continued training")
+    if isinstance(init_model, (str, Path)):
+        predictor = _InnerPredictor.from_model_file(model_file=init_model, pred_parameter=params)
+    elif isinstance(init_model, Booster):
+        predictor = _InnerPredictor.from_booster(booster=init_model, pred_parameter=dict(init_model.params, **params))
+    else:
+        predictor = None
 
     if metrics is not None:
         for metric_alias in _ConfigAliases.get("metric"):
             params.pop(metric_alias, None)
         params["metric"] = metrics
 
-    train_set._update_params(params)._set_predictor(None)
+    train_set._update_params(params)._set_predictor(predictor)
 
     results = defaultdict(list)
     cvbooster = _make_n_folds(

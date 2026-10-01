@@ -300,6 +300,11 @@ impl RsBooster {
         self.warnings.clone()
     }
 
+    /// upstream: `LGBM_BoosterMerge`.
+    fn merge_from(&mut self, other: PyRef<'_, RsBooster>) {
+        self.inner.merge_from(&other.inner);
+    }
+
     fn add_valid(&mut self, data: PyRef<'_, RsDataset>, name: &str) -> PyResult<()> {
         let d = data.inner.clone();
         guarded(|| self.inner.add_valid(d, name))

@@ -63,6 +63,8 @@ pub struct Gbdt {
     pub(crate) max_feature_idx: i32,
     pub(crate) feature_names: Vec<String>,
     pub(crate) feature_infos: Vec<String>,
+    /// Iterations merged from an init model (upstream `num_init_iteration_`).
+    num_init_iteration: usize,
     train: Option<TrainState>,
     pool: Option<Arc<rayon::ThreadPool>>,
     warnings: Vec<String>,
@@ -93,6 +95,7 @@ impl Gbdt {
             max_feature_idx: -1,
             feature_names: Vec::new(),
             feature_infos: Vec::new(),
+            num_init_iteration: 0,
             train: None,
             pool: None,
             warnings: Vec::new(),
@@ -163,6 +166,7 @@ impl Gbdt {
             feature_infos: train.feature_infos(),
             objective,
             models: Vec::new(),
+            num_init_iteration: 0,
             train: Some(TrainState {
                 data: train,
                 learner,
@@ -218,13 +222,26 @@ impl Gbdt {
             }
             scores.copy_from_slice(s);
         }
-        // Bring scores up to date with trees trained so far.
-        for (i, t) in self.models.iter().enumerate() {
+        // Bring scores up to date with trees trained by this booster; merged
+        // init-model trees are already part of the dataset's init_score.
+        let start = self.num_init_iteration * ntpi;
+        for (i, t) in self.models.iter().enumerate().skip(start) {
             let k = i % ntpi;
             t.add_prediction_to_score(&data, &mut scores[k * n..(k + 1) * n]);
         }
         st.valid.push(ValidSet { name: name.to_string(), data, scores, metrics });
         Ok(())
+    }
+
+    /// Put `other`'s trees in front of this booster's (continued training).
+    /// Their contribution must already be in the datasets' init scores.
+    ///
+    /// upstream: gbdt.h `GBDT::MergeFrom`.
+    pub fn merge_from(&mut self, other: &Gbdt) {
+        let mut models = other.models.clone();
+        self.num_init_iteration = models.len() / self.num_tree_per_iteration;
+        models.append(&mut self.models);
+        self.models = models;
     }
 
     pub fn num_tree_per_iteration(&self) -> usize {
