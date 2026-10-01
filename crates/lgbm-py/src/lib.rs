@@ -158,6 +158,15 @@ impl RsDataset {
         Ok(Self { inner: Arc::new(ds), warnings })
     }
 
+    /// upstream: `LGBM_DatasetGetSubset`.
+    fn subset(&self, py: Python<'_>, used: PyReadonlyArray1<'_, i32>, params: Vec<(String, String)>) -> PyResult<Self> {
+        let cfg = config_from(params)?;
+        let used = slice_of(&used, "used_indices")?;
+        let full = &self.inner;
+        let ds = detached(py, || lgbm_core::dataset::with_num_threads(cfg.num_threads, || full.subset(used))?)?;
+        Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings })
+    }
+
     fn config_warnings(&self) -> Vec<String> {
         self.warnings.clone()
     }

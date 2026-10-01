@@ -399,6 +399,33 @@ def test_multithread(case, recorder):
     rec.finish()
 
 
+CV_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
+                                           "bin_init_score")]
+
+
+@pytest.mark.parametrize("case", CV_CASES, ids=[c.name for c in CV_CASES])
+def test_cv(case, recorder):
+    """cv(): fold assignment (stratified for classification), Dataset.subset, per-fold boosters, aggregation."""
+    rec = recorder(case.name)
+    classification = case.objective in ("binary", "multiclass", "multiclassova")
+
+    def run(mod):
+        ds = mod.Dataset(case.X, label=case.y, weight=case.weight, init_score=case.init_score)
+        r = mod.cv(dict(case.full_params, early_stopping_round=5), ds, num_boost_round=60, nfold=4,
+                   stratified=classification, eval_train_metric=True, return_cvbooster=True, seed=7)
+        cvb = r.pop("cvbooster")
+        return r, cvb
+
+    (r_rs, b_rs), (r_up, b_up) = run(lgb_rs), run(lgb_up)
+    rec.compare("result keys", "tree_structure", list(r_rs), list(r_up))
+    for k in r_up:
+        rec.compare(f"cv[{k}]", "metrics", r_rs.get(k, []), r_up[k])
+    rec.compare("best_iteration", "tree_structure", b_rs.best_iteration, b_up.best_iteration)
+    rec.compare("fold models", "model_text", b_rs.model_to_string(), b_up.model_to_string())
+    rec.compare("fold predictions", "predictions", np.asarray(b_rs.predict(case.Xv)), np.asarray(b_up.predict(case.Xv)))
+    rec.finish()
+
+
 def leaf_values(b):
     return np.concatenate([np.asarray(t["leaf_value"], dtype=float) for t in _trees_of(b)])
 

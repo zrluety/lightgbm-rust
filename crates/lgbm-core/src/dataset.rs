@@ -347,6 +347,54 @@ impl Dataset {
         Ok(ds)
     }
 
+    /// Rows `used` (sorted, in range) of this dataset, sharing its bin mappers.
+    ///
+    /// upstream: c_api.cpp `LGBM_DatasetGetSubset`, `Dataset::CopySubrow`,
+    /// `Metadata::Init(const Metadata&, const data_size_t*, data_size_t)`.
+    pub fn subset(&self, used: &[i32]) -> Result<Self> {
+        if used.is_empty() {
+            return Err(LgbmError::InvalidParameter("Check failed: (num_used_row_indices) > (0)".into()));
+        }
+        check_elements_interval_closed(used, 0, self.num_data as i32 - 1, "Used indices of subset")?;
+        if used.windows(2).any(|w| w[0] > w[1]) {
+            return Err(LgbmError::InvalidData("used_row_indices should be sorted in Subset".into()));
+        }
+        let n = used.len();
+        let bins = self
+            .bins
+            .par_iter()
+            .map(|col| match col {
+                BinColumn::U8(v) => BinColumn::U8(used.iter().map(|&i| v[i as usize]).collect()),
+                BinColumn::U16(v) => BinColumn::U16(used.iter().map(|&i| v[i as usize]).collect()),
+                BinColumn::U32(v) => BinColumn::U32(used.iter().map(|&i| v[i as usize]).collect()),
+            })
+            .collect();
+        let pick_f32 = |v: &[f32]| used.iter().map(|&i| v[i as usize]).collect::<Vec<_>>();
+        let init_score = self.metadata.init_score.as_ref().map(|s| {
+            let k = s.len() / self.num_data;
+            let mut out = Vec::with_capacity(n * k);
+            for c in 0..k {
+                out.extend(used.iter().map(|&i| s[c * self.num_data + i as usize]));
+            }
+            out
+        });
+        Ok(Self {
+            num_data: n,
+            bin_mappers: self.bin_mappers.clone(),
+            used_features: self.used_features.clone(),
+            upstream_inner: self.upstream_inner.clone(),
+            real_to_inner: self.real_to_inner.clone(),
+            bins,
+            metadata: Metadata {
+                label: pick_f32(&self.metadata.label),
+                weight: self.metadata.weight.as_deref().map(pick_f32),
+                init_score,
+            },
+            feature_names: self.feature_names.clone(),
+            warnings: Vec::new(),
+        })
+    }
+
     fn validate_fields(n: usize, ncol: usize, f: &DatasetFields<'_>) -> Result<()> {
         if n == 0 {
             return Err(LgbmError::InvalidData("dataset has no rows".into()));
@@ -522,6 +570,40 @@ impl Dataset {
     }
 }
 
+/// upstream: utils/common.h `CheckElementsIntervalClosed` (same pairwise scan,
+/// so the reported element matches).
+fn check_elements_interval_closed(y: &[i32], ymin: i32, ymax: i32, caller: &str) -> Result<()> {
+    let fatal = |i: usize| {
+        Err(LgbmError::InvalidData(format!(
+            "[{caller}]: does not tolerate element [#{i} = {}] outside [{ymin}, {ymax}]",
+            y[i]
+        )))
+    };
+    let mut i = 1;
+    while i < y.len() {
+        let (a, b) = (y[i - 1], y[i]);
+        if a < b {
+            if a < ymin {
+                return fatal(i - 1);
+            } else if b > ymax {
+                return fatal(i);
+            }
+        } else if a > ymax {
+            return fatal(i - 1);
+        } else if b < ymin {
+            return fatal(i);
+        }
+        i += 2;
+    }
+    if y.len() % 2 == 1 {
+        let last = y.len() - 1;
+        if y[last] < ymin || y[last] > ymax {
+            return fatal(last);
+        }
+    }
+    Ok(())
+}
+
 /// Message upstream logs when [`sanitize_feature_names`] replaced spaces.
 pub const FEATURE_NAME_SPACE_WARNING: &str = "Found whitespace in feature_names, replace with underlines";
 
@@ -599,6 +681,34 @@ mod tests {
         for f in 0..a.num_features() {
             assert_eq!(a.bin_indices(f), b.bin_indices(f));
         }
+    }
+
+    #[test]
+    fn subset_copies_rows_and_metadata() {
+        let n = 40;
+        let data: Vec<f64> = (0..n * 2).map(|i| ((i * 37) % 23) as f64).collect();
+        let label: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+        let init: Vec<f64> = (0..2 * n).map(|i| i as f64).collect();
+        let cfg = Config::from_pairs([("min_data_in_leaf", "1"), ("min_data_in_bin", "1")]).unwrap();
+        let mat = DenseMatrix::from_f64_row_major(&data, n, 2).unwrap();
+        let fields =
+            DatasetFields { label: &label, weight: Some(&weight), init_score: Some(&init), ..Default::default() };
+        let ds = Dataset::from_dense(&mat, fields, &cfg).unwrap();
+        let used = [1, 5, 6, 39];
+        let sub = ds.subset(&used).unwrap();
+        assert_eq!(sub.num_data(), 4);
+        assert!(sub.same_bins_as(&ds));
+        assert_eq!(sub.label(), &[1.0, 5.0, 6.0, 39.0]);
+        assert_eq!(sub.weight().unwrap(), &[2.0, 6.0, 7.0, 40.0]);
+        assert_eq!(sub.init_score().unwrap(), &[1.0, 5.0, 6.0, 39.0, 41.0, 45.0, 46.0, 79.0]);
+        for f in 0..ds.num_features() {
+            let full = ds.bin_indices(f);
+            assert_eq!(sub.bin_indices(f), used.iter().map(|&i| full[i as usize]).collect::<Vec<_>>());
+        }
+        let e = ds.subset(&[3, 40]).unwrap_err().to_string();
+        assert!(e.contains("[Used indices of subset]: does not tolerate element [#1 = 40] outside [0, 39]"), "{e}");
+        assert!(ds.subset(&[5, 3]).unwrap_err().to_string().contains("should be sorted"));
     }
 
     #[test]

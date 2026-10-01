@@ -53,7 +53,7 @@ def test_unsupported_features_raise_lightgbm_error():
     with pytest.raises(lgb.LightGBMError, match="categorical"):
         lgb.Dataset(X, label=y, categorical_feature=[0]).construct()
     with pytest.raises(lgb.LightGBMError, match="not supported"):
-        lgb.cv({**BASE}, lgb.Dataset(X, label=y))
+        lgb.Dataset(X, label=y).construct().save_binary("unused.bin")
 
 
 def test_invalid_parameter_message_matches_upstream_check():

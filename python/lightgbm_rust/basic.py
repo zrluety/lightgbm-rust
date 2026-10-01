@@ -489,6 +489,7 @@ class Dataset:
         self.params = copy.deepcopy(params) if params else {}
         self.free_raw_data = free_raw_data
         self.used_indices: Optional[List[int]] = None
+        self._need_slice = True
         self._predictor: Any = None
         self.pandas_categorical: Optional[List[List]] = None
         self._params_back_up: Optional[Dict[str, Any]] = None
@@ -501,14 +502,14 @@ class Dataset:
         """Lazily build the binned dataset."""
         if self._rs is not None:
             return self
+        if self.used_indices is not None and self.reference is not None:
+            return self._construct_subset()
         if self.data is None:
             raise ValueError("Cannot construct a Dataset whose raw data has been freed.")
         if self.group is not None:
             raise _unsupported("group / query data (ranking)")
         if self.position is not None:
             raise _unsupported("position data")
-        if self.used_indices is not None:
-            raise _unsupported("Dataset.subset()")
         cat = self.categorical_feature
         if cat not in ("auto", None) and len(cat) > 0:
             raise _unsupported("categorical features")
@@ -565,6 +566,35 @@ class Dataset:
         self.weight = self.get_field("weight")
         if self.init_score is not None:
             self.init_score = self.get_field("init_score")
+        if self.free_raw_data:
+            self.data = None
+        self.feature_name = self.get_feature_name()
+        return self
+
+    def _construct_subset(self) -> "Dataset":
+        # upstream: Dataset.construct, "construct subset" branch
+        assert self.reference is not None and self.used_indices is not None
+        reference_params = self.reference.get_params()
+        if self.get_params() != reference_params:
+            ignore = _ConfigAliases.get("categorical_feature")
+            a = {k: v for k, v in self.get_params().items() if k not in ignore}
+            b = {k: v for k, v in reference_params.items() if k not in ignore}
+            if a != b:
+                _log_warning("Overriding the parameters from Reference Dataset.")
+            self._update_params(reference_params)
+        if self.reference.group is not None:
+            raise _unsupported("group / query data (ranking)")
+        if self._predictor is not None and self._predictor is not self.reference._predictor:
+            raise _unsupported("init_model / continued training")
+        used_indices = _list_to_1d_numpy(data=self.used_indices, dtype=np.int32, name="used_indices")
+        full = self.reference.construct()._rs
+        assert full is not None
+        self._rs = full.subset(np.ascontiguousarray(used_indices), _param_dict_to_pairs(self.params))
+        _emit_engine_warnings(self._rs.config_warnings(), self.params)
+        if not self.free_raw_data:
+            self.get_data()
+        if self.get_label() is None:
+            raise ValueError("Label should not be None.")
         if self.free_raw_data:
             self.data = None
         self.feature_name = self.get_feature_name()
@@ -764,6 +794,20 @@ class Dataset:
     def get_data(self) -> Any:
         if self._rs is None:
             raise Exception("Cannot get data before construct Dataset")
+        if self._need_slice and self.used_indices is not None and self.reference is not None:
+            self.data = self.reference.data
+            if self.data is not None:
+                if isinstance(self.data, np.ndarray) or _is_scipy_sparse(self.data):
+                    self.data = self.data[self.used_indices, :]
+                elif _is_pandas_df(self.data):
+                    self.data = self.data.iloc[self.used_indices].copy()
+                elif isinstance(self.data, Sequence):
+                    self.data = self.data[self.used_indices]
+                else:
+                    _log_warning(
+                        f"Cannot subset {type(self.data).__name__} type of raw data.\nReturning original raw data"
+                    )
+            self._need_slice = False
         if self.data is None:
             raise LightGBMError(
                 "Cannot call `get_data` after freed raw data, set free_raw_data=False when construct Dataset to avoid this."
@@ -813,7 +857,21 @@ class Dataset:
         return len(self._rs.bin_upper_bounds(int(feature)))
 
     def subset(self, used_indices: List[int], params: Optional[Dict[str, Any]] = None) -> "Dataset":
-        raise _unsupported("Dataset.subset()")
+        """Get subset of current Dataset (rows ``used_indices``, sharing its bin mappers)."""
+        if params is None:
+            params = self.params
+        ret = Dataset(
+            None,
+            reference=self,
+            feature_name=self.feature_name,
+            categorical_feature=self.categorical_feature,
+            params=params,
+            free_raw_data=self.free_raw_data,
+        )
+        ret._predictor = self._predictor
+        ret.pandas_categorical = self.pandas_categorical
+        ret.used_indices = sorted(used_indices)
+        return ret
 
     def save_binary(self, filename: Union[str, Path]) -> "Dataset":
         raise _unsupported("Dataset.save_binary()")
