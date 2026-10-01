@@ -455,7 +455,7 @@ impl RsBooster {
                 d.set_item("internal_weight", t.internal_weight[..ni].to_vec())?;
                 d.set_item("internal_count", t.internal_count[..ni].to_vec())?;
                 d.set_item("leaf_value", t.leaf_value[..t.num_leaves].to_vec())?;
-                d.set_item("leaf_weight", t.leaf_weight[..t.num_leaves].to_vec())?;
+                d.set_item("leaf_weight", t.leaf_weight[..t.num_leaves.min(t.leaf_weight.len())].to_vec())?;
                 d.set_item("leaf_count", t.leaf_count[..t.num_leaves].to_vec())?;
                 Ok(d)
             })

@@ -25,6 +25,8 @@ pub enum MetricKind {
     BinaryLogloss,
     BinaryError,
     Auc,
+    MultiLogloss,
+    MultiError,
 }
 
 impl MetricKind {
@@ -44,6 +46,8 @@ impl MetricKind {
             "binary_logloss" => MetricKind::BinaryLogloss,
             "binary_error" => MetricKind::BinaryError,
             "auc" => MetricKind::Auc,
+            "multi_logloss" => MetricKind::MultiLogloss,
+            "multi_error" => MetricKind::MultiError,
             other => return Err(LgbmError::Unsupported(format!("metric={other}"))),
         })
     }
@@ -64,6 +68,8 @@ impl MetricKind {
             MetricKind::BinaryLogloss => "binary_logloss",
             MetricKind::BinaryError => "binary_error",
             MetricKind::Auc => "auc",
+            MetricKind::MultiLogloss => "multi_logloss",
+            MetricKind::MultiError => "multi_error",
         }
     }
 
@@ -78,16 +84,41 @@ struct LossParams {
     alpha: f64,
     fair_c: f64,
     rho: f64,
+    multi_error_top_k: i32,
 }
 
 /// A metric bound to one dataset's labels and weights.
 #[derive(Debug, Clone)]
 pub struct Metric {
     pub kind: MetricKind,
+    name: String,
     label: Vec<f32>,
     weight: Option<Vec<f32>>,
     sum_weights: f64,
     params: LossParams,
+}
+
+/// upstream `MultiErrorMetric::LossOnPoint` / `MultiSoftmaxLoglossMetric::LossOnPoint`.
+fn multiclass_loss(kind: MetricKind, p: LossParams, label: f32, rec: &[f64]) -> f64 {
+    let k = label as usize;
+    match kind {
+        MetricKind::MultiError => {
+            let mut num_larger = 0;
+            for &s in rec {
+                if s >= rec[k] {
+                    num_larger += 1;
+                }
+                if num_larger > p.multi_error_top_k {
+                    return 1.0;
+                }
+            }
+            0.0
+        }
+        MetricKind::MultiLogloss => {
+            if rec[k] > K_EPSILON { -rec[k].ln() } else { -K_EPSILON.ln() }
+        }
+        _ => unreachable!("not a multiclass metric"),
+    }
 }
 
 /// upstream `PointWiseLossCalculator::LossOnPoint` of the regression metrics.
@@ -159,15 +190,30 @@ impl Metric {
                 s
             }
         };
-        let params = LossParams { alpha: cfg.alpha, fair_c: cfg.fair_c, rho: cfg.tweedie_variance_power };
-        Ok(Self { kind, label: meta.label.clone(), weight: meta.weight.clone(), sum_weights, params })
+        let params = LossParams {
+            alpha: cfg.alpha,
+            fair_c: cfg.fair_c,
+            rho: cfg.tweedie_variance_power,
+            multi_error_top_k: cfg.multi_error_top_k,
+        };
+        let name = match kind {
+            MetricKind::MultiError if cfg.multi_error_top_k != 1 => format!("multi_error@{}", cfg.multi_error_top_k),
+            _ => kind.name().to_string(),
+        };
+        Ok(Self { kind, name, label: meta.label.clone(), weight: meta.weight.clone(), sum_weights, params })
     }
 
-    /// Evaluate on raw scores (`num_data` entries for single-output models).
+    /// Name reported with the value (e.g. `multi_error@2`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Evaluate on raw scores (class-major, `num_data * num_outputs` entries).
     pub fn eval(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
         match self.kind {
             MetricKind::Auc => self.auc(score),
             MetricKind::BinaryLogloss | MetricKind::BinaryError => self.binary(score, objective),
+            MetricKind::MultiLogloss | MetricKind::MultiError => self.multiclass(score, objective),
             kind => {
                 let p = self.params;
                 let s = self.weighted_sum(score, objective, |label, s| regression_loss(kind, p, label, s));
@@ -203,6 +249,34 @@ impl Metric {
             }
             _ => unreachable!("not a binary metric"),
         }
+    }
+
+    /// upstream `MulticlassMetric::Eval`: the objective's transform when there
+    /// is one, raw scores otherwise.
+    fn multiclass(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
+        let n = self.label.len();
+        let k = score.len().checked_div(n).unwrap_or(0);
+        let mut raw = vec![0.0f64; k];
+        let mut rec = vec![0.0f64; k];
+        let mut sum = 0.0f64;
+        for i in 0..n {
+            for c in 0..k {
+                raw[c] = score[c * n + i];
+            }
+            let r = match objective {
+                Some(o) => {
+                    o.convert_output(&raw, &mut rec);
+                    &rec
+                }
+                None => &raw,
+            };
+            let l = multiclass_loss(self.kind, self.params, self.label[i], r);
+            sum += match &self.weight {
+                Some(w) => l * w[i] as f64,
+                None => l,
+            };
+        }
+        sum / self.sum_weights
     }
 
     fn weighted_sum(&self, score: &[f64], objective: Option<&Objective>, loss: impl Fn(f32, f64) -> f64) -> f64 {

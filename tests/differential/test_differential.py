@@ -1,4 +1,4 @@
-"""Differential tests: lightgbm-rust vs LightGBM 4.7.0 on the regression-family/binary subset.
+"""Differential tests: lightgbm-rust vs LightGBM 4.7.0 on the regression-family/binary/multiclass subset.
 
 Each test compares intermediate and final quantities; tolerances come from
 tests/tolerances.toml (see its rationale entries).
@@ -199,9 +199,25 @@ def _reference_gradients(case):
             g = g * w.astype(np.float32)
         h = np.ones_like(y, dtype=np.float32) if w is None else w.astype(np.float32)
         return g, h
+    if case.objective == "multiclass":
+        return _reference_softmax_gradients(case, y, w)
+    if case.objective == "multiclassova":
+        n, k = len(y), p["num_class"]
+        init = None if case.init_score is None else case.init_score.astype(np.float64)
+        parts = [_reference_binary_gradients(p, y.astype(np.int64) == c, ww, None if init is None else init[:, c])
+                 for c in range(k)]
+        return np.concatenate([g for g, _ in parts]), np.concatenate([h for _, h in parts])
+    init = None if case.init_score is None else case.init_score.astype(np.float64)
+    return _reference_binary_gradients(p, y > 0, ww, init)
+
+
+def _reference_binary_gradients(p, pos, ww, init):
+    """upstream BinaryLogloss; `pos` is the is_pos predicate applied to the labels."""
     sigmoid = p.get("sigmoid", 1.0)
-    pos = y > 0
     cnt_pos, cnt_neg = int(pos.sum()), int((~pos).sum())
+    if cnt_pos == 0 or cnt_neg == 0:
+        # "Contains only one class": no gradients are written
+        return np.zeros(len(pos), dtype=np.float32), np.zeros(len(pos), dtype=np.float32)
     lw = [1.0, 1.0]
     if p.get("is_unbalance") and cnt_pos > 0 and cnt_neg > 0:
         if cnt_pos > cnt_neg:
@@ -209,19 +225,58 @@ def _reference_gradients(case):
         else:
             lw = [1.0, cnt_neg / cnt_pos]
     lw[1] *= p.get("scale_pos_weight", 1.0)
-    if case.init_score is not None:
-        score = case.init_score.astype(np.float64)
+    if init is not None:
+        score = init
     else:
         pavg = _seqsum(pos * ww) / _seqsum(ww)
         pavg = min(max(pavg, 1e-15), 1 - 1e-15)
-        score = np.full_like(y, math.log(pavg / (1 - pavg)) / sigmoid)
+        score = np.full(len(pos), math.log(pavg / (1 - pavg)) / sigmoid)
     label = np.where(pos, 1.0, -1.0)
     label_weight = np.where(pos, lw[1], lw[0])
-    response = -label * sigmoid / (1.0 + np.exp(label * sigmoid * score))
+    response = -label * sigmoid / (1.0 + _cexp(label * sigmoid * score))
     abs_r = np.abs(response)
     g = response * label_weight * ww
     h = abs_r * (sigmoid - abs_r) * label_weight * ww
     return g.astype(np.float32), h.astype(np.float32)
+
+
+def _reference_softmax_gradients(case, y, w):
+    """upstream MulticlassSoftmax (class-major output, Common::Softmax per row)."""
+    p = case.full_params
+    k = p["num_class"]
+    n = len(y)
+    label = y.astype(np.int64)
+    if case.init_score is not None:
+        score = case.init_score.astype(np.float64)
+    else:
+        prior = np.zeros(k)
+        for i in range(n):
+            prior[label[i]] += 1.0 if w is None else w[i]
+        prior /= n if w is None else _seqsum(w)
+        init = [math.log(max(1e-15, q)) for q in prior]
+        if not p.get("boost_from_average", True):
+            init = [0.0] * k
+        score = np.tile(np.array(init), (n, 1))
+    factor = k / float(np.float32(k) - np.float32(1.0))
+    g = np.empty((k, n), dtype=np.float32)
+    h = np.empty((k, n), dtype=np.float32)
+    for i in range(n):
+        row = score[i]
+        wmax = row[0]
+        for v in row[1:]:
+            wmax = wmax if v < wmax else v
+        e = [math.exp(v - wmax) for v in row]
+        wsum = 0.0
+        for v in e:
+            wsum += v
+        wi = 1.0 if w is None else w[i]
+        for c in range(k):
+            q = e[c] / wsum
+            gi = q - 1.0 if label[i] == c else q
+            hi = factor * q * (1.0 - q)
+            g[c, i] = gi if w is None else gi * wi
+            h[c, i] = hi if w is None else hi * wi
+    return g.ravel(), h.ravel()
 
 
 @pytest.mark.parametrize("case", CASES, ids=case_ids())
@@ -310,7 +365,7 @@ def test_metrics_and_early_stopping(case, recorder):
 
 MT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_basic", "reg_100_rounds", "bin_100_rounds",
                                            "l1_weighted", "quantile_basic", "mape_weighted", "poisson_weighted",
-                                           "tweedie_basic")]
+                                           "tweedie_basic", "mc_weighted", "ova_basic")]
 
 
 @pytest.mark.parametrize("case", MT_CASES, ids=[c.name for c in MT_CASES])

@@ -121,7 +121,9 @@ impl Gbdt {
             o.init(&train.metadata, n)?;
             warnings = o.take_warnings();
         }
-        let ntpi = objective.as_ref().map_or(1, |o| o.num_outputs());
+        // upstream GBDT::Init: num_class trees per iteration unless the objective says otherwise
+        let num_class = config.num_class.max(1) as usize;
+        let ntpi = objective.as_ref().map_or(num_class, |o| o.num_outputs());
         let class_need_train = (0..ntpi)
             .map(|k| objective.as_ref().is_none_or(|o| o.class_need_train(k)))
             .collect();
@@ -149,7 +151,7 @@ impl Gbdt {
         let learner = SerialTreeLearner::new(train.clone(), &config);
         Ok(Self {
             num_tree_per_iteration: ntpi,
-            num_class: 1,
+            num_class,
             label_index: 0,
             max_feature_idx: train.num_total_features() as i32 - 1,
             feature_names: train.feature_names().to_vec(),
@@ -475,7 +477,7 @@ impl Gbdt {
             .map(|m| {
                 (
                     "training".to_string(),
-                    m.kind.name().to_string(),
+                    m.name().to_string(),
                     m.eval(&st.scores, self.objective.as_ref()),
                     m.kind.higher_better(),
                 )
@@ -491,7 +493,7 @@ impl Gbdt {
             for m in &v.metrics {
                 out.push((
                     v.name.clone(),
-                    m.kind.name().to_string(),
+                    m.name().to_string(),
                     m.eval(&v.scores, self.objective.as_ref()),
                     m.kind.higher_better(),
                 ));

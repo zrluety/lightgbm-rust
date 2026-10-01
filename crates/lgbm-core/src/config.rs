@@ -92,7 +92,7 @@ const HONORED: &[&str] = &[
     "start_iteration_predict", "num_iteration_predict", "predict_raw_score",
     "predict_leaf_index", "predict_disable_shape_check", "is_provide_training_metric",
     "force_col_wise", "force_row_wise", "alpha", "fair_c", "poisson_max_delta_step",
-    "tweedie_variance_power",
+    "tweedie_variance_power", "multi_error_top_k",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -112,7 +112,7 @@ const NO_EFFECT: &[&str] = &[
     "local_listen_port", "time_out", "machine_list_filename", "machines",
     // Objective-specific knobs of objectives that are gated via `objective`.
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
-    "lambdarank_position_bias_regularization", "eval_at", "multi_error_top_k",
+    "lambdarank_position_bias_regularization", "eval_at",
     "auc_mu_weights",
     // DART/GOSS knobs are inert unless boosting/data_sample_strategy selects them.
     "drop_rate", "max_drop", "skip_drop", "xgboost_dart_mode", "uniform_drop",
@@ -128,11 +128,11 @@ const NO_EFFECT: &[&str] = &[
 
 pub const SUPPORTED_OBJECTIVES: &[&str] = &[
     "regression", "regression_l1", "huber", "fair", "poisson", "quantile", "mape", "gamma", "tweedie",
-    "binary",
+    "binary", "multiclass", "multiclassova",
 ];
 pub const SUPPORTED_METRICS: &[&str] = &[
     "l2", "rmse", "l1", "quantile", "huber", "fair", "poisson", "mape", "gamma", "gamma_deviance",
-    "tweedie", "binary_logloss", "binary_error", "auc",
+    "tweedie", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error",
 ];
 
 /// upstream: include/LightGBM/config.h `ParseObjectiveAlias`.
@@ -323,6 +323,7 @@ pub struct Config {
     pub poisson_max_delta_step: f64,
     pub tweedie_variance_power: f64,
     pub num_class: i32,
+    pub multi_error_top_k: i32,
     pub saved_feature_importance_type: i32,
     pub is_provide_training_metric: bool,
     /// Canonical key -> value string as supplied (after alias resolution).
@@ -379,6 +380,7 @@ impl Default for Config {
             poisson_max_delta_step: 0.7,
             tweedie_variance_power: 1.5,
             num_class: 1,
+            multi_error_top_k: 1,
             saved_feature_importance_type: 0,
             is_provide_training_metric: false,
             explicit: BTreeMap::new(),
@@ -586,6 +588,7 @@ impl Config {
         set_f64!(poisson_max_delta_step);
         set_f64!(tweedie_variance_power);
         set_int!(num_class);
+        set_int!(multi_error_top_k);
         set_int!(saved_feature_importance_type);
         set_bool!(is_provide_training_metric);
 
@@ -597,8 +600,26 @@ impl Config {
                 return Err(LgbmError::Unsupported(format!("metric={m}")));
             }
         }
-        if self.num_class != 1 {
-            return Err(LgbmError::Unsupported("num_class != 1 (multiclass)".into()));
+        // upstream: Config::CheckParamConflict (objective / metric / num_class)
+        let is_multiclass = |o: &str| o == "multiclass" || o == "multiclassova";
+        let objective_multiclass =
+            is_multiclass(&self.objective) || (self.objective == "custom" && self.num_class > 1);
+        if objective_multiclass {
+            if self.num_class <= 1 {
+                return Err(LgbmError::InvalidParameter(
+                    "Number of classes should be specified and greater than 1 for multiclass training".into(),
+                ));
+            }
+        } else if self.num_class != 1 {
+            return Err(LgbmError::InvalidParameter("Number of classes must be 1 for non-multiclass training".into()));
+        }
+        for m in &self.metric {
+            let metric_multiclass = is_multiclass(m)
+                || matches!(m.as_str(), "multi_logloss" | "multi_error" | "auc_mu")
+                || (m == "custom" && self.num_class > 1);
+            if objective_multiclass != metric_multiclass {
+                return Err(LgbmError::InvalidParameter("Multiclass objective and metrics don't match".into()));
+            }
         }
         if self.is_unbalance && (self.scale_pos_weight - 1.0).abs() > 1e-6 {
             return Err(LgbmError::InvalidParameter(

@@ -131,8 +131,8 @@ impl Gbdt {
         } else {
             num_class
         };
-        if num_class != 1 || ntpi != 1 {
-            return Err(LgbmError::Unsupported("multiclass / multi-output models".into()));
+        if num_class < 1 || ntpi < 1 {
+            return Err(LgbmError::ModelFormat("num_class and num_tree_per_iteration must be positive".into()));
         }
         let label_index = get_int("label_index")?;
         let max_feature_idx = get_int("max_feature_idx")?;

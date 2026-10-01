@@ -14,6 +14,7 @@
 //! Score layout follows upstream: class-major, `scores[k * num_data + i]`.
 
 pub mod binary;
+pub mod multiclass;
 pub mod percentile;
 pub mod regression;
 
@@ -403,6 +404,8 @@ pub fn create_objective(cfg: &Config) -> Result<Option<Objective>> {
             Ok(Some(Objective::Row(Box::new(regression::Regression::new(cfg)?))))
         }
         "binary" => Ok(Some(Objective::Row(Box::new(binary::BinaryLogloss::new(cfg)?)))),
+        "multiclass" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassSoftmax::new(cfg))))),
+        "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::new(cfg)?)))),
         "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("objective={other}"))),
     }
@@ -428,6 +431,8 @@ pub fn objective_from_model_string(s: &str) -> Result<Option<Objective>> {
             }
             Ok(Some(Objective::Row(Box::new(binary::BinaryLogloss::for_prediction(sigmoid)))))
         }
+        "multiclass" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassSoftmax::for_prediction(&rest)?)))),
+        "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::for_prediction(&rest)?)))),
         "" | "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("loading model with objective={other}"))),
     }

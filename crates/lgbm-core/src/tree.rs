@@ -294,7 +294,9 @@ impl Tree {
         s.push_str(&format!("left_child={}\n", join(&self.left_child[..ni], |x| x.to_string())));
         s.push_str(&format!("right_child={}\n", join(&self.right_child[..ni], |x| x.to_string())));
         s.push_str(&format!("leaf_value={}\n", join(&self.leaf_value[..n], |x| fmt_g17(*x))));
-        s.push_str(&format!("leaf_weight={}\n", join(&self.leaf_weight[..n], |x| fmt_g17(*x))));
+        // ArrayToString prints at most the stored values; a loaded one-leaf tree stores no weights
+        let nw = n.min(self.leaf_weight.len());
+        s.push_str(&format!("leaf_weight={}\n", join(&self.leaf_weight[..nw], |x| fmt_g17(*x))));
         s.push_str(&format!("leaf_count={}\n", join(&self.leaf_count[..n], |x| x.to_string())));
         s.push_str(&format!("internal_value={}\n", join(&self.internal_value[..ni], |x| fmt_g6(*x))));
         s.push_str(&format!("internal_weight={}\n", join(&self.internal_weight[..ni], |x| fmt_g6(*x))));
@@ -385,13 +387,15 @@ impl Tree {
             Some(s) => arr(s, n, "leaf_count")?,
             None => vec![0; n],
         };
-        t.leaf_weight = match kv.get("leaf_weight") {
-            Some(s) => arr_f64(s, n, "leaf_weight")?,
-            None => vec![0.0; n],
-        };
         t.leaf_parent = vec![-1; n];
         t.leaf_depth = vec![0; n];
+        // upstream Tree(const char*) returns before reading the remaining fields of a one-leaf tree
+        t.leaf_weight = Vec::new();
         if n > 1 {
+            t.leaf_weight = match kv.get("leaf_weight") {
+                Some(s) => arr_f64(s, n, "leaf_weight")?,
+                None => vec![0.0; n],
+            };
             t.left_child = arr(need(&kv, "left_child")?, ni, "left_child")?;
             t.right_child = arr(need(&kv, "right_child")?, ni, "right_child")?;
             t.split_feature = arr(need(&kv, "split_feature")?, ni, "split_feature")?;

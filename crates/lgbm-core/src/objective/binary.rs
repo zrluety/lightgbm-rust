@@ -11,14 +11,22 @@ pub struct BinaryLogloss {
     sigmoid: f64,
     is_unbalance: bool,
     scale_pos_weight: f64,
+    /// `Some(c)`: a row is positive when `(int)label == c` (one-vs-all);
+    /// `None`: when `label > 0`.
+    pos_class: Option<i32>,
     label_weights: [f64; 2],
     is_pos: Vec<bool>,
     weight: Option<Vec<f32>>,
     need_train: bool,
+    warnings: Vec<String>,
 }
 
 impl BinaryLogloss {
     pub fn new(cfg: &Config) -> Result<Self> {
+        Self::with_pos_class(cfg, None)
+    }
+
+    pub(crate) fn with_pos_class(cfg: &Config, pos_class: Option<i32>) -> Result<Self> {
         if cfg.sigmoid <= 0.0 {
             return Err(LgbmError::InvalidParameter(format!(
                 "Sigmoid parameter {} should be greater than zero",
@@ -29,10 +37,12 @@ impl BinaryLogloss {
             sigmoid: cfg.sigmoid,
             is_unbalance: cfg.is_unbalance,
             scale_pos_weight: cfg.scale_pos_weight,
+            pos_class,
             label_weights: [1.0, 1.0],
             is_pos: Vec::new(),
             weight: None,
             need_train: true,
+            warnings: Vec::new(),
         })
     }
 
@@ -41,10 +51,12 @@ impl BinaryLogloss {
             sigmoid,
             is_unbalance: false,
             scale_pos_weight: 1.0,
+            pos_class: None,
             label_weights: [1.0, 1.0],
             is_pos: Vec::new(),
             weight: None,
             need_train: true,
+            warnings: Vec::new(),
         }
     }
 }
@@ -55,11 +67,17 @@ impl RowObjective for BinaryLogloss {
     }
 
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
-        self.is_pos = meta.label.iter().map(|&l| l > 0.0).collect();
+        self.is_pos = match self.pos_class {
+            None => meta.label.iter().map(|&l| l > 0.0).collect(),
+            Some(c) => meta.label.iter().map(|&l| l as i32 == c).collect(),
+        };
         self.weight = meta.weight.clone();
         let cnt_positive = self.is_pos.iter().filter(|&&p| p).count();
         let cnt_negative = self.is_pos.len() - cnt_positive;
         self.need_train = !(cnt_negative == 0 || cnt_positive == 0);
+        if !self.need_train {
+            self.warnings.push("Contains only one class".into());
+        }
         self.label_weights = [1.0, 1.0];
         if self.is_unbalance && cnt_positive > 0 && cnt_negative > 0 {
             if cnt_positive > cnt_negative {
@@ -72,6 +90,10 @@ impl RowObjective for BinaryLogloss {
         }
         self.label_weights[1] *= self.scale_pos_weight;
         Ok(())
+    }
+
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {

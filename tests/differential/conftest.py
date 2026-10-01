@@ -176,10 +176,21 @@ REGRESSION_OBJECTIVES = ("regression", "regression_l1", "huber", "fair", "poisso
                          "tweedie")
 
 
-def _target(rng: np.random.Generator, X: np.ndarray, objective: str) -> np.ndarray:
+MULTICLASS_OBJECTIVES = ("multiclass", "multiclassova")
+
+
+def _target(rng: np.random.Generator, X: np.ndarray, objective: str, num_labels: int = 1) -> np.ndarray:
     Z = np.nan_to_num(X)
     f = np.tanh(Z[:, 0]) * 2 + 0.5 * Z[:, 1] - 0.3 * Z[:, 2] * (Z[:, 0] > 0)
     n = len(f)
+    if objective in MULTICLASS_OBJECTIVES:
+        # class c has logit (c - mid) * f + 0.5 * Z[:, c mod p]; sample from the softmax
+        mid = (num_labels - 1) / 2
+        logits = np.stack([(c - mid) * f + 0.5 * Z[:, c % Z.shape[1]] for c in range(num_labels)], axis=1)
+        prob = np.exp(logits - logits.max(axis=1, keepdims=True))
+        prob /= prob.sum(axis=1, keepdims=True)
+        u = rng.random(n)[:, None]
+        return np.minimum((prob.cumsum(axis=1) < u).sum(axis=1), num_labels - 1).astype(np.float64)
     if objective in ("regression", "regression_l1", "huber", "fair", "quantile"):
         return f + rng.normal(scale=0.5, size=n)
     if objective == "mape":
@@ -198,17 +209,21 @@ def _target(rng: np.random.Generator, X: np.ndarray, objective: str) -> np.ndarr
 
 def make_case(name: str, objective: str, params: Dict[str, Any], *, n: int = 3000, p: int = 6,
               kind: str = "normal", weighted: bool = False, init_score: bool = False, seed: int = 0,
-              rounds: int = 30, imbalance: float = 0.0) -> Case:
+              rounds: int = 30, imbalance: float = 0.0, num_labels: Optional[int] = None) -> Case:
+    """`num_labels` (multiclass): distinct labels generated; defaults to `num_class`."""
     rng = np.random.default_rng(seed)
+    k = params.get("num_class", 1)
+    num_labels = k if num_labels is None else num_labels
     X = _features(rng, n, p, kind)
     Xv = _features(rng, n // 3, p, kind)
-    y = _target(rng, X, objective)
-    yv = _target(rng, Xv, objective)
+    y = _target(rng, X, objective, num_labels)
+    yv = _target(rng, Xv, objective, num_labels)
     if imbalance:
         keep = (y == 1) | (rng.random(n) > imbalance)
         X, y = X[keep], y[keep]
     w = rng.uniform(0.2, 3.0, size=len(y)) if weighted else None
-    s = rng.normal(scale=0.3, size=len(y)) if init_score else None
+    shape = (len(y), k) if k > 1 else len(y)
+    s = rng.normal(scale=0.3, size=shape) if init_score else None
     return Case(name, objective, params, X, y, Xv, yv, w, s, rounds)
 
 
@@ -261,6 +276,18 @@ CASES = [
     make_case("gamma_weighted", "gamma", {}, weighted=True),
     make_case("tweedie_basic", "tweedie", {"tweedie_variance_power": 1.2}),
     make_case("tweedie_weighted", "tweedie", {"metric": ["tweedie", "poisson", "l2"]}, weighted=True),
+    make_case("mc_basic", "multiclass", {"num_class": 3, "metric": ["multi_logloss", "multi_error"]}),
+    make_case("mc_weighted", "multiclass", {"num_class": 4}, weighted=True),
+    make_case("mc_top_k", "multiclass",
+              {"num_class": 5, "metric": ["multi_error", "multi_logloss"], "multi_error_top_k": 2}),
+    make_case("mc_absent_class", "multiclass", {"num_class": 4}, num_labels=3),
+    make_case("mc_init_score", "multiclass", {"num_class": 3}, init_score=True),
+    make_case("mc_nan_zero", "multiclass", {"num_class": 3, "num_leaves": 15}, kind="nan_zero"),
+    make_case("mc_60_rounds", "multiclass", {"num_class": 3, "num_leaves": 63}, n=8000, rounds=60),
+    make_case("ova_basic", "multiclassova", {"num_class": 3, "metric": ["multi_logloss", "multi_error"]}),
+    make_case("ova_weighted_sigmoid", "multiclassova", {"num_class": 4, "sigmoid": 0.7}, weighted=True),
+    make_case("ova_unbalance", "multiclassova", {"num_class": 3, "is_unbalance": True}),
+    make_case("ova_absent_class", "multiclassova", {"num_class": 4}, num_labels=3),
 ]
 
 
@@ -347,6 +374,9 @@ def upstream_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
 def rust_tree_arrays(booster: Any) -> List[Dict[str, Any]]:
     trees = booster._tree_arrays()
     for t in trees:
+        if not t["leaf_weight"]:
+            # a reloaded one-leaf tree stores no weight; upstream_tree_arrays defaults the missing JSON key to 0.0
+            t["leaf_weight"] = [0.0] * t["num_leaves"]
         t["threshold"] = [avoid_inf(v) for v in t["threshold"]]
         t["split_gain"] = [avoid_inf(v) for v in t["split_gain"]]
     return trees

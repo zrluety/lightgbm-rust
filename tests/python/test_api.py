@@ -47,7 +47,7 @@ def test_pandas_input_uses_column_names():
 
 def test_unsupported_features_raise_lightgbm_error():
     X, y = _data()
-    for params in ({"objective": "multiclass", "num_class": 3}, {"bagging_fraction": 0.5, "bagging_freq": 1}, {"boosting": "dart"}):
+    for params in ({"objective": "cross_entropy"}, {"bagging_fraction": 0.5, "bagging_freq": 1}, {"boosting": "dart"}):
         with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet"):
             lgb.train({**BASE, **params}, lgb.Dataset(X, label=y), 2)
     with pytest.raises(lgb.LightGBMError, match="categorical"):

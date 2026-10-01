@@ -177,6 +177,75 @@ fn binary_single_class_needs_no_training() {
     assert!(!o.class_need_train(0));
 }
 
+#[test]
+fn multiclass_softmax_matches_finite_differences() {
+    let label = vec![0.0f32, 2.0, 1.0, 2.0];
+    let weight = vec![1.0f32, 0.5, 2.0, 1.5];
+    let k = 3;
+    let n = label.len();
+    // class-major scores
+    let scores = vec![0.1, -1.0, 0.5, 2.0, 0.3, 0.0, -0.2, 1.0, -0.4, 0.8, 0.9, -1.5];
+    let cfg = Config::from_pairs([("objective", "multiclass"), ("num_class", "3")]).unwrap();
+    let factor = 3.0 / 2.0;
+    for w in [None, Some(weight.clone())] {
+        let meta = Metadata { label: label.clone(), weight: w.clone(), init_score: None };
+        let mut o = multiclass::MulticlassSoftmax::new(&cfg);
+        o.init(&meta, n).unwrap();
+        let mut g = vec![0.0f32; n * k];
+        let mut h = vec![0.0f32; n * k];
+        o.gradients(ScoreView { scores: &scores, num_data: n, num_outputs: k }, &mut g, &mut h);
+        for i in 0..n {
+            let wi = w.as_ref().map_or(1.0, |w| w[i] as f64);
+            let loss = |c: usize, x: f64| {
+                let s: Vec<f64> = (0..k).map(|j| if j == c { x } else { scores[j * n + i] }).collect();
+                let lse = s.iter().map(|v| v.exp()).sum::<f64>().ln();
+                wi * (lse - s[label[i] as usize])
+            };
+            for c in 0..k {
+                let (fg, fh) = fd(|x| loss(c, x), scores[c * n + i]);
+                let (ag, ah) = (g[c * n + i] as f64, h[c * n + i] as f64);
+                assert!((ag - fg).abs() <= 1e-5 * (1.0 + fg.abs()), "grad {c},{i}: {ag} vs {fg}");
+                // upstream scales the diagonal Hessian by K / (K - 1)
+                assert!((ah - factor * fh).abs() <= 1e-3 * (1.0 + fh.abs()), "hess {c},{i}: {ah} vs {fh}");
+            }
+        }
+    }
+    // init scores are log class priors; a class absent from the labels is not trained
+    let meta = Metadata { label: vec![0.0, 0.0, 2.0, 0.0], weight: None, init_score: None };
+    let mut o = multiclass::MulticlassSoftmax::new(&cfg);
+    o.init(&meta, 4).unwrap();
+    assert_eq!(o.boost_from_score(0), 0.75f64.ln());
+    assert!(!o.class_need_train(1) && o.class_need_train(0));
+    let bad = Metadata { label: vec![0.0, 3.0], weight: None, init_score: None };
+    let err = multiclass::MulticlassSoftmax::new(&cfg).init(&bad, 2).unwrap_err();
+    assert!(err.to_string().contains("Label must be in [0, 3), but found 3 in label"));
+}
+
+#[test]
+fn multiclass_ova_is_per_class_binary() {
+    let label = vec![0.0f32, 2.0, 1.0, 2.0];
+    let n = label.len();
+    let scores = vec![0.1, -1.0, 0.5, 2.0, 0.3, 0.0, -0.2, 1.0, -0.4, 0.8, 0.9, -1.5];
+    let cfg = Config::from_pairs([("objective", "multiclassova"), ("num_class", "3")]).unwrap();
+    let meta = Metadata { label: label.clone(), weight: None, init_score: None };
+    let mut o = multiclass::MulticlassOva::new(&cfg).unwrap();
+    o.init(&meta, n).unwrap();
+    let mut g = vec![0.0f32; 3 * n];
+    let mut h = vec![0.0f32; 3 * n];
+    o.gradients(ScoreView { scores: &scores, num_data: n, num_outputs: 3 }, &mut g, &mut h);
+    for c in 0..3 {
+        let y: Vec<f32> = label.iter().map(|&l| (l as usize == c) as i32 as f32).collect();
+        let mut b = binary::BinaryLogloss::new(&Config::from_pairs([("objective", "binary")]).unwrap()).unwrap();
+        b.init(&Metadata { label: y, weight: None, init_score: None }, n).unwrap();
+        let (mut bg, mut bh) = (vec![0.0f32; n], vec![0.0f32; n]);
+        b.gradients(ScoreView { scores: &scores[c * n..(c + 1) * n], num_data: n, num_outputs: 1 }, &mut bg, &mut bh);
+        assert_eq!(&g[c * n..(c + 1) * n], &bg[..]);
+        assert_eq!(&h[c * n..(c + 1) * n], &bh[..]);
+        assert_eq!(o.boost_from_score(c), b.boost_from_score(0));
+    }
+    assert_eq!(o.to_model_string(), "multiclassova num_class:3 sigmoid:1");
+}
+
 /// Test-only grouped objective: per group, squared error of each row plus a
 /// penalty `c/2 * (sum_t s_t - sum_t y_t)^2` coupling all rows in the group.
 /// Hessian is dense per group: `I + c * 11^T`.
