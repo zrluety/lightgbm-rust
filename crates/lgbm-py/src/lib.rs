@@ -19,7 +19,10 @@ use std::sync::Arc;
 
 use lgbm_core::arrow::{ArrowArrayStream, ArrowChunkedArray};
 use lgbm_core::boosting::PredictKind;
-use lgbm_core::{Config, Dataset, DatasetFields, DenseMatrix, DenseValues, Gbdt, LgbmError};
+use lgbm_core::{
+    Config, Dataset, DatasetFields, DenseMatrix, DenseValues, Gbdt, LgbmError, Matrix as Matrix2, SparseIndptr,
+    SparseMatrix,
+};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyUntypedArrayMethods,
@@ -62,10 +65,29 @@ fn detached<R: Send>(py: Python<'_>, f: impl FnOnce() -> lgbm_core::Result<R> + 
     py.detach(|| guarded(f))
 }
 
-/// A borrowed 2-D float array.
+enum SparseIndptrArray<'py> {
+    I32(PyReadonlyArray1<'py, i32>),
+    I64(PyReadonlyArray1<'py, i64>),
+}
+
+enum ValuesArray<'py> {
+    F32(PyReadonlyArray1<'py, f32>),
+    F64(PyReadonlyArray1<'py, f64>),
+}
+
+/// A borrowed 2-D float array, or a CSR/CSC matrix passed as
+/// `(is_csr, indptr, indices, data, nrows, ncols)`.
 enum Matrix<'py> {
     F32(PyReadonlyArray2<'py, f32>),
     F64(PyReadonlyArray2<'py, f64>),
+    Sparse {
+        is_csr: bool,
+        indptr: SparseIndptrArray<'py>,
+        indices: PyReadonlyArray1<'py, i32>,
+        values: ValuesArray<'py>,
+        nrows: usize,
+        ncols: usize,
+    },
 }
 
 impl<'py> Matrix<'py> {
@@ -76,10 +98,41 @@ impl<'py> Matrix<'py> {
         if let Ok(a) = obj.extract::<PyReadonlyArray2<'py, f32>>() {
             return Ok(Self::F32(a));
         }
+        type SparseParts<'py> = (bool, Bound<'py, PyAny>, PyReadonlyArray1<'py, i32>, Bound<'py, PyAny>, usize, usize);
+        if let Ok((is_csr, indptr, indices, values, nrows, ncols)) = obj.extract::<SparseParts<'py>>() {
+            let indptr = if let Ok(a) = indptr.extract::<PyReadonlyArray1<'py, i32>>() {
+                SparseIndptrArray::I32(a)
+            } else {
+                SparseIndptrArray::I64(indptr.extract().map_err(|_| PyTypeError::new_err("indptr must be int32 or int64"))?)
+            };
+            let values = if let Ok(a) = values.extract::<PyReadonlyArray1<'py, f64>>() {
+                ValuesArray::F64(a)
+            } else {
+                ValuesArray::F32(values.extract().map_err(|_| PyTypeError::new_err("data must be float32 or float64"))?)
+            };
+            return Ok(Self::Sparse { is_csr, indptr, indices, values, nrows, ncols });
+        }
         Err(PyTypeError::new_err("expected a 2-D numpy array of dtype float32 or float64"))
     }
 
-    fn view(&self) -> PyResult<DenseMatrix<'_>> {
+    fn view(&self) -> PyResult<Matrix2<'_>> {
+        let Self::Sparse { is_csr, indptr, indices, values, nrows, ncols } = self else {
+            return self.dense_view().map(Matrix2::Dense);
+        };
+        let indptr = match indptr {
+            SparseIndptrArray::I32(a) => SparseIndptr::I32(slice_of(a, "indptr")?),
+            SparseIndptrArray::I64(a) => SparseIndptr::I64(slice_of(a, "indptr")?),
+        };
+        let values = match values {
+            ValuesArray::F32(a) => DenseValues::F32(slice_of(a, "data")?),
+            ValuesArray::F64(a) => DenseValues::F64(slice_of(a, "data")?),
+        };
+        SparseMatrix::new(indptr, slice_of(indices, "indices")?, values, *nrows, *ncols, *is_csr)
+            .map(Matrix2::Sparse)
+            .map_err(core_err)
+    }
+
+    fn dense_view(&self) -> PyResult<DenseMatrix<'_>> {
         fn layout<T: numpy::Element>(a: &PyReadonlyArray2<'_, T>) -> PyResult<(usize, usize, bool)> {
             let s = a.shape();
             let row_major = if a.is_c_contiguous() {
@@ -101,6 +154,7 @@ impl<'py> Matrix<'py> {
                 let (n, m, rm) = layout(a)?;
                 DenseMatrix::new(DenseValues::F64(a.as_slice().map_err(not_contig)?), n, m, rm)
             }
+            Self::Sparse { .. } => unreachable!("sparse input has no dense view"),
         };
         r.map_err(core_err)
     }
@@ -151,8 +205,8 @@ impl RsDataset {
             categorical_features: Vec::new(),
         };
         let ds = detached(py, || match &reference {
-            Some(r) => Dataset::from_dense_with_reference(&view, fields, r, cfg.num_threads),
-            None => Dataset::from_dense(&view, fields, &cfg),
+            Some(r) => Dataset::from_matrix_with_reference(&view, fields, r, cfg.num_threads),
+            None => Dataset::from_matrix(&view, fields, &cfg),
         })?;
         let mut warnings = cfg.warnings;
         warnings.extend(ds.warnings().iter().cloned());
@@ -414,7 +468,7 @@ impl RsBooster {
         let view = mat.view()?;
         let nrows = view.nrows();
         let g = &self.inner;
-        let out = detached(py, || g.predict(&view, kind, start_iteration, num_iteration))?;
+        let out = detached(py, || g.predict_matrix(&view, kind, start_iteration, num_iteration))?;
         let width = if nrows == 0 { 0 } else { out.len() / nrows };
         out.into_pyarray(py).reshape([nrows, width])
     }

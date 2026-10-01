@@ -314,8 +314,62 @@ def _pandas_to_numpy(data: Any, feature_name: Any, categorical_feature: Any) -> 
     return arr, names
 
 
-def _to_float_matrix(data: Any, feature_name: Any = "auto", categorical_feature: Any = "auto") -> Tuple[np.ndarray, Optional[List[str]]]:
-    """Convert supported inputs to a 2-D float32/float64 array.
+_SparseParts = Tuple[bool, np.ndarray, np.ndarray, np.ndarray, int, int]
+
+
+def _sparse_parts(data: Any) -> _SparseParts:
+    """``(is_csr, indptr, indices, data, nrows, ncols)`` of a CSR/CSC matrix.
+
+    upstream: ``Dataset.__init_from_csr``/``__init_from_csc`` and
+    ``_InnerPredictor.__pred_for_csr``/``__pred_for_csc`` (``_c_int_array``,
+    ``_c_float_array``, ``indices.astype(np.int32, copy=False)``).
+    """
+    import scipy.sparse
+
+    if len(data.indices) != len(data.data):
+        raise ValueError(f"Length mismatch: {len(data.indices)} vs {len(data.data)}")
+    indptr = np.ascontiguousarray(data.indptr)
+    if indptr.dtype not in (np.int32, np.int64):
+        raise TypeError(f"Expected np.int32 or np.int64, met type({indptr.dtype})")
+    values = np.ascontiguousarray(data.data)
+    if values.dtype not in (np.float32, np.float64):
+        raise TypeError(f"Expected np.float32 or np.float64, met type({values.dtype})")
+    indices = np.ascontiguousarray(data.indices.astype(np.int32, copy=False))
+    nrow, ncol = data.shape
+    return isinstance(data, scipy.sparse.csr_matrix), indptr, indices, values, int(nrow), int(ncol)
+
+
+def _sparse_input(data: Any, predict: bool) -> _SparseParts:
+    """upstream: ``_lazy_init`` / ``_InnerPredictor.predict`` dispatch for scipy.sparse input.
+
+    ``csr_matrix`` and ``csc_matrix`` are used as is; other sparse types reach
+    upstream's fallback branch, which converts them to ``csr_matrix``.
+    """
+    import scipy.sparse
+
+    if isinstance(data, (scipy.sparse.csr_matrix, scipy.sparse.csc_matrix)):
+        return _sparse_parts(data)
+    if predict:
+        _log_warning("Converting data to scipy sparse matrix.")
+        try:
+            csr = scipy.sparse.csr_matrix(data)
+        except BaseException as err:
+            raise TypeError(f"Cannot predict data for type {type(data).__name__}") from err
+        return _sparse_parts(csr)
+    try:
+        return _sparse_parts(scipy.sparse.csr_matrix(data))
+    except BaseException as err:
+        raise TypeError(f"Cannot initialize Dataset from {type(data).__name__}") from err
+
+
+def _matrix_nrows(mat: Union[np.ndarray, _SparseParts]) -> int:
+    return mat[4] if isinstance(mat, tuple) else mat.shape[0]
+
+
+def _to_float_matrix(
+    data: Any, feature_name: Any = "auto", categorical_feature: Any = "auto", predict: bool = False
+) -> Tuple[Union[np.ndarray, _SparseParts], Optional[List[str]]]:
+    """Convert supported inputs to a 2-D float32/float64 array, or the parts of a CSR/CSC matrix.
 
     float32/float64 arrays that are C- or F-contiguous are passed through
     unchanged (borrowed by the engine without copying). Other numeric dtypes
@@ -325,7 +379,7 @@ def _to_float_matrix(data: Any, feature_name: Any = "auto", categorical_feature:
     if isinstance(data, (str, Path)):
         raise _unsupported("training from files")
     if _is_scipy_sparse(data):
-        raise _unsupported("scipy.sparse input")
+        return _sparse_input(data, predict), None
     if isinstance(data, Sequence) or (isinstance(data, list) and data and isinstance(data[0], Sequence)):
         raise _unsupported("lightgbm.Sequence input")
     if _is_arrow_like_frame(data):
@@ -617,7 +671,7 @@ class Dataset:
         if self.feature_name != "auto" and self.feature_name is not None:
             names = list(self.feature_name)
         self._has_non_default_feature_names = names is not None
-        n = mat.shape[0]
+        n = _matrix_nrows(mat)
         label = np.zeros(n, dtype=np.float32) if self.label is None else _label_to_numpy(self.label)
         weight = None
         if self.weight is not None and not _weight_is_all_ones(self.weight):
@@ -1396,11 +1450,11 @@ class Booster:
             for i, (e, got) in enumerate(zip(expected, names)):
                 if e != got:
                     raise LightGBMError(f"Expected '{e}' at position {i} but found '{got}'")
-        mat, _ = _to_float_matrix(data)
+        mat, _ = _to_float_matrix(data, predict=True)
         kind = "leaf" if pred_leaf else ("raw" if raw_score else "normal")
         assert self._rs is not None
         preds = self._rs.predict(mat, kind, int(start_iteration), int(num_iteration))
-        nrow = mat.shape[0]
+        nrow = _matrix_nrows(mat)
         flat = preds.ravel()
         if pred_leaf:
             flat = flat.astype(np.int32)

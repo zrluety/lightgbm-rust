@@ -61,7 +61,8 @@ def cpp_section() -> list[str]:
             reason = {
                 "c-api-internals": "tests a C++/C-API internal with no counterpart in lightgbm-rust",
                 "input-arrow": "tests the deprecated chunk-array C API (`LGBM_*FromArrow`), which has no counterpart",
-                "input-sparse": "sparse input not implemented (milestone 4)",
+                "input-sparse": "tests the streaming push C API (`LGBM_DatasetPushRowsByCSR*`), which has no "
+                                "counterpart; CSR/CSC input is covered by the differential `test_sparse_inputs`",
             }.get(r["area"], f"area `{r['area']}` not implemented yet")
             out.append(f"| `{key}` | not ported | {reason} |")
     return out + [""]

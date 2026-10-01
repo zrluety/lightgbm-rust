@@ -14,9 +14,9 @@ use rayon::prelude::*;
 
 use crate::binning::{BinMapper, BinParams, BinType};
 use crate::config::Config;
-use crate::consts::K_ZERO_THRESHOLD;
 use crate::error::{LgbmError, Result};
 use crate::feature_groups::{SampleColumn, upstream_inner_order};
+use crate::matrix::Matrix;
 use crate::random::Random;
 
 /// Run `f` on a dedicated rayon pool of `num_threads` threads, or on the
@@ -110,13 +110,32 @@ impl BinColumn {
         }
     }
 
-    fn build(num_bin: i32, n: usize, f: impl Fn(usize) -> u32 + Sync) -> Self {
+    pub(crate) fn build(num_bin: i32, n: usize, f: impl Fn(usize) -> u32 + Sync) -> Self {
         if num_bin <= 256 {
             BinColumn::U8((0..n).map(|i| f(i) as u8).collect())
         } else if num_bin <= 65536 {
             BinColumn::U16((0..n).map(|i| f(i) as u16).collect())
         } else {
             BinColumn::U32((0..n).map(&f).collect())
+        }
+    }
+
+    pub(crate) fn filled(num_bin: i32, n: usize, bin: u32) -> Self {
+        if num_bin <= 256 {
+            BinColumn::U8(vec![bin as u8; n])
+        } else if num_bin <= 65536 {
+            BinColumn::U16(vec![bin as u16; n])
+        } else {
+            BinColumn::U32(vec![bin; n])
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, i: usize, bin: u32) {
+        match self {
+            BinColumn::U8(v) => v[i] = bin as u8,
+            BinColumn::U16(v) => v[i] = bin as u16,
+            BinColumn::U32(v) => v[i] = bin,
         }
     }
 }
@@ -326,10 +345,15 @@ impl Dataset {
     /// Construct a training dataset, building bin mappers from the data.
     /// Uses `cfg.num_threads` threads (all cores when <= 0).
     pub fn from_dense(mat: &DenseMatrix<'_>, fields: DatasetFields<'_>, cfg: &Config) -> Result<Self> {
-        with_num_threads(cfg.num_threads, || Self::from_dense_impl(mat, fields, cfg))?
+        Self::from_matrix(&Matrix::Dense(*mat), fields, cfg)
     }
 
-    fn from_dense_impl(mat: &DenseMatrix<'_>, fields: DatasetFields<'_>, cfg: &Config) -> Result<Self> {
+    /// Like [`Dataset::from_dense`], for dense or sparse (CSR/CSC) input.
+    pub fn from_matrix(mat: &Matrix<'_>, fields: DatasetFields<'_>, cfg: &Config) -> Result<Self> {
+        with_num_threads(cfg.num_threads, || Self::from_matrix_impl(mat, fields, cfg))?
+    }
+
+    fn from_matrix_impl(mat: &Matrix<'_>, fields: DatasetFields<'_>, cfg: &Config) -> Result<Self> {
         let n = mat.nrows();
         let ncol = mat.ncols();
         Self::validate_fields(n, ncol, &fields)?;
@@ -357,20 +381,7 @@ impl Dataset {
             use_missing: cfg.use_missing,
             zero_as_missing: cfg.zero_as_missing,
         };
-        let columns: Vec<SampleColumn> = (0..ncol)
-            .into_par_iter()
-            .map(|c| {
-                let mut col = SampleColumn { indices: Vec::new(), values: Vec::new() };
-                for (i, &r) in sample_indices.iter().enumerate() {
-                    let v = mat.get(r as usize, c);
-                    if v.abs() > K_ZERO_THRESHOLD || v.is_nan() {
-                        col.indices.push(i as i32);
-                        col.values.push(v);
-                    }
-                }
-                col
-            })
-            .collect();
+        let columns: Vec<SampleColumn> = mat.sample_columns(&sample_indices);
         let bin_mappers: Vec<BinMapper> = columns
             .par_iter()
             .map(|col| BinMapper::find_bin(&col.values, total_sample_size, BinType::Numerical, &params))
@@ -421,11 +432,21 @@ impl Dataset {
         reference: &Dataset,
         num_threads: i32,
     ) -> Result<Self> {
-        with_num_threads(num_threads, || Self::from_dense_with_reference_impl(mat, fields, reference))?
+        Self::from_matrix_with_reference(&Matrix::Dense(*mat), fields, reference, num_threads)
     }
 
-    fn from_dense_with_reference_impl(
-        mat: &DenseMatrix<'_>,
+    /// Like [`Dataset::from_dense_with_reference`], for dense or sparse input.
+    pub fn from_matrix_with_reference(
+        mat: &Matrix<'_>,
+        fields: DatasetFields<'_>,
+        reference: &Dataset,
+        num_threads: i32,
+    ) -> Result<Self> {
+        with_num_threads(num_threads, || Self::from_matrix_with_reference_impl(mat, fields, reference))?
+    }
+
+    fn from_matrix_with_reference_impl(
+        mat: &Matrix<'_>,
         fields: DatasetFields<'_>,
         reference: &Dataset,
     ) -> Result<Self> {
@@ -535,7 +556,7 @@ impl Dataset {
     }
 
     fn assemble(
-        mat: &DenseMatrix<'_>,
+        mat: &Matrix<'_>,
         fields: DatasetFields<'_>,
         bin_mappers: Vec<BinMapper>,
         feature_names: Vec<String>,
@@ -547,13 +568,7 @@ impl Dataset {
         for (inner, &real) in used_features.iter().enumerate() {
             real_to_inner[real] = Some(inner);
         }
-        let bins: Vec<BinColumn> = used_features
-            .par_iter()
-            .map(|&c| {
-                let m = &bin_mappers[c];
-                BinColumn::build(m.num_bin, n, |r| m.value_to_bin(mat.get(r, c)))
-            })
-            .collect();
+        let bins = mat.build_bins(&used_features, &bin_mappers);
         let mut metadata = Metadata::default();
         metadata.set_label(n, fields.label)?;
         metadata.set_weight(n, fields.weight)?;

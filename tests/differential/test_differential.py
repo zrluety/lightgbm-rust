@@ -7,7 +7,7 @@ tests/tolerances.toml (see its rationale entries).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
 import lightgbm as lgb_up
@@ -579,6 +579,90 @@ def test_arrow_inputs(case, frame, recorder):
     rec.compare("pred_leaf[holdout table]", "tree_structure", rs.predict(valid, pred_leaf=True),
                 up.predict(valid, pred_leaf=True))
     rec.finish()
+
+
+# --------------------------------------------------------------------------- scipy.sparse
+
+
+def _most_freq_not_zero(case):
+    """Column 1 is mostly 1.0, so its most frequent bin differs from the zero bin
+    (upstream's CSC loader then pushes every row, and CSR pushes zeros)."""
+    def mostly_one(X, seed):
+        X = X.copy()
+        X[np.random.default_rng(seed).random(len(X)) < 0.85, 1] = 1.0
+        return X
+    return replace(case, name=f"{case.name}_most_freq_one", X=mostly_one(case.X, 1), Xv=mostly_one(case.Xv, 2))
+
+
+SPARSE_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "reg_sparse", "bin_weighted", "mc_basic",
+                                               "bag_basic", "bin_init_score")]
+SPARSE_CASES.append(_most_freq_not_zero(next(c for c in CASES if c.name == "reg_sparse")))
+SPARSE_FORMATS = ["csr", "csc", "csr_f32_int64_indptr", "csr_explicit_zeros", "coo"]
+
+
+def _to_sparse(X, fmt):
+    sp = pytest.importorskip("scipy.sparse")
+    if fmt == "csr":
+        return sp.csr_matrix(X)
+    if fmt == "csc":
+        return sp.csc_matrix(X)
+    if fmt == "csr_f32_int64_indptr":
+        m = sp.csr_matrix(X.astype(np.float32))
+        m.indptr = m.indptr.astype(np.int64)
+        return m
+    if fmt == "csr_explicit_zeros":
+        rows, cols = np.indices(X.shape)
+        m = sp.csr_matrix((X.ravel(), (rows.ravel(), cols.ravel())), shape=X.shape)
+        assert m.nnz == X.size
+        return m
+    return sp.coo_matrix(X)
+
+
+@pytest.mark.parametrize("fmt", SPARSE_FORMATS)
+@pytest.mark.parametrize("case", SPARSE_CASES, ids=[c.name for c in SPARSE_CASES])
+def test_sparse_inputs(case, fmt, recorder):
+    """scipy.sparse training, validation and prediction input, against upstream on the same input."""
+    rec = recorder(f"{case.name}[{fmt}]")
+    X, Xv = _to_sparse(case.X, fmt), _to_sparse(case.Xv, fmt)
+    hist = {}
+
+    def run(mod):
+        h = {}
+        hist[mod.__name__] = h
+        ds = mod.Dataset(X, label=case.y, weight=case.weight, init_score=case.init_score, free_raw_data=False)
+        valid = ds.create_valid(Xv, label=case.yv)
+        return mod.train(case.full_params, ds, num_boost_round=case.num_boost_round, valid_sets=[valid],
+                         callbacks=[mod.record_evaluation(h)])
+
+    rs, up = run(lgb_rs), run(lgb_up)
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    for m, v in hist["lightgbm"]["valid_0"].items():
+        rec.compare(f"valid_0.{m}[per iteration]", "metrics", hist["lightgbm_rust"]["valid_0"].get(m), v)
+    rec.compare("raw_score[holdout sparse]", "predictions", rs.predict(Xv, raw_score=True),
+                up.predict(Xv, raw_score=True))
+    rec.compare("predict[holdout sparse]", "predictions", rs.predict(Xv), up.predict(Xv))
+    rec.compare("pred_leaf[holdout sparse]", "tree_structure", rs.predict(Xv, pred_leaf=True),
+                up.predict(Xv, pred_leaf=True))
+    dense = lgb_rs.train(case.full_params, lgb_rs.Dataset(X.toarray(), label=case.y, weight=case.weight,
+                                                          init_score=case.init_score),
+                         num_boost_round=case.num_boost_round)
+    rec.compare("model_text[same data, dense]", "model_text", dense.model_to_string(), up.model_to_string())
+    rec.finish()
+
+
+def test_sparse_input_errors():
+    """upstream argument checks in Dataset.__init_from_csr and the predictor."""
+    sp = pytest.importorskip("scipy.sparse")
+    X = sp.csr_matrix(np.eye(20, 3, dtype=np.int64))
+    for mod in (lgb_rs, lgb_up):
+        with pytest.raises(TypeError, match=r"Expected np.float32 or np.float64, met type\(int64\)"):
+            mod.Dataset(X, label=np.zeros(20)).construct()
+        with pytest.raises(TypeError, match="Cannot initialize Dataset from coo_matrix"):
+            mod.Dataset(sp.coo_matrix(X), label=np.zeros(20)).construct()
+        bad = sp.csr_matrix(np.eye(20, 3))
+        bad.indices = bad.indices[:-1]
+        with pytest.raises(ValueError, match="Length mismatch: 2 vs 3"):
+            mod.Dataset(bad, label=np.zeros(20)).construct()
 
 
 # --------------------------------------------------------------------------- ranking

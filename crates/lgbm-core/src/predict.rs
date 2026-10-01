@@ -8,6 +8,7 @@ use crate::binning::MissingType;
 use crate::boosting::{Gbdt, PredictKind};
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::DenseMatrix;
+use crate::matrix::Matrix;
 use crate::error::{LgbmError, Result};
 use crate::tree::Tree;
 
@@ -119,6 +120,17 @@ impl Gbdt {
         start_iteration: i32,
         num_iteration: i32,
     ) -> Result<Vec<f64>> {
+        self.predict_matrix(&Matrix::Dense(*mat), kind, start_iteration, num_iteration)
+    }
+
+    /// Like [`Gbdt::predict`], for dense or sparse (CSR/CSC) input.
+    pub fn predict_matrix(
+        &self,
+        mat: &Matrix<'_>,
+        kind: PredictKind,
+        start_iteration: i32,
+        num_iteration: i32,
+    ) -> Result<Vec<f64>> {
         if mat.ncols() != self.num_feature() {
             return Err(LgbmError::InvalidData(format!(
                 "The number of features in data ({}) is not the same as it was in training data ({}).",
@@ -135,6 +147,7 @@ impl Gbdt {
         let flat: Vec<FlatTree> = models.iter().map(|t| FlatTree::new(t, ncol)).collect();
         let mut out = vec![0.0; mat.nrows() * width];
         let objective = self.objective.as_ref();
+        let reader = mat.rows();
         self.install(|| {
             out.par_chunks_mut((width * BLOCK).max(1)).enumerate().for_each_init(
                 || (vec![0.0f64; stride * BLOCK], vec![0.0f64; ntpi * BLOCK], [0usize; BLOCK]),
@@ -143,7 +156,7 @@ impl Gbdt {
                     let nb = if width == 0 { (mat.nrows() - r0).min(BLOCK) } else { o.len() / width };
                     for r in 0..nb {
                         let row = &mut rows[r * stride..(r + 1) * stride];
-                        mat.row_into(r0 + r, &mut row[..ncol]);
+                        reader.row_into(r0 + r, &mut row[..ncol]);
                         for v in row[..ncol].iter_mut() {
                             // upstream predictor drops |v| <= kZeroThreshold (sparse row pairs)
                             if !v.is_nan() && v.abs() <= K_ZERO_THRESHOLD {

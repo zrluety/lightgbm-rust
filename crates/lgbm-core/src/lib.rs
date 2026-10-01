@@ -24,6 +24,7 @@ pub mod fmt;
 pub mod histogram;
 pub mod io;
 pub mod learner;
+pub mod matrix;
 pub mod metric;
 pub mod multi_val_bin;
 pub mod objective;
@@ -36,6 +37,7 @@ pub mod tree;
 pub use boosting::{EvalResult, Gbdt, PredictKind};
 pub use config::Config;
 pub use dataset::{Dataset, DatasetFields, DenseMatrix, DenseValues};
+pub use matrix::{Matrix, SparseIndptr, SparseMatrix};
 pub use error::{LgbmError, Result};
 
 /// Upstream version this crate tracks.
