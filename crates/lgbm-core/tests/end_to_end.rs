@@ -185,7 +185,7 @@ fn block_prediction_matches_per_row_traversal() {
 
 #[test]
 fn unsupported_parameters_are_rejected() {
-    for (k, v) in [("bagging_fraction", "0.5"), ("objective", "multiclass"), ("boosting", "dart"), ("linear_tree", "true")] {
+    for (k, v) in [("cegb_tradeoff", "0.5"), ("objective", "multiclass"), ("boosting", "dart"), ("linear_tree", "true")] {
         let e = Config::from_pairs([(k, v)]);
         assert!(e.is_err(), "{k}={v} should be rejected");
     }

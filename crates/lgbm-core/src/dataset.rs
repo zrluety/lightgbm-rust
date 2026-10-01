@@ -16,6 +16,7 @@ use crate::binning::{BinMapper, BinParams, BinType};
 use crate::config::Config;
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::error::{LgbmError, Result};
+use crate::feature_groups::{SampleColumn, upstream_inner_order};
 use crate::random::Random;
 
 /// Run `f` on a dedicated rayon pool of `num_threads` threads, or on the
@@ -207,6 +208,8 @@ pub struct Dataset {
     bin_mappers: Vec<BinMapper>,
     /// inner feature index -> real (column) index; only non-trivial features
     used_features: Vec<usize>,
+    /// Upstream's inner index of each inner feature (see `feature_groups`).
+    upstream_inner: Vec<usize>,
     real_to_inner: Vec<Option<usize>>,
     bins: Vec<BinColumn>,
     pub metadata: Metadata,
@@ -259,16 +262,23 @@ impl Dataset {
             use_missing: cfg.use_missing,
             zero_as_missing: cfg.zero_as_missing,
         };
-        let bin_mappers: Vec<BinMapper> = (0..ncol)
+        let columns: Vec<SampleColumn> = (0..ncol)
             .into_par_iter()
             .map(|c| {
-                let sample_values: Vec<f64> = sample_indices
-                    .iter()
-                    .map(|&r| mat.get(r as usize, c))
-                    .filter(|v| v.abs() > K_ZERO_THRESHOLD || v.is_nan())
-                    .collect();
-                BinMapper::find_bin(&sample_values, total_sample_size, BinType::Numerical, &params)
+                let mut col = SampleColumn { indices: Vec::new(), values: Vec::new() };
+                for (i, &r) in sample_indices.iter().enumerate() {
+                    let v = mat.get(r as usize, c);
+                    if v.abs() > K_ZERO_THRESHOLD || v.is_nan() {
+                        col.indices.push(i as i32);
+                        col.values.push(v);
+                    }
+                }
+                col
             })
+            .collect();
+        let bin_mappers: Vec<BinMapper> = columns
+            .par_iter()
+            .map(|col| BinMapper::find_bin(&col.values, total_sample_size, BinType::Numerical, &params))
             .collect::<Result<_>>()?;
 
         let (feature_names, replaced) = match fields.feature_names.clone() {
@@ -276,6 +286,16 @@ impl Dataset {
             None => ((0..ncol).map(|i| format!("Column_{i}")).collect(), false),
         };
         let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
+        let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
+        ds.upstream_inner = upstream_inner_order(
+            &ds.bin_mappers,
+            &ds.used_features,
+            &columns,
+            total_sample_size,
+            n,
+            explicit_bool("enable_bundle").unwrap_or(true),
+            explicit_bool("is_enable_sparse").unwrap_or(true),
+        );
         if replaced {
             ds.warnings.push(FEATURE_NAME_SPACE_WARNING.into());
         }
@@ -322,7 +342,9 @@ impl Dataset {
                 reference.num_total_features()
             )));
         }
-        Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())
+        let mut ds = Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())?;
+        ds.upstream_inner = reference.upstream_inner.clone();
+        Ok(ds)
     }
 
     fn validate_fields(n: usize, ncol: usize, f: &DatasetFields<'_>) -> Result<()> {
@@ -391,6 +413,7 @@ impl Dataset {
         Ok(Self {
             num_data: n,
             bin_mappers,
+            upstream_inner: (0..used_features.len()).collect(),
             used_features,
             real_to_inner,
             bins,
@@ -419,6 +442,12 @@ impl Dataset {
 
     pub fn inner_feature_index(&self, real: usize) -> Option<usize> {
         self.real_to_inner[real]
+    }
+
+    /// The index upstream gives inner feature `inner` (its features are
+    /// numbered in shuffled feature-group order).
+    pub fn upstream_inner_index(&self, inner: usize) -> usize {
+        self.upstream_inner[inner]
     }
 
     pub fn feature_bin_mapper(&self, inner: usize) -> &BinMapper {

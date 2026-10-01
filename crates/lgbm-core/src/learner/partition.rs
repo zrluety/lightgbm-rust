@@ -24,6 +24,8 @@ pub struct DataPartition {
     num_leaves: usize,
     left_buf: Vec<u32>,
     right_buf: Vec<u32>,
+    /// In-bag rows (ascending) when bagging; `None` uses every row.
+    used: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -42,16 +44,37 @@ impl DataPartition {
             num_leaves: 1,
             left_buf: Vec::new(),
             right_buf: Vec::new(),
+            used: None,
+        }
+    }
+
+    /// upstream: `DataPartition::SetUsedDataIndices`; takes effect at the next [`init`](Self::init).
+    pub fn set_used_data_indices(&mut self, used: Option<&[u32]>) {
+        match used {
+            Some(u) => {
+                let v = self.used.get_or_insert_with(Vec::new);
+                v.clear();
+                v.extend_from_slice(u);
+            }
+            None => self.used = None,
         }
     }
 
     pub fn init(&mut self) {
-        for (i, v) in self.indices.iter_mut().enumerate() {
-            *v = i as u32;
-        }
         self.leaf_begin.iter_mut().for_each(|x| *x = 0);
         self.leaf_count.iter_mut().for_each(|x| *x = 0);
-        self.leaf_count[0] = self.num_data;
+        match &self.used {
+            None => {
+                for (i, v) in self.indices.iter_mut().enumerate() {
+                    *v = i as u32;
+                }
+                self.leaf_count[0] = self.num_data;
+            }
+            Some(u) => {
+                self.indices[..u.len()].copy_from_slice(u);
+                self.leaf_count[0] = u.len();
+            }
+        }
         self.num_leaves = 1;
     }
 

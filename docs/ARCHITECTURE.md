@@ -27,11 +27,13 @@ This crate holds all modeling logic. It has no Python dependency and is usable d
 | `config` | parameter table generated from `config.h` (`docs/compat/params.json`): alias resolution, typed parsing, checks, model `parameters:` block | `config.h`, `config.cpp`, `config_auto.cpp` |
 | `binning` | `BinMapper::find_bin` (numerical): greedy bin finding, zero/NaN bins, missing types, trivial-feature filter | `bin.cpp` |
 | `dataset` | `DenseMatrix` (borrowed input), sampling, per-column bin mappers, binned columns (u8/u16/u32), `Metadata` (label/weight/init_score) | `dataset_loader.cpp`, `dataset.cpp`, `metadata.cpp` |
+| `feature_groups` | upstream's feature-bundling group search, used only to reproduce upstream's inner feature order (it seeds the `extra_trees` RNGs) | `dataset.cpp` `FastFeatureBundling`, `FindGroups` |
+| `sample_strategy` | row sampling per iteration: bagging (incl. balanced) and GOSS; in-bag/out-of-bag indices | `bagging.hpp`, `goss.hpp` |
 | `objective` | `RowObjective`, `GroupedObjective`, `GradHessBlock`, `HessianMode`, `DiagonalReduction`; the regression family (`regression`, `regression_l1`, `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`, incl. `reg_sqrt`), upstream's percentile functions, `binary`, `multiclass`, `multiclassova` | `objective_function.h`, `regression_objective.hpp`, `binary_objective.hpp`, `multiclass_objective.hpp`, `utils/array_args.h` |
 | `metric` | `l2`, `rmse`, `l1`, `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`, `multi_error` | `regression_metric.hpp`, `binary_metric.hpp`, `multiclass_metric.hpp` |
 | `tree` | tree arrays, decision types, leaf outputs, model text serialization | `tree.cpp` |
 | `histogram` | per-feature histograms, most-frequent-bin fix-up | `dense_bin.hpp`, `Dataset::ConstructHistograms`/`FixHistogram` |
-| `learner` | leaf-wise serial tree learner: data partition, histogram subtraction, numerical split search with missing handling, leaf output with L1/L2/`max_delta_step`/`path_smooth` | `serial_tree_learner.cpp`, `feature_histogram.hpp`, `data_partition.hpp` |
+| `learner` | leaf-wise serial tree learner: data partition (restricted to the in-bag rows when sampling), histogram subtraction, numerical split search with missing handling and `extra_trees` random thresholds, leaf output with L1/L2/`max_delta_step`/`path_smooth`; `col_sampler` for `feature_fraction`/`feature_fraction_bynode` | `serial_tree_learner.cpp`, `feature_histogram.hpp`, `data_partition.hpp`, `col_sampler.hpp` |
 | `boosting` | `Gbdt`: boost-from-average, gradients, training iterations, rollback, score updates for train/valid, evaluation, feature importance | `gbdt.cpp`, `score_updater.hpp` |
 | `predict` | raw/transformed/leaf-index prediction with iteration windows | `predictor.hpp`, `gbdt_prediction.cpp` |
 | `io` | model text read/write (byte-identical to upstream for the supported subset) | `gbdt_model_text.cpp` |
@@ -70,6 +72,7 @@ This is the user-facing API, mirroring `lightgbm` 4.7.0: `Dataset`, `Booster`, `
 - **Determinism.**
   - **Col-wise:** no floating-point reduction is split across threads, so results are bitwise independent of the thread count.
   - **Row-wise:** results depend on the thread count through the block partition, exactly as upstream's do. The differential suite checks 4-thread row-wise training against upstream at 4 threads (exact), and col-wise at 4 threads against 1 thread.
+  - **GOSS:** rows are sampled per thread block (`Threading::BlockInfoForceSize`), so GOSS results depend on the thread count in both histogram modes, as upstream's do. The differential suite checks 4-thread GOSS against upstream at 4 threads. Bagging, feature fraction, and extra trees use sequential RNG streams and are thread-independent.
   - **Sequential sums:** root gradient sums and `BoostFromScore` label means are always sequential. This equals upstream with `deterministic=true`. Without it, upstream uses an OpenMP reduction whose rounding depends on the thread count; the benchmark shows such differences of up to 1.8e-15 on regression.
 - **GIL.** Every long-running binding call (dataset construction, `update`, `predict`, model parse/serialize) runs under `Python::detach`, which releases the GIL. `tests/python/test_api.py` verifies this with a ticker thread. Input arrays are borrowed read-only before releasing the GIL. Callers must not mutate an array from another thread during the call; the same rule applies to upstream.
 

@@ -92,7 +92,10 @@ const HONORED: &[&str] = &[
     "start_iteration_predict", "num_iteration_predict", "predict_raw_score",
     "predict_leaf_index", "predict_disable_shape_check", "is_provide_training_metric",
     "force_col_wise", "force_row_wise", "alpha", "fair_c", "poisson_max_delta_step",
-    "tweedie_variance_power", "multi_error_top_k",
+    "tweedie_variance_power", "multi_error_top_k", "bagging_fraction", "bagging_freq",
+    "pos_bagging_fraction", "neg_bagging_fraction", "bagging_seed", "feature_fraction",
+    "feature_fraction_bynode", "feature_fraction_seed", "extra_trees", "extra_seed",
+    "data_sample_strategy", "top_rate", "other_rate",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -104,8 +107,7 @@ const NO_EFFECT: &[&str] = &[
     "header", "label_column", "weight_column", "group_column", "ignore_column",
     "save_binary", "precise_float_parser", "two_round", "pre_partition",
     // Seeds only matter when the corresponding sampler is enabled (gated separately).
-    "bagging_seed", "feature_fraction_seed", "extra_seed", "drop_seed", "objective_seed",
-    "data_sample_strategy",
+    "drop_seed", "objective_seed",
     // Only read by non-CPU devices / multi-machine learners, which are gated via
     // device_type / num_machines / tree_learner.
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
@@ -114,9 +116,8 @@ const NO_EFFECT: &[&str] = &[
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
     "lambdarank_position_bias_regularization", "eval_at",
     "auc_mu_weights",
-    // DART/GOSS knobs are inert unless boosting/data_sample_strategy selects them.
+    // DART knobs are inert unless boosting selects it (gated).
     "drop_rate", "max_drop", "skip_drop", "xgboost_dart_mode", "uniform_drop",
-    "top_rate", "other_rate",
     // Categorical knobs are inert without categorical features (gated separately).
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
     // Quantization sub-options are inert unless use_quantized_grad (gated).
@@ -302,13 +303,23 @@ pub struct Config {
     pub min_data_in_bin: i32,
     pub bin_construct_sample_cnt: i32,
     pub data_random_seed: i32,
-    /// Sub-seeds of samplers that are not implemented yet; kept so that
-    /// `seed` derivation and the saved parameters match upstream.
     pub bagging_seed: i32,
+    /// Kept so that `seed` derivation and the saved parameters match upstream.
     pub drop_seed: i32,
     pub feature_fraction_seed: i32,
     pub objective_seed: i32,
     pub extra_seed: i32,
+    /// `"bagging"` or `"goss"`.
+    pub data_sample_strategy: String,
+    pub bagging_fraction: f64,
+    pub bagging_freq: i32,
+    pub pos_bagging_fraction: f64,
+    pub neg_bagging_fraction: f64,
+    pub top_rate: f64,
+    pub other_rate: f64,
+    pub feature_fraction: f64,
+    pub feature_fraction_bynode: f64,
+    pub extra_trees: bool,
     pub use_missing: bool,
     pub zero_as_missing: bool,
     pub feature_pre_filter: bool,
@@ -367,6 +378,16 @@ impl Default for Config {
             feature_fraction_seed: 2,
             objective_seed: 5,
             extra_seed: 6,
+            data_sample_strategy: "bagging".into(),
+            bagging_fraction: 1.0,
+            bagging_freq: 0,
+            pos_bagging_fraction: 1.0,
+            neg_bagging_fraction: 1.0,
+            top_rate: 0.2,
+            other_rate: 0.1,
+            feature_fraction: 1.0,
+            feature_fraction_bynode: 1.0,
+            extra_trees: false,
             use_missing: true,
             zero_as_missing: false,
             feature_pre_filter: true,
@@ -532,12 +553,20 @@ impl Config {
         if let Some(v) = p.get("boosting") {
             self.boosting = match v.to_ascii_lowercase().as_str() {
                 "gbdt" | "gbrt" => "gbdt".to_string(),
-                "dart" | "goss" | "rf" | "random_forest" => {
+                "goss" => "goss".to_string(),
+                "dart" | "rf" | "random_forest" => {
                     return Err(LgbmError::Unsupported(format!("boosting={v}")));
                 }
                 _ => {
                     return Err(LgbmError::InvalidParameter(format!("Unknown boosting type {v}")));
                 }
+            };
+        }
+        if let Some(v) = p.get("data_sample_strategy") {
+            // upstream: GetDataSampleStrategy
+            self.data_sample_strategy = match v.to_ascii_lowercase().as_str() {
+                s @ ("goss" | "bagging") => s.to_string(),
+                _ => return Err(LgbmError::InvalidParameter(format!("Unknown sample strategy {v}"))),
             };
         }
         let metric_value = p.get("metric").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
@@ -575,6 +604,15 @@ impl Config {
         set_int!(feature_fraction_seed);
         set_int!(objective_seed);
         set_int!(extra_seed);
+        set_f64!(bagging_fraction);
+        set_int!(bagging_freq);
+        set_f64!(pos_bagging_fraction);
+        set_f64!(neg_bagging_fraction);
+        set_f64!(top_rate);
+        set_f64!(other_rate);
+        set_f64!(feature_fraction);
+        set_f64!(feature_fraction_bynode);
+        set_bool!(extra_trees);
         set_bool!(use_missing);
         set_bool!(zero_as_missing);
         set_bool!(feature_pre_filter);
@@ -646,6 +684,15 @@ impl Config {
                 self.num_leaves = full_num_leaves as i32;
             }
         }
+        if self.boosting == "goss" {
+            self.boosting = "gbdt".into();
+            self.data_sample_strategy = "goss".into();
+            self.warnings.push(
+                "Found boosting=goss. For backwards compatibility reasons, LightGBM interprets this as \
+                 boosting=gbdt, data_sample_strategy=goss.To suppress this warning, set data_sample_strategy=goss instead."
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -706,6 +753,16 @@ impl Config {
             "feature_fraction_seed" => self.feature_fraction_seed.to_string(),
             "objective_seed" => self.objective_seed.to_string(),
             "extra_seed" => self.extra_seed.to_string(),
+            "data_sample_strategy" => self.data_sample_strategy.clone(),
+            "bagging_fraction" => g(self.bagging_fraction),
+            "bagging_freq" => self.bagging_freq.to_string(),
+            "pos_bagging_fraction" => g(self.pos_bagging_fraction),
+            "neg_bagging_fraction" => g(self.neg_bagging_fraction),
+            "top_rate" => g(self.top_rate),
+            "other_rate" => g(self.other_rate),
+            "feature_fraction" => g(self.feature_fraction),
+            "feature_fraction_bynode" => g(self.feature_fraction_bynode),
+            "extra_trees" => b(self.extra_trees),
             "use_missing" => b(self.use_missing),
             "zero_as_missing" => b(self.zero_as_missing),
             "feature_pre_filter" => b(self.feature_pre_filter),
@@ -902,11 +959,19 @@ mod tests {
 
     #[test]
     fn unimplemented_non_default_is_rejected() {
-        let e = Config::from_pairs([("bagging_fraction", "0.5")]).unwrap_err();
+        let e = Config::from_pairs([("cegb_tradeoff", "0.5")]).unwrap_err();
         assert!(matches!(e, LgbmError::Unsupported(_)));
         // the default value is accepted
-        assert!(Config::from_pairs([("bagging_fraction", "1.0")]).is_ok());
+        assert!(Config::from_pairs([("cegb_tradeoff", "1.0")]).is_ok());
         assert!(Config::from_pairs([("objective", "multiclass")]).is_err());
+    }
+
+    #[test]
+    fn boosting_goss_is_gbdt_with_goss_sampling() {
+        let c = Config::from_pairs([("boosting", "goss")]).unwrap();
+        assert_eq!((c.boosting.as_str(), c.data_sample_strategy.as_str()), ("gbdt", "goss"));
+        assert!(c.warnings[0].starts_with("Found boosting=goss."));
+        assert!(Config::from_pairs([("data_sample_strategy", "x")]).is_err());
     }
 
     #[test]

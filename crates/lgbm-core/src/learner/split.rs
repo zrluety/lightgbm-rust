@@ -3,11 +3,12 @@
 //! upstream: src/treelearner/feature_histogram.hpp
 //! (`FindBestThresholdSequentially`, `GetSplitGains`, `GetLeafGain`,
 //! `CalculateSplittedLeafOutput`, `FuncForNumricalL3`). Monotone
-//! constraints, extra-trees, quantized gradients, and feature penalties are
-//! not implemented, so their template branches are omitted.
+//! constraints, quantized gradients, and feature penalties are not
+//! implemented, so their template branches are omitted.
 
 use crate::binning::MissingType;
 use crate::consts::{K_EPSILON, K_MIN_SCORE};
+use crate::random::Random;
 
 /// Per-feature histogram metadata (upstream `FeatureMetainfo`).
 #[derive(Debug, Clone, Copy)]
@@ -195,6 +196,10 @@ fn round_int(x: f64) -> i32 {
 /// `hist` is interleaved `[g0, h0, g1, h1, ...]` with `num_bin - offset`
 /// entries; `sum_hessian` is the leaf's raw Hessian sum. Returns whether
 /// any candidate beat the no-split gain (upstream `is_splittable_`).
+///
+/// `extra_rand` is the feature's extra-trees generator (upstream
+/// `FeatureMetainfo::rand`, `USE_RAND`): one threshold is drawn per call and
+/// only that candidate is evaluated.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_threshold(
     hist: &[f64],
@@ -204,6 +209,7 @@ pub fn find_best_threshold(
     sum_hessian: f64,
     num_data: i32,
     parent_output: f64,
+    extra_rand: Option<&mut Random>,
     out: &mut SplitInfo,
 ) -> bool {
     out.default_left = true;
@@ -211,11 +217,13 @@ pub fn find_best_threshold(
     let sum_hessian = sum_hessian + 2.0 * K_EPSILON;
     let min_gain_shift =
         leaf_gain(sum_gradient, sum_hessian, p, num_data, parent_output) + p.min_gain_to_split;
+    // upstream: BeforeNumerical
+    let rand_threshold = extra_rand.map(|r| if meta.num_bin - 2 > 0 { r.next_int(0, meta.num_bin - 2) } else { 0 });
     let mut splittable = false;
     let mut run = |reverse: bool, skip_default: bool, na_as_missing: bool, out: &mut SplitInfo| {
         splittable |= scan(
             hist, meta, p, sum_gradient, sum_hessian, num_data, min_gain_shift, parent_output,
-            reverse, skip_default, na_as_missing, out,
+            reverse, skip_default, na_as_missing, rand_threshold, out,
         );
     };
     if meta.num_bin > 2 && meta.missing_type != MissingType::None {
@@ -235,7 +243,8 @@ pub fn find_best_threshold(
     splittable
 }
 
-/// upstream `FindBestThresholdSequentially` (no MC / no RAND).
+/// upstream `FindBestThresholdSequentially` (no MC; `rand_threshold` is
+/// `Some` under `USE_RAND`).
 #[allow(clippy::too_many_arguments)]
 fn scan(
     hist: &[f64],
@@ -249,6 +258,7 @@ fn scan(
     reverse: bool,
     skip_default_bin: bool,
     na_as_missing: bool,
+    rand_threshold: Option<i32>,
     out: &mut SplitInfo,
 ) -> bool {
     let offset = meta.offset;
@@ -294,6 +304,10 @@ fn scan(
                 break;
             }
             let sum_left_gradient = sum_gradient - sum_right_gradient;
+            if rand_threshold.is_some_and(|r| t - 1 + offset != r) {
+                t -= 1;
+                continue;
+            }
             let current_gain = split_gain(
                 sum_left_gradient,
                 sum_left_hessian,
@@ -361,6 +375,10 @@ fn scan(
                 break;
             }
             let sum_right_gradient = sum_gradient - sum_left_gradient;
+            if rand_threshold.is_some_and(|r| t + offset != r) {
+                t += 1;
+                continue;
+            }
             let current_gain = split_gain(
                 sum_left_gradient,
                 sum_left_hessian,
@@ -438,7 +456,7 @@ mod tests {
             most_freq_bin: 0,
         };
         let mut out = SplitInfo::default();
-        let ok = find_best_threshold(&hist, &meta, &params(), 0.0, 20.0, 20, 0.0, &mut out);
+        let ok = find_best_threshold(&hist, &meta, &params(), 0.0, 20.0, 20, 0.0, None, &mut out);
         assert!(ok);
         assert_eq!(out.threshold, 1);
         assert_eq!(out.left_count, 10);

@@ -365,7 +365,8 @@ def test_metrics_and_early_stopping(case, recorder):
 
 MT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_basic", "reg_100_rounds", "bin_100_rounds",
                                            "l1_weighted", "quantile_basic", "mape_weighted", "poisson_weighted",
-                                           "tweedie_basic", "mc_weighted", "ova_basic")]
+                                           "tweedie_basic", "mc_weighted", "ova_basic", "bag_basic", "goss_basic",
+                                           "goss_no_subset", "sampling_combo")]
 
 
 @pytest.mark.parametrize("case", MT_CASES, ids=[c.name for c in MT_CASES])
@@ -380,14 +381,21 @@ def test_multithread(case, recorder):
 
     # col-wise histograms are feature-parallel, so the thread count cannot
     # change any sum (row-wise uses upstream's thread-dependent row blocks).
-    def col_wise(threads):
+    def col_wise(mod, threads):
         p = {**case.full_params, "force_row_wise": False, "force_col_wise": True, "num_threads": threads}
-        return lgb_rs.train(p, lgb_rs.Dataset(case.X, label=case.y, params=p), num_boost_round=case.num_boost_round)
+        return mod.train(p, mod.Dataset(case.X, label=case.y, params=p), num_boost_round=case.num_boost_round)
 
     def trees(b):
         return b.model_to_string().split("end of trees")[0]
 
-    rec.compare("rust col-wise 4 threads vs 1 thread (trees)", "model_text", trees(col_wise(4)), trees(col_wise(1)))
+    if case.full_params.get("data_sample_strategy") == "goss" or case.full_params.get("boosting") == "goss":
+        # GOSS picks its top rows per thread chunk (upstream goss.hpp), so the
+        # thread count changes the sample by design; compare against upstream instead.
+        rec.compare("col-wise 4 threads (trees, GOSS)", "model_text", trees(col_wise(lgb_rs, 4)),
+                    trees(col_wise(lgb_up, 4)))
+    else:
+        rec.compare("rust col-wise 4 threads vs 1 thread (trees)", "model_text", trees(col_wise(lgb_rs, 4)),
+                    trees(col_wise(lgb_rs, 1)))
     rec.finish()
 
 

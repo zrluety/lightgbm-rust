@@ -60,6 +60,10 @@ pub trait RowObjective: Send + Sync {
     fn class_need_train(&self, _output: usize) -> bool {
         true
     }
+    /// upstream `NumPositiveData` (enables balanced bagging when > 0).
+    fn num_positive_data(&self) -> usize {
+        0
+    }
     /// upstream `IsRenewTreeOutput`: leaf values are recomputed from the
     /// residuals after each tree is grown (L1, quantile, MAPE).
     fn is_renew_tree_output(&self) -> bool {
@@ -338,6 +342,13 @@ impl Objective {
         match self {
             Objective::Row(o) => o.class_need_train(k),
             Objective::Grouped { .. } => true,
+        }
+    }
+
+    pub fn num_positive_data(&self) -> usize {
+        match self {
+            Objective::Row(o) => o.num_positive_data(),
+            Objective::Grouped { .. } => 0,
         }
     }
 

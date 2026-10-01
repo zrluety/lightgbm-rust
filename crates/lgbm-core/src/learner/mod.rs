@@ -10,6 +10,7 @@
 //! results match upstream's row-wise mode for the same thread count; with
 //! one thread both modes give identical sums).
 
+pub mod col_sampler;
 pub mod partition;
 pub mod split;
 
@@ -21,8 +22,10 @@ use crate::consts::K_MIN_SCORE;
 use crate::dataset::Dataset;
 use crate::histogram::{self, HistLayout};
 use crate::multi_val_bin::{HistSlots, MultiValBin, merge_blocks};
+use crate::random::Random;
 use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
 use crate::tree::{SplitArgs, Tree};
+use col_sampler::ColSampler;
 use partition::DataPartition;
 use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_output};
 
@@ -75,6 +78,9 @@ pub struct SerialTreeLearner {
     ordered_h: Vec<f32>,
     /// Interleaved `[grad, hess]` per row for the row-wise kernel.
     gh: Vec<[f32; 2]>,
+    col_sampler: ColSampler,
+    /// Per-feature extra-trees generators (upstream `FeatureMetainfo::rand`).
+    extra_rands: Option<Vec<Random>>,
     pub trace: Option<TreeTrace>,
 }
 
@@ -97,7 +103,17 @@ impl SerialTreeLearner {
         let slots = HistSlots::new(&data);
         let multi_val =
             (!cfg.force_col_wise && data.num_features() > 0).then(|| MultiValBin::new(&data, &slots));
+        let col_sampler = ColSampler::new(&data, cfg);
+        let extra_rands = cfg
+            .extra_trees
+            .then(|| {
+                (0..data.num_features())
+                    .map(|f| Random::new(cfg.extra_seed.wrapping_add(data.upstream_inner_index(f) as i32)))
+                    .collect()
+            });
         Self {
+            col_sampler,
+            extra_rands,
             slots,
             multi_val,
             team: ThreadTeam::new(resolve_num_threads(cfg.num_threads)),
@@ -137,6 +153,12 @@ impl SerialTreeLearner {
         self.partition.add_leaf_outputs(&self.team, leaf_values, score);
     }
 
+    /// upstream: `SerialTreeLearner::SetBaggingData` (non-subset mode).
+    /// `used` are the in-bag rows in ascending order; `None` trains on all rows.
+    pub fn set_bagging_data(&mut self, used: Option<&[u32]>) {
+        self.partition.set_used_data_indices(used);
+    }
+
     /// Train one tree on `grad`/`hess` (length `num_data`).
     pub fn train(&mut self, grad: &[f32], hess: &[f32]) -> Tree {
         let n = self.data.num_data();
@@ -146,7 +168,9 @@ impl SerialTreeLearner {
                 self.free_bufs.push(lh.data);
             }
         }
+        self.col_sampler.reset_by_tree();
         self.partition.init();
+        let root_cnt = self.partition.leaf_count(0);
         if self.multi_val.is_some() {
             self.gh.resize(n, [0.0; 2]);
             const CHUNK: usize = 1 << 15;
@@ -166,13 +190,20 @@ impl SerialTreeLearner {
         }
         let mut sg = 0.0f64;
         let mut sh = 0.0f64;
-        for i in 0..n {
-            sg += grad[i] as f64;
-            sh += hess[i] as f64;
+        if root_cnt == n {
+            for i in 0..n {
+                sg += grad[i] as f64;
+                sh += hess[i] as f64;
+            }
+        } else {
+            for &i in self.partition.indices_on_leaf(0) {
+                sg += grad[i as usize] as f64;
+                sh += hess[i as usize] as f64;
+            }
         }
         self.smaller = LeafSplits {
             leaf: 0,
-            num_data: n as i32,
+            num_data: root_cnt as i32,
             sum_gradients: sg,
             sum_hessians: sh,
             weight: 0.0,
@@ -183,7 +214,7 @@ impl SerialTreeLearner {
         }
 
         let mut tree = Tree::new(self.num_leaves);
-        tree.set_leaf_output(0, root_output(sg, sh, &self.params, n as i32));
+        tree.set_leaf_output(0, root_output(sg, sh, &self.params, root_cnt as i32));
 
         let mut left_leaf: i32 = 0;
         let mut right_leaf: i32 = -1;
@@ -237,13 +268,17 @@ impl SerialTreeLearner {
         let nf = self.data.num_features();
         // The parent's histograms live in the left leaf's slot.
         let parent = if right >= 0 { self.hist_pool[left as usize].take() } else { None };
+        let bytree = self.col_sampler.is_feature_used_bytree();
         let is_used: Vec<bool> = match &parent {
-            Some(p) => p.splittable.clone(),
-            None => vec![true; nf],
+            Some(p) => p.splittable.iter().zip(bytree).map(|(&s, &b)| s && b).collect(),
+            None => bytree.to_vec(),
         };
+        // upstream FindBestSplitsFromHistograms: smaller leaf first, then larger.
+        let s_node = self.col_sampler.get_by_node();
+        let l_node = if self.larger.leaf >= 0 { self.col_sampler.get_by_node() } else { Vec::new() };
 
         let sm_leaf = self.smaller.leaf as usize;
-        let use_indices = right >= 0;
+        let use_indices = right >= 0 || self.partition.leaf_count(sm_leaf) != self.data.num_data();
         let mut s_buf = self.free_bufs.pop().unwrap_or_default();
         s_buf.clear();
         s_buf.resize(self.slots.buf_len(), 0.0);
@@ -289,6 +324,7 @@ impl SerialTreeLearner {
         let l_shared = l_buf.as_mut().map(|b| SharedMut::new(b));
         let views = &self.slots.views;
         let row_wise = self.multi_val.is_some();
+        let rands = self.extra_rands.as_mut().map(|r| SharedMut::new(r));
 
         let work = if row_wise {
             nblock.max(1) * self.slots.buf_len()
@@ -321,6 +357,8 @@ impl SerialTreeLearner {
                 }
                 histogram::fix(&layout, smaller.sum_gradients, smaller.sum_hessians, hist);
                 let real = data.real_feature_index(f) as i32;
+                // SAFETY: task `f` is the only one touching generator `f`.
+                let mut rand = rands.as_ref().map(|r| unsafe { r.get(f) });
                 let mut s_split = SplitInfo::default();
                 let s_ok = find_best_threshold(
                     hist,
@@ -330,6 +368,7 @@ impl SerialTreeLearner {
                     smaller.sum_hessians,
                     smaller.num_data,
                     smaller_parent_output,
+                    rand.as_deref_mut(),
                     &mut s_split,
                 );
                 s_split.feature = real;
@@ -346,6 +385,7 @@ impl SerialTreeLearner {
                         larger.sum_hessians,
                         larger.num_data,
                         larger_parent_output,
+                        rand.as_deref_mut(),
                         &mut l_split,
                     );
                     l_split.feature = real;
@@ -359,17 +399,20 @@ impl SerialTreeLearner {
             });
         drop(s_shared);
         drop(l_shared);
+        drop(rands);
 
+        // upstream ComputeBestSplitForFeature: the by-node mask is applied
+        // after the threshold search so `is_splittable` stays accurate.
         let mut s_best = SplitInfo::default();
         let mut l_best = SplitInfo::default();
         let mut s_spl = Vec::with_capacity(nf);
         let mut l_spl = Vec::with_capacity(nf);
         for (f, r) in results.into_iter().enumerate() {
             if is_used[f] {
-                if r.smaller_split.better_than(&s_best) {
+                if s_node[f] && r.smaller_split.better_than(&s_best) {
                     s_best = r.smaller_split;
                 }
-                if larger.leaf >= 0 && r.larger_split.better_than(&l_best) {
+                if larger.leaf >= 0 && l_node[f] && r.larger_split.better_than(&l_best) {
                     l_best = r.larger_split;
                 }
             }

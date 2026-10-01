@@ -169,6 +169,12 @@ def _features(rng: np.random.Generator, n: int, p: int, kind: str) -> np.ndarray
     elif kind == "heavy_tail":
         X = rng.standard_cauchy(size=(n, p))
         X[:, 1] = np.exp(rng.normal(size=n) * 3)
+    elif kind == "sparse":
+        # mostly-zero, nearly exclusive columns: exercises upstream's feature bundling
+        slot = rng.integers(0, p, size=n)
+        X = np.where(slot[:, None] == np.arange(p)[None, :], X, 0.0)
+        X[:, 0] = rng.normal(size=n)
+        X[rng.random(X.shape) < 0.01] = 1.5
     return X
 
 
@@ -288,6 +294,33 @@ CASES = [
     make_case("ova_weighted_sigmoid", "multiclassova", {"num_class": 4, "sigmoid": 0.7}, weighted=True),
     make_case("ova_unbalance", "multiclassova", {"num_class": 3, "is_unbalance": True}),
     make_case("ova_absent_class", "multiclassova", {"num_class": 4}, num_labels=3),
+    # sampling (upstream bagging.hpp / goss.hpp / col_sampler.hpp / extra trees)
+    make_case("bag_basic", "regression", {"bagging_fraction": 0.7, "bagging_freq": 1}),
+    make_case("bag_freq3_subset", "regression", {"bagging_fraction": 0.5, "bagging_freq": 3, "bagging_seed": 7}),
+    make_case("bag_small_fraction", "regression", {"bagging_fraction": 0.3, "bagging_freq": 1, "min_data_in_leaf": 5}),
+    make_case("bag_seed_derived", "regression",
+              {"seed": 5, "bagging_fraction": 0.8, "bagging_freq": 1, "feature_fraction": 0.8}),
+    make_case("bag_balanced_binary", "binary",
+              {"pos_bagging_fraction": 0.8, "neg_bagging_fraction": 0.4, "bagging_freq": 1}),
+    make_case("bag_l1_weighted", "regression_l1", {"bagging_fraction": 0.6, "bagging_freq": 2}, weighted=True),
+    make_case("bag_quantile", "quantile", {"bagging_fraction": 0.75, "bagging_freq": 1, "alpha": 0.4}),
+    make_case("bag_multiclass", "multiclass", {"num_class": 3, "bagging_fraction": 0.7, "bagging_freq": 1}),
+    make_case("ff_bytree", "regression", {"feature_fraction": 0.6}),
+    make_case("ff_bynode", "regression", {"feature_fraction_bynode": 0.5}),
+    make_case("ff_both", "binary",
+              {"feature_fraction": 0.7, "feature_fraction_bynode": 0.6, "feature_fraction_seed": 11}, p=10),
+    make_case("ff_multiclass", "multiclass", {"num_class": 3, "feature_fraction": 0.5}),
+    make_case("extra_trees", "regression", {"extra_trees": True}),
+    make_case("extra_trees_nan", "binary", {"extra_trees": True, "extra_seed": 3}, kind="nan_zero"),
+    make_case("extra_trees_sparse", "regression", {"extra_trees": True}, kind="sparse", p=12),
+    make_case("reg_sparse", "regression", {}, kind="sparse", p=12),
+    make_case("goss_basic", "regression", {"data_sample_strategy": "goss", "learning_rate": 0.2}),
+    make_case("goss_no_subset", "binary",
+              {"data_sample_strategy": "goss", "top_rate": 0.4, "other_rate": 0.2, "learning_rate": 0.25}),
+    make_case("goss_boosting_alias", "multiclass", {"boosting": "goss", "num_class": 3, "learning_rate": 0.3}),
+    make_case("sampling_combo", "regression",
+              {"bagging_fraction": 0.8, "bagging_freq": 2, "feature_fraction": 0.8, "feature_fraction_bynode": 0.7,
+               "extra_trees": True, "num_leaves": 15}, n=6000, p=8, weighted=True),
 ]
 
 

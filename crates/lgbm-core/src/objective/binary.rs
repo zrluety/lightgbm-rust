@@ -18,6 +18,7 @@ pub struct BinaryLogloss {
     is_pos: Vec<bool>,
     weight: Option<Vec<f32>>,
     need_train: bool,
+    num_pos_data: usize,
     warnings: Vec<String>,
 }
 
@@ -42,6 +43,7 @@ impl BinaryLogloss {
             is_pos: Vec::new(),
             weight: None,
             need_train: true,
+            num_pos_data: 0,
             warnings: Vec::new(),
         })
     }
@@ -56,6 +58,7 @@ impl BinaryLogloss {
             is_pos: Vec::new(),
             weight: None,
             need_train: true,
+            num_pos_data: 0,
             warnings: Vec::new(),
         }
     }
@@ -74,6 +77,7 @@ impl RowObjective for BinaryLogloss {
         self.weight = meta.weight.clone();
         let cnt_positive = self.is_pos.iter().filter(|&&p| p).count();
         let cnt_negative = self.is_pos.len() - cnt_positive;
+        self.num_pos_data = cnt_positive;
         self.need_train = !(cnt_negative == 0 || cnt_positive == 0);
         if !self.need_train {
             self.warnings.push("Contains only one class".into());
@@ -151,6 +155,10 @@ impl RowObjective for BinaryLogloss {
 
     fn class_need_train(&self, _output: usize) -> bool {
         self.need_train
+    }
+
+    fn num_positive_data(&self) -> usize {
+        self.num_pos_data
     }
 
     fn convert_output(&self, raw: &[f64], out: &mut [f64]) {

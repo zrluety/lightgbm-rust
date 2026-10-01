@@ -273,6 +273,23 @@ impl Tree {
         });
     }
 
+    /// upstream: `Tree::AddPredictionToScore(data, used_data_indices, num_data, score)`.
+    pub fn add_prediction_to_score_rows(&self, data: &Dataset, rows: &[u32], score: &mut [f64]) {
+        if self.num_leaves <= 1 {
+            let v = self.leaf_value[0];
+            for &i in rows {
+                score[i as usize] += v;
+            }
+            return;
+        }
+        use rayon::prelude::*;
+        let leaves: Vec<usize> =
+            rows.par_iter().with_min_len(4096).map(|&i| self.get_leaf_binned(data, i as usize)).collect();
+        for (&i, leaf) in rows.iter().zip(leaves) {
+            score[i as usize] += self.leaf_value[leaf];
+        }
+    }
+
     pub fn max_depth(&self) -> i32 {
         if self.num_leaves <= 1 { 0 } else { *self.leaf_depth.iter().max().unwrap() }
     }

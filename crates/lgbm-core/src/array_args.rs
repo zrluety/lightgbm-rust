@@ -59,6 +59,25 @@ pub fn partition<T: PartialOrd + Copy>(arr: &mut [T], start: i32, end: i32) -> (
     (j, i)
 }
 
+/// upstream `ArgMaxAtK`: reorders `arr[start..end]` so that position `k`
+/// holds the value it would have if the range were sorted descending.
+/// The tail recursion is written as a loop.
+pub fn arg_max_at_k<T: PartialOrd + Copy>(arr: &mut [T], mut start: i32, mut end: i32, k: i32) -> i32 {
+    loop {
+        if start >= end - 1 {
+            return start;
+        }
+        let (l, r) = partition(arr, start, end);
+        if (k > l && k < r) || (l == start - 1 && r == end - 1) {
+            return k;
+        } else if k <= l {
+            end = l + 1;
+        } else {
+            start = r;
+        }
+    }
+}
+
 /// Index of the first maximum (upstream `ArgMax`, sequential branch).
 pub fn arg_max<T: PartialOrd>(arr: &[T]) -> usize {
     let mut m = 0;
@@ -111,6 +130,22 @@ mod tests {
         assert_eq!(g[(mb + 1) as usize], g[(me - 1) as usize]);
         assert_eq!(mb, -1);
         assert_eq!(me, 3);
+    }
+
+    #[test]
+    fn arg_max_at_k_selects_kth_largest() {
+        let base = [3.0f32, 9.0, 1.0, 9.0, 4.0, 7.0, 7.0, 0.5, 2.0, 7.0];
+        let mut sorted = base.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        for k in 0..base.len() as i32 {
+            let mut v = base.to_vec();
+            let len = v.len() as i32;
+            arg_max_at_k(&mut v, 0, len, k);
+            assert_eq!(v[k as usize], sorted[k as usize], "k={k}");
+        }
+        let mut asc: Vec<f32> = (0..5000).map(|i| i as f32).collect();
+        arg_max_at_k(&mut asc, 0, 5000, 10);
+        assert_eq!(asc[10], 4989.0);
     }
 
     #[test]

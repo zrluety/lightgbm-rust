@@ -17,6 +17,7 @@ pub mod config;
 pub mod consts;
 pub mod dataset;
 pub mod error;
+pub mod feature_groups;
 pub mod fmt;
 pub mod histogram;
 pub mod io;
@@ -26,6 +27,7 @@ pub mod multi_val_bin;
 pub mod objective;
 pub mod predict;
 pub mod random;
+pub mod sample_strategy;
 pub mod threading;
 pub mod tree;
 

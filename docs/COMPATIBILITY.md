@@ -1,8 +1,8 @@
 # Compatibility matrix
 
-Target: LightGBM **v4.7.0** (commit `8f7036f`, see [UPSTREAM.md](UPSTREAM.md)). State as of the end of milestone 3. The numbers come from `tests/report/summary.md` (regenerate with the commands in [TESTING.md](TESTING.md)).
+Target: LightGBM **v4.7.0** (commit `8f7036f`, see [UPSTREAM.md](UPSTREAM.md)). State as of milestone 4 (in progress). The numbers come from `tests/report/summary.md` (regenerate with the commands in [TESTING.md](TESTING.md)).
 
-**lightgbm-rust does not have full parity with LightGBM.** It implements a CPU, dense, numerical-feature subset for L2 regression and binary classification. Within that subset, results match upstream bit for bit on every differential case run so far. Everything outside the subset either raises `LightGBMError("not supported by lightgbm-rust yet: ...")` or is absent.
+**lightgbm-rust does not have full parity with LightGBM.** It implements a CPU, dense, numerical-feature subset of GBDT: the regression objectives, binary, multiclass and multiclass-OVA, with bagging, GOSS, feature subsampling, and extra trees. Within that subset, results match upstream bit for bit on every differential case run so far. Everything outside the subset either raises `LightGBMError("not supported by lightgbm-rust yet: ...")` or is absent.
 
 ## How to read this
 
@@ -25,11 +25,11 @@ Each axis takes one of these statuses:
 A dash in the Tolerance column means the comparison is exact or there is no numerical output. Named tolerances refer to sections of [`tests/tolerances.toml`](../tests/tolerances.toml).
 
 The **evidence** referred to throughout comes from three places:
-- **Differential tests (D):** `tests/differential`, run against the PyPI `lightgbm==4.7.0` wheel. These are 25 cases of 3,000 to 8,000 rows with 6 features, run single-threaded plus a 4-thread run. There are 12,235 comparisons. All are bitwise exact except 345 values of internal (non-leaf) nodes, `internal_value` and `internal_weight`, which differ by at most 2.2e-16 relative.
+- **Differential tests (D):** `tests/differential`, run against the PyPI `lightgbm==4.7.0` wheel. These are 76 cases of 3,000 to 8,000 rows with 6 to 12 features, run single-threaded plus 4-thread runs for 16 of them. There are 47,955 comparisons. All are bitwise exact except 849 values of internal (non-leaf) nodes, `internal_value` and `internal_weight`, which differ by at most 2.2e-16 relative.
 - **Upstream tests (U):** upstream's own `tests/python_package_test`, run unmodified through the import shim.
 - **Rust tests (R):** `cargo test -p lgbm-core`, including the ported C++ tests.
 
-Upstream-suite totals: **149 passed, 0 failed, 429 unsupported, 14 skipped**. On top of those cases, `test_sklearn.py` (65 functions) cannot be collected, and `test_dask.py` (32 functions) is skipped because dask is not installed.
+Upstream-suite totals: **158 passed, 0 failed, 420 unsupported, 14 skipped**. On top of those cases, `test_sklearn.py` (65 functions) cannot be collected, and `test_dask.py` (32 functions) is skipped because dask is not installed.
 
 ## Python API surface
 
@@ -60,7 +60,7 @@ Upstream-suite totals: **149 passed, 0 failed, 429 unsupported, 14 skipped**. On
 | Labels, weights, `init_score` (incl. NaN/inf clamping by `AvoidInf`, dropping all-ones weights) | implemented | verified | n/a | implemented | D: `*_weighted`, `*_init_score`; U: `test_consistent_state_for_dataset_fields`, `test_init_score_for_multiclass_classification` | gradients, predictions | – |
 | Feature names (auto `Column_i`, whitespace → `_`, JSON-character and duplicate checks) | implemented | verified | verified | n/a | U: `test_feature_name`, `test_feature_name_with_non_ascii`, `test_feature_names_are_set_correctly_when_no_feature_names_passed_into_Dataset`, `test_set_feature_name_updates_has_non_default_feature_names` | – | – |
 | Validation sets sharing the training bin mappers | implemented | verified | n/a | implemented | D: metrics and early stopping; U: `test_dataset_params_with_reference` | metrics | – |
-| Exclusive feature bundling (`enable_bundle`) | not started | partial | n/a | not started | – | – | No bundling is performed. EFB with the default `max_conflict_rate=0` is lossless, so results are expected to be unchanged; this is confirmed only on dense differential data. On sparse, wide data, memory and speed will be worse than upstream. |
+| Exclusive feature bundling (`enable_bundle`) | partial | partial | n/a | not started | D: `reg_sparse`, `extra_trees_sparse` (mostly-zero, nearly exclusive columns) | – | Upstream's grouping (`FastFeatureBundling`/`FindGroups`, incl. the group shuffle) is ported only to reproduce upstream's inner feature order, which seeds the per-feature `extra_trees` RNGs. Histograms are not bundled. EFB with the default `max_conflict_rate=0` is lossless, so results are unchanged (confirmed on the sparse cases); on sparse, wide data, memory and speed will be worse than upstream. |
 | Sparse (SciPy CSR/CSC), Arrow, Polars, `Sequence`, text/binary files, `two_round`, `header`, `label_column`, ... | not started | not started | n/a | not started | U: input-arrow 183, input-polars 65, input-sparse 3 unsupported | – | Planned for milestone 4 (sparse, Arrow, Polars). |
 | `max_bin_by_feature`, `forcedbins_filename`, `linear_tree` | not started | not started | not started | not started | U: unsupported | – | – |
 | `Dataset.save_binary`, binary dataset files, `subset`, `add_features_from` | not started | not started | not started | not started | U: 24 + 5 + 3 unsupported | – | – |
@@ -70,11 +70,14 @@ Upstream-suite totals: **149 passed, 0 failed, 429 unsupported, 14 skipped**. On
 | feature | API | Behavior | Model format | Performance | upstream tests | tolerance | known differences |
 |---|---|---|---|---|---|---|---|
 | Leaf-wise growth: `num_leaves`, `max_depth` (incl. upstream's `num_leaves` reduction and warning), `min_data_in_leaf`, `min_sum_hessian_in_leaf` | implemented | verified | verified | partial | D: `tree_structure` all exact (`reg_depth`, `reg_depth_without_num_leaves`, `reg_100_rounds`, `bin_100_rounds`); U: `test_max_depth_warning_*` | tree_structure (exact) | – |
-| Split gain and leaf output: `lambda_l1`, `lambda_l2`, `min_gain_to_split`, `max_delta_step`, `path_smooth` | implemented | verified | verified | n/a | D: `reg_regularized`, `split_gain` exact, leaf values and leaf weights exact; U: `test_path_smoothing` | split_gain, leaf_value | Internal-node `internal_value`/`internal_weight` differ in the last bit in 345 of the comparisons (max 2.2e-16 relative); the cause has not been isolated yet. These values are not used for prediction. Upstream saves them with 6 significant digits, so the model text is still byte-identical. |
+| Split gain and leaf output: `lambda_l1`, `lambda_l2`, `min_gain_to_split`, `max_delta_step`, `path_smooth` | implemented | verified | verified | n/a | D: `reg_regularized`, `split_gain` exact, leaf values and leaf weights exact; U: `test_path_smoothing` | split_gain, leaf_value | Internal-node `internal_value`/`internal_weight` differ in the last bit in 849 of the comparisons (max 2.2e-16 relative); the cause has not been isolated yet. These values are not used for prediction. Upstream saves them with 6 significant digits, so the model text is still byte-identical. |
 | Missing values (NaN/zero as missing, default direction search) | implemented | verified | verified | n/a | D: `*_nan_zero`, `reg_zero_as_missing`, `reg_no_missing`; U: `test_missing_value_handle*` | tree_structure | – |
 | Histogram construction, subtraction trick, most-frequent-bin fix-up | implemented | verified | n/a | verified (see Performance) | D: all cases | – | – |
 | `force_row_wise` / `force_col_wise`, `deterministic`, `num_threads` | implemented | verified | verified (saved in params) | verified | D: `test_multithread` (row-wise 4 threads vs upstream 4 threads; col-wise 4 vs 1 thread); Rust `histogram_layouts_and_thread_counts_agree` | multithread | Setting neither flag selects row-wise without upstream's timing test (upstream picks the faster of the two at run time). Col-wise results do not depend on the thread count. Row-wise results depend on it exactly as upstream's do. |
-| Bagging, `feature_fraction`, `feature_fraction_bynode`, `extra_trees`, GOSS sampling | not started | not started | not started | not started | U: unsupported (e.g. `test_node_level_subcol`, `test_goss_boosting_and_strategy_equivalent`) | – | Rejected if set to a non-default value. |
+| Bagging (`bagging_fraction`, `bagging_freq`, `bagging_seed`, balanced `pos_/neg_bagging_fraction`) | implemented | verified | verified | partial | D: `bag_*` (incl. balanced binary, weighted L1, quantile, multiclass, `bagging_freq=3`, seed derived from `seed`), `sampling_combo`, `bag_basic` at 4 threads; U: `test_node_level_subcol` | – | Upstream's per-1024-row-block RNG is reproduced exactly. `bagging_by_query` is not supported (needs ranking). Upstream's subset-copy mode is not implemented; it yields the same sums, so only memory/speed differ. |
+| `feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed` | implemented | verified | verified | partial | D: `ff_bytree`, `ff_bynode`, `ff_both`, `ff_multiclass`, `sampling_combo`; U: `test_node_level_subcol` | – | Interaction constraints in the column sampler are not supported (constraints are rejected). The row-wise histogram path still builds histograms for features excluded by the per-tree sample (speed only). |
+| `extra_trees`, `extra_seed` | implemented | verified | verified | partial | D: `extra_trees`, `extra_trees_nan`, `extra_trees_sparse`, `sampling_combo`; U: `test_extra_trees` | – | Per-feature RNGs are seeded by upstream's inner feature index, which depends on its feature-bundling order (see the bundling row). |
+| GOSS (`data_sample_strategy=goss`, `top_rate`, `other_rate`; `boosting=goss` alias) | implemented | verified | verified | partial | D: `goss_basic`, `goss_no_subset`, `goss_boosting_alias`, and 4-thread runs of the first two against upstream at 4 threads; U: `test_goss_boosting_and_strategy_equivalent`; R: `ArgMaxAtK` test | – | Like upstream, results depend on the thread count (rows are sampled per thread block). `boosting=goss` is rewritten to `gbdt` + `data_sample_strategy=goss` with upstream's warning; the parameter checks use upstream's messages. GOSS blocks are processed sequentially (speed only). |
 | Monotone and interaction constraints, CEGB, forced splits, quantized gradients, linear trees | not started | not started | not started | not started | U: constraints 7, linear-tree 5, quantized 1 unsupported | – | Rejected if set to a non-default value. |
 | Categorical splits | not started | not started | not started | not started | U: unsupported | – | – |
 
@@ -82,12 +85,12 @@ Upstream-suite totals: **149 passed, 0 failed, 429 unsupported, 14 skipped**. On
 
 | feature | API | Behavior | Model format | Performance | upstream tests | tolerance | known differences |
 |---|---|---|---|---|---|---|---|
-| GBDT: `learning_rate`, `num_iterations` and aliases, `boost_from_average`, score updates | implemented | verified | verified | partial | D: all 25 cases incl. `reg_no_boost_from_average`, `reg_100_rounds`, `bin_100_rounds` | predictions | – |
+| GBDT: `learning_rate`, `num_iterations` and aliases, `boost_from_average`, score updates | implemented | verified | verified | partial | D: all cases incl. `reg_no_boost_from_average`, `reg_100_rounds`, `bin_100_rounds` | predictions | – |
 | Early stopping (`early_stopping_round`, `early_stopping_min_delta`, `first_metric_only`, train set ignored) | implemented | verified | verified (`best_iteration` in model) | n/a | U: 7 `test_early_stopping*` passed; D: `test_metrics_and_early_stopping` | metrics | – |
 | Custom objective (`fobj` / callable `objective`) | implemented | verified | verified (`objective=custom`) | n/a | U: `test_objective_callable_train_regression`, `test_objective_callable_train_binary_classification`, `test_verbosity_is_respected_when_using_custom_objective`; Python API test (custom L2 equals built-in L2 exactly) | predictions | – |
 | `rollback_one_iter` | implemented | verified | n/a | n/a | U: `test_booster_rollback_one_iter` | – | – |
 | Continued training (`init_model`), `refit`, `keep_training_booster` + reload | not started | not started | n/a | n/a | U: continued-training 9 unsupported | – | – |
-| DART, random forest (`rf`), GOSS boosting | not started | not started | not started | not started | U: unsupported | – | – |
+| DART, random forest (`rf`) | not started | not started | not started | not started | U: unsupported | – | – |
 
 ## Objectives
 

@@ -13,6 +13,8 @@ use crate::error::{LgbmError, Result};
 use crate::learner::SerialTreeLearner;
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
+use crate::sample_strategy::SampleStrategy;
+use crate::threading::resolve_num_threads;
 use crate::tree::Tree;
 
 /// Which prediction to produce.
@@ -39,6 +41,7 @@ struct ValidSet {
 struct TrainState {
     data: Arc<Dataset>,
     learner: SerialTreeLearner,
+    sampler: Option<SampleStrategy>,
     scores: Vec<f64>,
     has_init_score: bool,
     grad: Vec<f32>,
@@ -148,6 +151,8 @@ impl Gbdt {
             Vec::new()
         };
         let pool = build_pool(config.num_threads)?;
+        let sampler =
+            SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
         let learner = SerialTreeLearner::new(train.clone(), &config);
         Ok(Self {
             num_tree_per_iteration: ntpi,
@@ -161,6 +166,7 @@ impl Gbdt {
             train: Some(TrainState {
                 data: train,
                 learner,
+                sampler,
                 scores,
                 has_init_score,
                 grad: vec![0.0; n * ntpi],
@@ -345,6 +351,16 @@ impl Gbdt {
             }
         }
 
+        // upstream: data_sample_strategy_->Bagging
+        {
+            let st = self.train.as_mut().unwrap();
+            if let Some(s) = st.sampler.as_mut() {
+                if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
+                    st.learner.set_bagging_data(Some(s.in_bag()));
+                }
+            }
+        }
+
         let cfg = self.config.clone().expect("training config");
         let mut should_continue = false;
         for k in 0..ntpi {
@@ -396,6 +412,10 @@ impl Gbdt {
                 let st = self.train.as_mut().unwrap();
                 let mut update = || {
                     st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
+                    // upstream GBDT::UpdateScore: out-of-bag rows are predicted
+                    if let Some(s) = st.sampler.as_ref().filter(|s| s.bag_cnt() < n) {
+                        tree.add_prediction_to_score_rows(&st.data, s.out_of_bag(), &mut st.scores[offset..offset + n]);
+                    }
                     for v in st.valid.iter_mut() {
                         let vn = v.data.num_data();
                         tree.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
