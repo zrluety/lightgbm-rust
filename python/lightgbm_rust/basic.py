@@ -606,10 +606,6 @@ class Dataset:
             return self._construct_subset()
         if self.data is None:
             raise ValueError("Cannot construct a Dataset whose raw data has been freed.")
-        if self.group is not None:
-            raise _unsupported("group / query data (ranking)")
-        if self.position is not None:
-            raise _unsupported("position data")
         cat = self.categorical_feature
         if cat not in ("auto", None) and len(cat) > 0:
             raise _unsupported("categorical features")
@@ -665,6 +661,10 @@ class Dataset:
         # upstream: _lazy_init re-reads the fields, which the engine may have modified
         self.label = self.get_field("label")
         self.weight = self.get_field("weight")
+        if self.group is not None:
+            self.set_group(self.group)
+        if self.position is not None:
+            self.set_position(self.position)
         if predictor is not None:
             self._set_init_score_by_predictor(predictor=predictor, data=self.data, used_indices=None)
         elif self.init_score is not None:
@@ -685,15 +685,22 @@ class Dataset:
             if a != b:
                 _log_warning("Overriding the parameters from Reference Dataset.")
             self._update_params(reference_params)
-        if self.reference.group is not None:
-            raise _unsupported("group / query data (ranking)")
         used_indices = _list_to_1d_numpy(data=self.used_indices, dtype=np.int32, name="used_indices")
+        if self.reference.group is not None:
+            group_info = np.array(self.reference.group).astype(np.int32, copy=False)
+            _, self.group = np.unique(
+                np.repeat(range(len(group_info)), repeats=group_info)[self.used_indices], return_counts=True
+            )
         full = self.reference.construct()._rs
         assert full is not None
         self._rs = full.subset(np.ascontiguousarray(used_indices), _param_dict_to_pairs(self.params))
         _emit_engine_warnings(self._rs.config_warnings(), self.params)
         if not self.free_raw_data:
             self.get_data()
+        if self.group is not None:
+            self.set_group(self.group)
+        if self.position is not None:
+            self.set_position(self.position)
         if self.get_label() is None:
             raise ValueError("Label should not be None.")
         if isinstance(self._predictor, _InnerPredictor) and self._predictor is not self.reference._predictor:
@@ -838,12 +845,10 @@ class Dataset:
         elif field_name == "init_score":
             values = None if data is None else _init_score_to_numpy(data)
         elif field_name in ("group", "position"):
-            if data is None:
-                return self
-            raise _unsupported(f"{field_name} data")
+            values = None if data is None else _field_1d_to_numpy(data, np.int32, field_name)
         else:
             raise LightGBMError(f"Unknown field name: {field_name}")
-        self._rs.set_field(field_name, values)
+        _emit_engine_warnings(self._rs.set_field(field_name, values), None)
         self.version += 1
         return self
 
@@ -862,8 +867,10 @@ class Dataset:
                 if num_classes > 1:
                     arr = arr.reshape((num_data, num_classes), order="F")
             return arr
-        if field_name in ("group", "position"):
-            return None
+        if field_name == "group":
+            return self._rs.get_group()
+        if field_name == "position":
+            return self._rs.get_position()
         raise LightGBMError(f"Unknown field name: {field_name}")
 
     def set_label(self, label: Any) -> "Dataset":
@@ -892,14 +899,20 @@ class Dataset:
         return self
 
     def set_group(self, group: Any) -> "Dataset":
-        if group is not None:
-            raise _unsupported("group / query data (ranking)")
-        self.group = None
+        self.group = group
+        if self._rs is not None and group is not None:
+            self.set_field("group", group)
+            # original values can be modified at the engine side
+            constructed_group = self.get_field("group")
+            if constructed_group is not None:
+                self.group = np.diff(constructed_group)
         return self
 
     def set_position(self, position: Any) -> "Dataset":
-        if position is not None:
-            raise _unsupported("position data")
+        self.position = position
+        if self._rs is not None and position is not None:
+            self.set_field("position", position)
+            self.position = self.get_field("position")
         return self
 
     def set_feature_name(self, feature_name: Union[List[str], str]) -> "Dataset":
@@ -936,9 +949,16 @@ class Dataset:
         return self.init_score
 
     def get_group(self) -> Any:
+        if self.group is None:
+            self.group = self.get_field("group")
+            if self.group is not None:
+                # boundaries -> group sizes
+                self.group = np.diff(self.group)
         return self.group
 
     def get_position(self) -> Any:
+        if self.position is None:
+            self.position = self.get_field("position")
         return self.position
 
     def get_data(self) -> Any:

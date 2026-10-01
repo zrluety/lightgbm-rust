@@ -228,13 +228,34 @@ impl RsDataset {
         self.inner.init_score().map(|s| s.to_vec().into_pyarray(py))
     }
 
-    /// Replace a metadata field. Boosters already created from this dataset
-    /// keep the previous values.
+    /// Query boundaries (`num_queries + 1` offsets), like upstream's `group` field.
+    fn get_group<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<i32>>> {
+        self.inner.metadata.query_boundaries.as_ref().map(|b| b.clone().into_pyarray(py))
+    }
+
+    /// Dense position ids, like upstream's `position` field.
+    fn get_position<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<i32>>> {
+        self.inner.metadata.positions.as_ref().map(|p| p.clone().into_pyarray(py))
+    }
+
+    /// Replace a metadata field and return upstream's warnings. Boosters
+    /// already created from this dataset keep the previous values.
     #[pyo3(signature = (name, values=None))]
-    fn set_field(&mut self, name: &str, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    fn set_field(&mut self, name: &str, values: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
         let n = self.inner.num_data();
         let ds = Arc::make_mut(&mut self.inner);
+        let mut warnings = Vec::new();
         match name {
+            "group" => {
+                let a: Option<PyReadonlyArray1<'_, i32>> = values.map(|o| o.extract()).transpose()?;
+                let v = a.as_ref().map(|a| slice_of(a, "group")).transpose()?;
+                ds.metadata.set_query(n, v).map_err(core_err)?;
+            }
+            "position" => {
+                let a: Option<PyReadonlyArray1<'_, i32>> = values.map(|o| o.extract()).transpose()?;
+                let v = a.as_ref().map(|a| slice_of(a, "position")).transpose()?;
+                warnings = ds.metadata.set_position(n, v).map_err(core_err)?;
+            }
             "label" => {
                 let a: PyReadonlyArray1<'_, f32> = values
                     .ok_or_else(|| PyValueError::new_err("label cannot be None"))?
@@ -258,7 +279,7 @@ impl RsDataset {
                 )));
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 }
 

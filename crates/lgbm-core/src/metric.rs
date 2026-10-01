@@ -1,13 +1,17 @@
 //! Evaluation metrics.
 //!
-//! upstream: src/metric/regression_metric.hpp, src/metric/binary_metric.hpp.
+//! upstream: src/metric/regression_metric.hpp, src/metric/binary_metric.hpp,
+//! src/metric/multiclass_metric.hpp, src/metric/rank_metric.hpp,
+//! src/metric/map_metric.hpp.
 
 use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Metadata;
+use crate::dcg::{self, DcgCalculator};
 use crate::error::{LgbmError, Result};
 use crate::objective::Objective;
 use crate::objective::regression::safe_log;
+use crate::threading::resolve_num_threads;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
@@ -27,6 +31,8 @@ pub enum MetricKind {
     Auc,
     MultiLogloss,
     MultiError,
+    Ndcg,
+    Map,
 }
 
 impl MetricKind {
@@ -48,6 +54,8 @@ impl MetricKind {
             "auc" => MetricKind::Auc,
             "multi_logloss" => MetricKind::MultiLogloss,
             "multi_error" => MetricKind::MultiError,
+            "ndcg" => MetricKind::Ndcg,
+            "map" => MetricKind::Map,
             other => return Err(LgbmError::Unsupported(format!("metric={other}"))),
         })
     }
@@ -70,12 +78,39 @@ impl MetricKind {
             MetricKind::Auc => "auc",
             MetricKind::MultiLogloss => "multi_logloss",
             MetricKind::MultiError => "multi_error",
+            MetricKind::Ndcg => "ndcg",
+            MetricKind::Map => "map",
         }
     }
 
     pub fn higher_better(&self) -> bool {
-        matches!(self, MetricKind::Auc)
+        matches!(self, MetricKind::Auc | MetricKind::Ndcg | MetricKind::Map)
     }
+}
+
+/// Query data of the NDCG / MAP metrics.
+#[derive(Debug, Clone)]
+struct RankEval {
+    eval_at: Vec<i32>,
+    boundaries: Vec<i32>,
+    query_weights: Option<Vec<f32>>,
+    sum_query_weights: f64,
+    /// NDCG: inverse max DCG per query and `eval_at` (-1 when the query has
+    /// no relevant document).
+    inverse_max_dcgs: Vec<Vec<f64>>,
+    dcg: Option<DcgCalculator>,
+    /// MAP: rows with label > 0.5 per query.
+    npos_per_query: Vec<i32>,
+    num_threads: usize,
+}
+
+/// upstream: libgomp's `schedule(static)` partition of `n` iterations.
+fn omp_static_chunks(n: usize, threads: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let (q, r) = (n / threads, n % threads);
+    (0..threads).map(move |t| {
+        let start = t * q + t.min(r);
+        start..start + q + (t < r) as usize
+    })
 }
 
 /// Loss parameters read by the regression metrics.
@@ -91,11 +126,12 @@ struct LossParams {
 #[derive(Debug, Clone)]
 pub struct Metric {
     pub kind: MetricKind,
-    name: String,
+    names: Vec<String>,
     label: Vec<f32>,
     weight: Option<Vec<f32>>,
     sum_weights: f64,
     params: LossParams,
+    rank: Option<RankEval>,
 }
 
 /// upstream `MultiErrorMetric::LossOnPoint` / `MultiSoftmaxLoglossMetric::LossOnPoint`.
@@ -118,6 +154,26 @@ fn multiclass_loss(kind: MetricKind, p: LossParams, label: f32, rec: &[f64]) -> 
             if rec[k] > K_EPSILON { -rec[k].ln() } else { -K_EPSILON.ln() }
         }
         _ => unreachable!("not a multiclass metric"),
+    }
+}
+
+/// upstream `MapMetric::CalMapAtK`.
+fn map_at_k(ks: &[i32], npos: i32, label: &[f32], score: &[f64], out: &mut [f64]) {
+    let sorted = dcg::sort_by_score_desc(score);
+    let mut num_hit = 0i32;
+    let mut sum_ap = 0.0f64;
+    let mut left = 0usize;
+    for (o, &k) in out.iter_mut().zip(ks) {
+        let k = (k as usize).min(label.len());
+        for (j, &idx) in sorted.iter().enumerate().take(k).skip(left) {
+            if label[idx] > 0.5 {
+                num_hit += 1;
+                // (j + 1.0f) is evaluated in float
+                sum_ap += num_hit as f64 / (j as f32 + 1.0f32) as f64;
+            }
+        }
+        *o = if npos > 0 { sum_ap / npos.min(k as i32) as f64 } else { 1.0 };
+        left = k;
     }
 }
 
@@ -196,21 +252,96 @@ impl Metric {
             rho: cfg.tweedie_variance_power,
             multi_error_top_k: cfg.multi_error_top_k,
         };
-        let name = match kind {
-            MetricKind::MultiError if cfg.multi_error_top_k != 1 => format!("multi_error@{}", cfg.multi_error_top_k),
-            _ => kind.name().to_string(),
+        let (names, rank) = match kind {
+            MetricKind::Ndcg | MetricKind::Map => {
+                let (names, rank) = Self::rank_init(kind, meta, cfg)?;
+                (names, Some(rank))
+            }
+            MetricKind::MultiError if cfg.multi_error_top_k != 1 => {
+                (vec![format!("multi_error@{}", cfg.multi_error_top_k)], None)
+            }
+            _ => (vec![kind.name().to_string()], None),
         };
-        Ok(Self { kind, name, label: meta.label.clone(), weight: meta.weight.clone(), sum_weights, params })
+        Ok(Self { kind, names, label: meta.label.clone(), weight: meta.weight.clone(), sum_weights, params, rank })
     }
 
-    /// Name reported with the value (e.g. `multi_error@2`).
-    pub fn name(&self) -> &str {
-        &self.name
+    /// upstream `NDCGMetric` / `MapMetric` constructor and `Init`.
+    fn rank_init(kind: MetricKind, meta: &Metadata, cfg: &Config) -> Result<(Vec<String>, RankEval)> {
+        let eval_at = dcg::default_eval_at(&cfg.eval_at)?;
+        let prefix = if kind == MetricKind::Ndcg { "ndcg@" } else { "map@" };
+        let names = eval_at.iter().map(|k| format!("{prefix}{k}")).collect();
+        let mut dcg_calc = None;
+        if kind == MetricKind::Ndcg {
+            let c = DcgCalculator::new(dcg::default_label_gain(&cfg.label_gain));
+            dcg::check_metadata(meta)?;
+            c.check_label(&meta.label)?;
+            dcg_calc = Some(c);
+        }
+        let boundaries = meta.query_boundaries.clone().ok_or_else(|| {
+            LgbmError::InvalidData(
+                if kind == MetricKind::Ndcg {
+                    "The NDCG metric requires query information"
+                } else {
+                    "For MAP metric, there should be query information"
+                }
+                .into(),
+            )
+        })?;
+        let nq = boundaries.len() - 1;
+        let query_weights = meta.query_weights.clone();
+        let sum_query_weights = match &query_weights {
+            None => nq as f64,
+            Some(w) => {
+                let mut s = 0.0f64;
+                for &x in w.iter().take(nq) {
+                    s += x as f64;
+                }
+                s
+            }
+        };
+        let rows = |q: usize| &meta.label[boundaries[q] as usize..boundaries[q + 1] as usize];
+        let mut inverse_max_dcgs = Vec::new();
+        let mut npos_per_query = Vec::new();
+        match &dcg_calc {
+            Some(c) => {
+                inverse_max_dcgs = (0..nq)
+                    .map(|q| {
+                        let mut v = vec![0.0f64; eval_at.len()];
+                        c.max_dcg(&eval_at, rows(q), &mut v);
+                        for x in v.iter_mut() {
+                            *x = if *x > 0.0 { 1.0 / *x } else { -1.0 };
+                        }
+                        v
+                    })
+                    .collect();
+            }
+            None => {
+                npos_per_query = (0..nq).map(|q| rows(q).iter().filter(|&&l| l > 0.5).count() as i32).collect();
+            }
+        }
+        let rank = RankEval {
+            eval_at,
+            boundaries,
+            query_weights,
+            sum_query_weights,
+            inverse_max_dcgs,
+            dcg: dcg_calc,
+            npos_per_query,
+            num_threads: resolve_num_threads(cfg.num_threads),
+        };
+        Ok((names, rank))
     }
 
-    /// Evaluate on raw scores (class-major, `num_data * num_outputs` entries).
-    pub fn eval(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
-        match self.kind {
+    /// Names reported with the values (e.g. `multi_error@2`, `ndcg@1`...).
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Evaluate on raw scores (class-major, `num_data * num_outputs` entries);
+    /// one value per [`names`](Self::names) entry.
+    pub fn eval(&self, score: &[f64], objective: Option<&Objective>) -> Vec<f64> {
+        let v = match self.kind {
+            MetricKind::Ndcg | MetricKind::Map => return self.rank_eval(score),
             MetricKind::Auc => self.auc(score),
             MetricKind::BinaryLogloss | MetricKind::BinaryError => self.binary(score, objective),
             MetricKind::MultiLogloss | MetricKind::MultiError => self.multiclass(score, objective),
@@ -223,7 +354,63 @@ impl Metric {
                     _ => s / self.sum_weights,
                 }
             }
+        };
+        vec![v]
+    }
+
+    /// upstream `NDCGMetric::Eval` / `MapMetric::Eval`. NDCG reproduces the
+    /// per-thread partial sums of OpenMP `schedule(static)`; MAP uses
+    /// `schedule(guided)`, whose partition is only reproducible with one
+    /// thread, so it is summed in query order.
+    fn rank_eval(&self, score: &[f64]) -> Vec<f64> {
+        let r = self.rank.as_ref().expect("ranking metric state");
+        let k = r.eval_at.len();
+        let nq = r.boundaries.len() - 1;
+        let threads = if self.kind == MetricKind::Ndcg { r.num_threads } else { 1 };
+        let mut buffers = vec![vec![0.0f64; k]; threads];
+        let mut tmp = vec![0.0f64; k];
+        for (buf, range) in buffers.iter_mut().zip(omp_static_chunks(nq, threads)) {
+            for q in range {
+                let (s, e) = (r.boundaries[q] as usize, r.boundaries[q + 1] as usize);
+                // stale query weights (see `Metadata::query_weights`) may be short
+                let qw = r.query_weights.as_ref().map(|w| w.get(q).map_or(0.0, |&x| x as f64));
+                match &r.dcg {
+                    Some(c) => {
+                        if r.inverse_max_dcgs[q][0] <= 0.0 {
+                            for b in buf.iter_mut() {
+                                *b += 1.0;
+                            }
+                            continue;
+                        }
+                        c.dcg(&r.eval_at, &self.label[s..e], &score[s..e], &mut tmp);
+                        for j in 0..k {
+                            buf[j] += match qw {
+                                None => tmp[j] * r.inverse_max_dcgs[q][j],
+                                Some(w) => tmp[j] * r.inverse_max_dcgs[q][j] * w,
+                            };
+                        }
+                    }
+                    None => {
+                        map_at_k(&r.eval_at, r.npos_per_query[q], &self.label[s..e], &score[s..e], &mut tmp);
+                        for j in 0..k {
+                            buf[j] += match qw {
+                                None => tmp[j],
+                                Some(w) => tmp[j] * w,
+                            };
+                        }
+                    }
+                }
+            }
         }
+        (0..k)
+            .map(|j| {
+                let mut v = 0.0f64;
+                for b in &buffers {
+                    v += b[j];
+                }
+                v / r.sum_query_weights
+            })
+            .collect()
     }
 
     fn binary(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
@@ -337,7 +524,7 @@ mod tests {
     use super::*;
 
     fn meta(label: Vec<f32>) -> Metadata {
-        Metadata { label, weight: None, init_score: None }
+        Metadata { label, weight: None, init_score: None, ..Default::default() }
     }
 
     fn metric(kind: MetricKind, md: &Metadata) -> Metric {
@@ -347,8 +534,8 @@ mod tests {
     #[test]
     fn auc_perfect_and_ties() {
         let m = metric(MetricKind::Auc, &meta(vec![0.0, 0.0, 1.0, 1.0]));
-        assert_eq!(m.eval(&[0.1, 0.2, 0.8, 0.9], None), 1.0);
-        assert_eq!(m.eval(&[0.5, 0.5, 0.5, 0.5], None), 0.5);
+        assert_eq!(m.eval(&[0.1, 0.2, 0.8, 0.9], None)[0], 1.0);
+        assert_eq!(m.eval(&[0.5, 0.5, 0.5, 0.5], None)[0], 0.5);
     }
 
     #[test]
@@ -356,14 +543,14 @@ mod tests {
         let md = meta(vec![1.0, 2.0]);
         let l2 = metric(MetricKind::L2, &md);
         let rmse = metric(MetricKind::Rmse, &md);
-        assert_eq!(l2.eval(&[2.0, 4.0], None), 2.5);
-        assert_eq!(rmse.eval(&[2.0, 4.0], None), 2.5f64.sqrt());
+        assert_eq!(l2.eval(&[2.0, 4.0], None)[0], 2.5);
+        assert_eq!(rmse.eval(&[2.0, 4.0], None)[0], 2.5f64.sqrt());
     }
 
     #[test]
     fn logloss_clamps() {
         let m = metric(MetricKind::BinaryLogloss, &meta(vec![1.0]));
-        assert_eq!(m.eval(&[0.0], None), -K_EPSILON.ln());
+        assert_eq!(m.eval(&[0.0], None)[0], -K_EPSILON.ln());
     }
 
     #[test]
@@ -371,13 +558,47 @@ mod tests {
         let md = meta(vec![1.0, 3.0]);
         let s = [2.0, 2.0];
         // alpha = 0.9 by default
-        assert!((metric(MetricKind::Quantile, &md).eval(&s, None) - (0.1 * 1.0 + 0.9 * 1.0) / 2.0).abs() < 1e-15);
+        assert!((metric(MetricKind::Quantile, &md).eval(&s, None)[0] - (0.1 * 1.0 + 0.9 * 1.0) / 2.0).abs() < 1e-15);
         // |diff| = 1 > alpha: alpha * (1 - alpha / 2)
-        assert!((metric(MetricKind::Huber, &md).eval(&s, None) - 0.9 * (1.0 - 0.45)).abs() < 1e-15);
-        assert_eq!(metric(MetricKind::Mape, &md).eval(&s, None), (1.0 + 1.0 / 3.0) / 2.0);
+        assert!((metric(MetricKind::Huber, &md).eval(&s, None)[0] - 0.9 * (1.0 - 0.45)).abs() < 1e-15);
+        assert_eq!(metric(MetricKind::Mape, &md).eval(&s, None)[0], (1.0 + 1.0 / 3.0) / 2.0);
         // gamma deviance sums (no averaging): 2 * sum(y/s - ln(y/s) - 1)
-        let gd = metric(MetricKind::GammaDeviance, &md).eval(&[1.0, 3.0], None);
+        let gd = metric(MetricKind::GammaDeviance, &md).eval(&[1.0, 3.0], None)[0];
         assert!(gd.abs() < 1e-8);
         assert!(Metric::new(MetricKind::Gamma, &meta(vec![1.0, 0.0]), &Config::default()).is_err());
+    }
+
+    fn grouped(label: Vec<f32>, counts: &[i32]) -> Metadata {
+        let n = label.len();
+        let mut m = meta(label);
+        m.set_query(n, Some(counts)).unwrap();
+        m
+    }
+
+    #[test]
+    fn ndcg_and_map_values() {
+        let cfg = Config::from_pairs([("eval_at", "2,1"), ("num_threads", "3")]).unwrap();
+        // query 0 ranks the relevant row second; query 1 has no relevant rows
+        let md = grouped(vec![0.0, 1.0, 0.0, 0.0], &[2, 2]);
+        let ndcg = Metric::new(MetricKind::Ndcg, &md, &cfg).unwrap();
+        assert_eq!(ndcg.names(), &["ndcg@1".to_string(), "ndcg@2".to_string()]);
+        let s = [1.0, 0.0, 0.0, 0.0];
+        let v = ndcg.eval(&s, None);
+        assert_eq!(v, vec![(0.0 + 1.0) / 2.0, (1.0 / 3f64.log2() + 1.0) / 2.0]);
+        let map = Metric::new(MetricKind::Map, &md, &cfg).unwrap();
+        assert_eq!(map.names(), &["map@1".to_string(), "map@2".to_string()]);
+        assert_eq!(map.eval(&s, None), vec![(0.0 + 1.0) / 2.0, (0.5 + 1.0) / 2.0]);
+        let e = Metric::new(MetricKind::Ndcg, &meta(vec![0.0]), &cfg).unwrap_err();
+        assert!(e.to_string().contains("The NDCG metric requires query information"));
+        let e = Metric::new(MetricKind::Map, &meta(vec![0.0]), &cfg).unwrap_err();
+        assert!(e.to_string().contains("For MAP metric, there should be query information"));
+    }
+
+    #[test]
+    fn omp_static_partition() {
+        let parts: Vec<_> = omp_static_chunks(7, 3).collect();
+        assert_eq!(parts, vec![0..3, 3..5, 5..7]);
+        let parts: Vec<_> = omp_static_chunks(2, 4).collect();
+        assert_eq!(parts, vec![0..1, 1..2, 2..2, 2..2]);
     }
 }

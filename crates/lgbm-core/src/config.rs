@@ -95,7 +95,9 @@ const HONORED: &[&str] = &[
     "tweedie_variance_power", "multi_error_top_k", "bagging_fraction", "bagging_freq",
     "pos_bagging_fraction", "neg_bagging_fraction", "bagging_seed", "feature_fraction",
     "feature_fraction_bynode", "feature_fraction_seed", "extra_trees", "extra_seed",
-    "data_sample_strategy", "top_rate", "other_rate",
+    "data_sample_strategy", "top_rate", "other_rate", "objective_seed",
+    "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
+    "lambdarank_position_bias_regularization", "eval_at",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -107,14 +109,12 @@ const NO_EFFECT: &[&str] = &[
     "header", "label_column", "weight_column", "group_column", "ignore_column",
     "save_binary", "precise_float_parser", "two_round", "pre_partition",
     // Seeds only matter when the corresponding sampler is enabled (gated separately).
-    "drop_seed", "objective_seed",
+    "drop_seed",
     // Only read by non-CPU devices / multi-machine learners, which are gated via
     // device_type / num_machines / tree_learner.
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
     "local_listen_port", "time_out", "machine_list_filename", "machines",
-    // Objective-specific knobs of objectives that are gated via `objective`.
-    "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
-    "lambdarank_position_bias_regularization", "eval_at",
+    // Only read by the auc_mu metric, which is gated via `metric`.
     "auc_mu_weights",
     // DART knobs are inert unless boosting selects it (gated).
     "drop_rate", "max_drop", "skip_drop", "xgboost_dart_mode", "uniform_drop",
@@ -129,11 +129,11 @@ const NO_EFFECT: &[&str] = &[
 
 pub const SUPPORTED_OBJECTIVES: &[&str] = &[
     "regression", "regression_l1", "huber", "fair", "poisson", "quantile", "mape", "gamma", "tweedie",
-    "binary", "multiclass", "multiclassova",
+    "binary", "multiclass", "multiclassova", "lambdarank", "rank_xendcg",
 ];
 pub const SUPPORTED_METRICS: &[&str] = &[
     "l2", "rmse", "l1", "quantile", "huber", "fair", "poisson", "mape", "gamma", "gamma_deviance",
-    "tweedie", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error",
+    "tweedie", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error", "ndcg", "map",
 ];
 
 /// upstream: include/LightGBM/config.h `ParseObjectiveAlias`.
@@ -174,6 +174,27 @@ pub fn parse_metric_alias(t: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// upstream: utils/common.h `Split(str, ',')` (empty tokens are dropped).
+fn split_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(',').filter(|t| !t.is_empty())
+}
+
+/// upstream: utils/common.h `Atoi` (leading spaces, sign, digits; stops at
+/// the first other character).
+fn atoi(s: &str) -> i32 {
+    let b = s.trim_start_matches(' ').as_bytes();
+    let (neg, digits) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    let mut v: i32 = 0;
+    for &c in digits.iter().take_while(|c| c.is_ascii_digit()) {
+        v = v.wrapping_mul(10).wrapping_add((c - b'0') as i32);
+    }
+    if neg { v.wrapping_neg() } else { v }
 }
 
 /// upstream: src/io/config.cpp `ParseMetrics` (split on ',', alias, dedupe in order).
@@ -335,6 +356,13 @@ pub struct Config {
     pub tweedie_variance_power: f64,
     pub num_class: i32,
     pub multi_error_top_k: i32,
+    pub lambdarank_truncation_level: i32,
+    pub lambdarank_norm: bool,
+    /// Empty means `2^i - 1` (filled by the ranking objective / metric).
+    pub label_gain: Vec<f64>,
+    pub lambdarank_position_bias_regularization: f64,
+    /// Sorted; empty means `1..=5`.
+    pub eval_at: Vec<i32>,
     pub saved_feature_importance_type: i32,
     pub is_provide_training_metric: bool,
     /// Canonical key -> value string as supplied (after alias resolution).
@@ -402,6 +430,11 @@ impl Default for Config {
             tweedie_variance_power: 1.5,
             num_class: 1,
             multi_error_top_k: 1,
+            lambdarank_truncation_level: 30,
+            lambdarank_norm: true,
+            label_gain: Vec::new(),
+            lambdarank_position_bias_regularization: 0.0,
+            eval_at: Vec::new(),
             saved_feature_importance_type: 0,
             is_provide_training_metric: false,
             explicit: BTreeMap::new(),
@@ -627,6 +660,24 @@ impl Config {
         set_f64!(tweedie_variance_power);
         set_int!(num_class);
         set_int!(multi_error_top_k);
+        set_int!(lambdarank_truncation_level);
+        set_bool!(lambdarank_norm);
+        set_f64!(lambdarank_position_bias_regularization);
+        if let Some(v) = p.get("label_gain") {
+            // upstream: Common::StringToArray<double> (std::stod per token)
+            self.label_gain = split_tokens(v)
+                .map(|t| {
+                    crate::fmt::parse_f64(t.trim()).ok_or_else(|| {
+                        LgbmError::InvalidParameter(format!("cannot parse label_gain value `{t}`"))
+                    })
+                })
+                .collect::<Result<_>>()?;
+        }
+        if let Some(v) = p.get("eval_at") {
+            // upstream: Common::StringToArray<int> (Atoi per token), sorted in Config::Set
+            self.eval_at = split_tokens(v).map(atoi).collect();
+            self.eval_at.sort();
+        }
         set_int!(saved_feature_importance_type);
         set_bool!(is_provide_training_metric);
 
@@ -776,6 +827,12 @@ impl Config {
             "poisson_max_delta_step" => g(self.poisson_max_delta_step),
             "tweedie_variance_power" => g(self.tweedie_variance_power),
             "num_class" => self.num_class.to_string(),
+            "lambdarank_truncation_level" => self.lambdarank_truncation_level.to_string(),
+            "lambdarank_norm" => b(self.lambdarank_norm),
+            // upstream: Common::Join (precision digits10 + 2)
+            "label_gain" => self.label_gain.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(","),
+            "lambdarank_position_bias_regularization" => g(self.lambdarank_position_bias_regularization),
+            "eval_at" => self.eval_at.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
             "saved_feature_importance_type" => self.saved_feature_importance_type.to_string(),
             _ => return self.explicit.get(name).cloned(),
         })

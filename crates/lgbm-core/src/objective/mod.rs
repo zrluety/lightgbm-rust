@@ -16,6 +16,7 @@
 pub mod binary;
 pub mod multiclass;
 pub mod percentile;
+pub mod rank;
 pub mod regression;
 
 use crate::config::Config;
@@ -417,6 +418,8 @@ pub fn create_objective(cfg: &Config) -> Result<Option<Objective>> {
         "binary" => Ok(Some(Objective::Row(Box::new(binary::BinaryLogloss::new(cfg)?)))),
         "multiclass" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassSoftmax::new(cfg))))),
         "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::new(cfg)?)))),
+        "lambdarank" => Ok(Some(Objective::Row(Box::new(rank::LambdarankNdcg::new(cfg)?)))),
+        "rank_xendcg" => Ok(Some(Objective::Row(Box::new(rank::RankXendcg::new(cfg))))),
         "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("objective={other}"))),
     }
@@ -444,6 +447,8 @@ pub fn objective_from_model_string(s: &str) -> Result<Option<Objective>> {
         }
         "multiclass" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassSoftmax::for_prediction(&rest)?)))),
         "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::for_prediction(&rest)?)))),
+        "lambdarank" => Ok(Some(Objective::Row(Box::new(rank::RankingForPrediction("lambdarank"))))),
+        "rank_xendcg" => Ok(Some(Objective::Row(Box::new(rank::RankingForPrediction("rank_xendcg"))))),
         "" | "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("loading model with objective={other}"))),
     }

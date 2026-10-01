@@ -509,31 +509,34 @@ impl Gbdt {
         } else {
             st.metrics.clone()
         };
-        metrics
-            .iter()
-            .map(|m| {
-                (
-                    "training".to_string(),
-                    m.name().to_string(),
-                    m.eval(&st.scores, self.objective.as_ref()),
-                    m.kind.higher_better(),
-                )
-            })
-            .collect()
+        let mut out = Vec::new();
+        for m in &metrics {
+            self.push_evals(&mut out, "training", m, &st.scores);
+        }
+        out
+    }
+
+    fn push_evals(&self, out: &mut Vec<EvalResult>, data_name: &str, m: &Metric, scores: &[f64]) {
+        for (name, v) in m.names().iter().zip(m.eval(scores, self.objective.as_ref())) {
+            out.push((data_name.to_string(), name.clone(), v, m.kind.higher_better()));
+        }
     }
 
     /// Evaluate the built-in metrics on every validation set.
     pub fn eval_valid(&self) -> Vec<EvalResult> {
+        self.eval_valid_marked().into_iter().map(|(e, _)| e).collect()
+    }
+
+    /// [`eval_valid`](Self::eval_valid), each result flagged when it comes
+    /// from its set's first metric.
+    fn eval_valid_marked(&self) -> Vec<(EvalResult, bool)> {
         let Some(st) = self.train.as_ref() else { return Vec::new() };
         let mut out = Vec::new();
         for v in &st.valid {
-            for m in &v.metrics {
-                out.push((
-                    v.name.clone(),
-                    m.name().to_string(),
-                    m.eval(&v.scores, self.objective.as_ref()),
-                    m.kind.higher_better(),
-                ));
+            for (j, m) in v.metrics.iter().enumerate() {
+                let mut evals = Vec::new();
+                self.push_evals(&mut evals, &v.name, m, &v.scores);
+                out.extend(evals.into_iter().map(|e| (e, j == 0)));
             }
         }
         out
@@ -549,7 +552,7 @@ impl Gbdt {
     }
 
     /// Train up to `num_iterations` with optional early stopping on the
-    /// first validation set's metrics (upstream `GBDT::Train` semantics with
+    /// validation sets' metrics (upstream `GBDT::Train` semantics with
     /// `early_stopping_round`). Returns the best iteration (1-based) when
     /// early stopping triggered, else 0.
     pub fn train(&mut self) -> Result<usize> {
@@ -564,17 +567,19 @@ impl Gbdt {
             if rounds == 0 {
                 continue;
             }
-            let evals = self.eval_valid();
+            let evals = self.eval_valid_marked();
             if evals.is_empty() {
                 continue;
             }
             let iter = self.current_iteration();
             if best.is_empty() {
-                best = evals.iter().map(|e| if e.3 { f64::NEG_INFINITY } else { f64::INFINITY }).collect();
+                best = evals.iter().map(|(e, _)| if e.3 { f64::NEG_INFINITY } else { f64::INFINITY }).collect();
                 best_iter = vec![0; evals.len()];
             }
-            let limit = if cfg.first_metric_only { 1 } else { evals.len() };
-            for (j, e) in evals.iter().enumerate().take(limit) {
+            for (j, (e, first)) in evals.iter().enumerate() {
+                if cfg.first_metric_only && !first {
+                    continue;
+                }
                 let improved = if e.3 {
                     e.2 > best[j] + cfg.early_stopping_min_delta
                 } else {

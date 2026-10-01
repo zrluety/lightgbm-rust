@@ -121,13 +121,22 @@ impl BinColumn {
     }
 }
 
-/// Labels, weights, and initial scores.
+/// Labels, weights, initial scores, and ranking query/position data.
 #[derive(Debug, Clone, Default)]
 pub struct Metadata {
     pub label: Vec<f32>,
     pub weight: Option<Vec<f32>>,
     /// Class-major (`k * num_data + i`), like upstream.
     pub init_score: Option<Vec<f64>>,
+    /// `num_queries + 1` row offsets (upstream `query_boundaries_`).
+    pub query_boundaries: Option<Vec<i32>>,
+    /// Mean row weight per query. Like upstream, these are only recomputed
+    /// when both weights and queries are set, so they can be stale.
+    pub query_weights: Option<Vec<f32>>,
+    /// Dense position id of each row (first-seen order).
+    pub positions: Option<Vec<i32>>,
+    /// Raw position value of each dense id, as a string.
+    pub position_ids: Vec<String>,
 }
 
 /// upstream: `Common::AvoidInf(float)`.
@@ -183,7 +192,93 @@ impl Metadata {
             }
             Some(w) => Some(w.iter().map(|&v| avoid_inf_f32(v)).collect()),
         };
+        if self.weight.is_some() {
+            self.calculate_query_weights();
+        }
         Ok(())
+    }
+
+    /// upstream: `Metadata::SetQuery`; `counts` are the query sizes.
+    pub fn set_query(&mut self, num_data: usize, counts: Option<&[i32]>) -> Result<()> {
+        let counts = match counts {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                self.query_boundaries = None;
+                return Ok(());
+            }
+        };
+        let sum: i64 = counts.iter().map(|&c| c as i64).sum();
+        if sum != num_data as i64 {
+            // upstream passes the arguments in this order
+            return Err(LgbmError::InvalidData(format!(
+                "Sum of query counts ({num_data}) differs from the length of #data ({sum})"
+            )));
+        }
+        let mut b = Vec::with_capacity(counts.len() + 1);
+        b.push(0i32);
+        for &c in counts {
+            b.push(b[b.len() - 1] + c);
+        }
+        self.query_boundaries = Some(b);
+        self.calculate_query_weights();
+        Ok(())
+    }
+
+    /// upstream: `Metadata::SetPosition`. Returns upstream's warnings.
+    pub fn set_position(&mut self, num_data: usize, positions: Option<&[i32]>) -> Result<Vec<String>> {
+        let positions = match positions {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                self.positions = None;
+                // upstream keeps the ids, which would make the ranking
+                // objectives read a missing position array
+                self.position_ids.clear();
+                return Ok(Vec::new());
+            }
+        };
+        if positions.len() != num_data {
+            return Err(LgbmError::InvalidData(format!(
+                "Positions size ({}) doesn't match data size ({num_data})",
+                positions.len()
+            )));
+        }
+        let mut warnings = Vec::new();
+        if self.positions.is_some() {
+            warnings.push("Overwriting positions in dataset.".to_string());
+        }
+        let mut ids = std::collections::HashMap::new();
+        self.position_ids.clear();
+        let mut dense = Vec::with_capacity(num_data);
+        for &p in positions {
+            let next = ids.len() as i32;
+            let id = *ids.entry(p).or_insert_with(|| {
+                self.position_ids.push(p.to_string());
+                next
+            });
+            dense.push(id);
+        }
+        self.positions = Some(dense);
+        Ok(warnings)
+    }
+
+    /// upstream: `Metadata::CalculateQueryWeights`.
+    fn calculate_query_weights(&mut self) {
+        let (Some(w), Some(b)) = (&self.weight, &self.query_boundaries) else { return };
+        let qw = b
+            .windows(2)
+            .map(|q| {
+                let mut s = 0.0f32;
+                for &x in &w[q[0] as usize..q[1] as usize] {
+                    s += x;
+                }
+                s / (q[1] - q[0]) as f32
+            })
+            .collect();
+        self.query_weights = Some(qw);
+    }
+
+    pub fn num_queries(&self) -> usize {
+        self.query_boundaries.as_ref().map_or(0, |b| b.len() - 1)
     }
 
     /// upstream: `Metadata::SetInitScore`.
@@ -389,6 +484,11 @@ impl Dataset {
                 label: pick_f32(&self.metadata.label),
                 weight: self.metadata.weight.as_deref().map(pick_f32),
                 init_score,
+                // upstream iterates over the new Metadata's `num_queries_`,
+                // which is still 0, so a grouped fullset yields `[0]` until
+                // the caller sets the groups (the Python package does)
+                query_boundaries: self.metadata.query_boundaries.as_ref().map(|_| vec![0]),
+                ..Default::default()
             },
             feature_names: self.feature_names.clone(),
             warnings: Vec::new(),

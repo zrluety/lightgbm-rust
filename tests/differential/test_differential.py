@@ -7,6 +7,8 @@ tests/tolerances.toml (see its rationale entries).
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import lightgbm as lgb_up
 import numpy as np
@@ -576,6 +578,172 @@ def test_arrow_inputs(case, frame, recorder):
                 up.predict(valid, raw_score=True))
     rec.compare("pred_leaf[holdout table]", "tree_structure", rs.predict(valid, pred_leaf=True),
                 up.predict(valid, pred_leaf=True))
+    rec.finish()
+
+
+# --------------------------------------------------------------------------- ranking
+
+
+@dataclass
+class RankCase:
+    name: str
+    objective: str
+    params: Dict[str, Any]
+    X: np.ndarray
+    y: np.ndarray
+    group: np.ndarray
+    Xv: np.ndarray
+    yv: np.ndarray
+    groupv: np.ndarray
+    weight: Optional[np.ndarray] = None
+    position: Optional[np.ndarray] = None
+    positionv: Optional[np.ndarray] = None
+    rounds: int = 30
+
+    @property
+    def full_params(self) -> Dict[str, Any]:
+        return {"objective": self.objective, **DETERMINISTIC, **self.params}
+
+
+def make_rank_case(name: str, objective: str, params: Dict[str, Any], *, n_queries: int = 150,
+                   weighted: bool = False, positions: bool = False, seed: int = 0, rounds: int = 30,
+                   max_label: int = 4) -> RankCase:
+    """Graded relevance 0..max_label from the features; query sizes 1..39; the first query has no relevant rows.
+
+    With `positions`, each row gets a display position within its query and relevance is hidden
+    (set to 0) more often at deep positions, i.e. position-biased labels.
+    """
+    rng = np.random.default_rng(seed)
+
+    def part(nq):
+        sizes = rng.integers(1, 40, size=nq)
+        n = int(sizes.sum())
+        X = rng.normal(size=(n, 6))
+        f = np.tanh(X[:, 0]) * 2 + 0.5 * X[:, 1] - 0.3 * X[:, 2] * (X[:, 0] > 0)
+        rel = np.clip(np.round(f + rng.normal(scale=0.7, size=n) + 1), 0, max_label)
+        rel[: sizes[0]] = 0
+        pos = None
+        if positions:
+            pos = np.concatenate([rng.permutation(s) for s in sizes]).astype(np.int32)
+            rel = np.where(rng.random(n) < 1 / (1 + 0.3 * pos), rel, 0)
+        return X, rel, sizes, pos
+
+    X, y, g, pos = part(n_queries)
+    Xv, yv, gv, posv = part(n_queries // 3)
+    w = rng.uniform(0.2, 3.0, size=len(y)) if weighted else None
+    return RankCase(name, objective, params, X, y, g, Xv, yv, gv, w, pos, posv, rounds)
+
+
+RANK_CASES = [
+    make_rank_case("rank_basic", "lambdarank", {}),
+    make_rank_case("rank_weighted", "lambdarank", {"metric": ["ndcg", "map"]}, weighted=True, seed=1),
+    make_rank_case("rank_eval_at_gain", "lambdarank",
+                   {"eval_at": [10, 1, 3], "label_gain": [0, 1, 2, 5, 9.5], "lambdarank_truncation_level": 5,
+                    "lambdarank_norm": False, "metric": ["map", "ndcg"]}, seed=2),
+    make_rank_case("rank_sigmoid", "lambdarank", {"sigmoid": 2.0, "learning_rate": 0.2}, seed=3),
+    make_rank_case("rank_position", "lambdarank", {"lambdarank_position_bias_regularization": 0.1},
+                   positions=True, seed=4),
+    make_rank_case("rank_position_unregularized", "lambdarank", {}, positions=True, weighted=True, seed=5),
+    make_rank_case("rank_bagging", "lambdarank", {"bagging_fraction": 0.7, "bagging_freq": 1, "num_leaves": 15},
+                   seed=6),
+    make_rank_case("xendcg_basic", "rank_xendcg", {}, seed=7),
+    make_rank_case("xendcg_seeded_weighted", "rank_xendcg", {"objective_seed": 11, "metric": ["map"]},
+                   weighted=True, seed=8),
+    make_rank_case("xendcg_alias_seed", "xendcg", {"seed": 3, "eval_at": [2, 4]}, seed=9),
+]
+
+
+def _rank_datasets(mod, case: RankCase):
+    train = mod.Dataset(case.X, label=case.y, group=case.group, weight=case.weight, position=case.position,
+                        free_raw_data=False)
+    valid = train.create_valid(case.Xv, label=case.yv, group=case.groupv, position=case.positionv)
+    return train, valid
+
+
+@pytest.mark.parametrize("case", RANK_CASES, ids=[c.name for c in RANK_CASES])
+def test_ranking(case, recorder):
+    """lambdarank / rank_xendcg training, ndcg/map metric histories, early stopping, group/position fields."""
+    rec = recorder(case.name)
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        train, valid = _rank_datasets(mod, case)
+        h = {}
+        bst = mod.train(case.full_params, train, num_boost_round=case.rounds, valid_sets=[train, valid],
+                        valid_names=["train", "valid"],
+                        callbacks=[mod.record_evaluation(h), mod.early_stopping(5, verbose=False)])
+        out[mod.__name__] = (bst, h, train)
+    (rs, h_rs, t_rs), (up, h_up, t_up) = out["lightgbm_rust"], out["lightgbm"]
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    for name, X in (("train", case.X), ("holdout", case.Xv)):
+        rec.compare(f"raw_score[{name}]", "predictions", rs.predict(X, raw_score=True), up.predict(X, raw_score=True))
+    rec.compare("leaf_index[holdout]", "tree_structure", rs.predict(case.Xv, pred_leaf=True),
+                up.predict(case.Xv, pred_leaf=True))
+    rec.compare("metric_names", "tree_structure", [sorted(h_rs.get(k, {})) for k in ("train", "valid")],
+                [sorted(h_up[k]) for k in ("train", "valid")])
+    for ds in ("train", "valid"):
+        for m in h_up[ds]:
+            rec.compare(f"{ds}.{m}[per iteration]", "metrics", h_rs.get(ds, {}).get(m, []), h_up[ds][m])
+    rec.compare("best_iteration", "tree_structure", rs.best_iteration, up.best_iteration)
+    rec.compare("get_group", "tree_structure", t_rs.get_group(), t_up.get_group())
+    rec.compare("get_field(group)", "tree_structure", t_rs.get_field("group"), t_up.get_field("group"))
+    if case.position is not None:
+        rec.compare("get_position", "tree_structure", t_rs.get_position(), t_up.get_position())
+    rec.compare("re-saved upstream model", "model_text",
+                lgb_rs.Booster(model_str=up.model_to_string()).model_to_string(), up.model_to_string())
+    rec.compare("upstream(rust model)", "predictions",
+                lgb_up.Booster(model_str=rs.model_to_string()).predict(case.Xv), rs.predict(case.Xv))
+    rec.finish()
+
+
+RANK_CV_CASES = [c for c in RANK_CASES if c.name in ("rank_basic", "rank_weighted", "xendcg_basic")]
+
+
+@pytest.mark.parametrize("case", RANK_CV_CASES, ids=[c.name for c in RANK_CV_CASES])
+def test_ranking_cv_and_subset(case, recorder):
+    """cv() group folds (GroupKFold) and Dataset.subset group recomputation."""
+    rec = recorder(case.name)
+
+    def run(mod):
+        ds = mod.Dataset(case.X, label=case.y, group=case.group, weight=case.weight, free_raw_data=False)
+        r = mod.cv(case.full_params, ds, num_boost_round=15, nfold=3, eval_train_metric=True, return_cvbooster=True)
+        cvb = r.pop("cvbooster")
+        # whole queries from the middle of the data
+        bounds = np.concatenate([[0], np.cumsum(case.group)])
+        idx = list(range(int(bounds[10]), int(bounds[40])))
+        sub = ds.subset(idx).construct()
+        sub_model = mod.train(case.full_params, sub, num_boost_round=5)
+        return r, cvb, sub, sub_model
+
+    (r_rs, b_rs, s_rs, m_rs), (r_up, b_up, s_up, m_up) = run(lgb_rs), run(lgb_up)
+    rec.compare("result keys", "tree_structure", list(r_rs), list(r_up))
+    for k in r_up:
+        rec.compare(f"cv[{k}]", "metrics", r_rs.get(k, []), r_up[k])
+    rec.compare("fold models", "model_text", b_rs.model_to_string(), b_up.model_to_string())
+    rec.compare("subset get_group", "tree_structure", s_rs.get_group(), s_up.get_group())
+    rec.compare("subset model", "model_text", m_rs.model_to_string(), m_up.model_to_string())
+    rec.finish()
+
+
+RANK_MT_CASES = [c for c in RANK_CASES if c.name in ("rank_basic", "rank_weighted", "rank_eval_at_gain", "xendcg_basic")]
+
+
+@pytest.mark.parametrize("case", RANK_MT_CASES, ids=[c.name for c in RANK_MT_CASES])
+def test_ranking_multithread(case, recorder):
+    """num_threads=4 on both engines; NDCG reproduces OpenMP's static per-thread partial sums.
+
+    MAP is excluded: upstream sums it with schedule(guided), whose partition is not reproducible.
+    """
+    rec = recorder(case.name)
+    params = {**case.full_params, "num_threads": 4, "metric": ["ndcg"]}
+    hist = {}
+    models = []
+    for mod in (lgb_rs, lgb_up):
+        train, valid = _rank_datasets(mod, case)
+        h = hist.setdefault(mod.__name__, {})
+        models.append(mod.train(params, train, num_boost_round=case.rounds, valid_sets=[valid],
+                                callbacks=[mod.record_evaluation(h)]))
+    rec.compare("model_text", "model_text", models[0].model_to_string(), models[1].model_to_string())
+    rec.compare("valid_0[per iteration]", "metrics", hist["lightgbm_rust"], hist["lightgbm"])
     rec.finish()
 
 

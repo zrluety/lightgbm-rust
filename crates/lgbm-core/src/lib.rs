@@ -17,6 +17,7 @@ pub mod boosting;
 pub mod config;
 pub mod consts;
 pub mod dataset;
+pub mod dcg;
 pub mod error;
 pub mod feature_groups;
 pub mod fmt;

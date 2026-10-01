@@ -64,10 +64,10 @@ fn l2_matches_finite_differences() {
     let label = vec![0.5f32, -1.0, 2.0, 3.25];
     let weight = vec![1.0f32, 0.5, 2.0, 1.5];
     let scores = [0.1, 0.2, -0.3, 4.0];
-    let meta = Metadata { label: label.clone(), weight: None, init_score: None };
+    let meta = Metadata { label: label.clone(), weight: None, init_score: None, ..Default::default() };
     let mut o = regression_obj(&[("objective", "regression")]);
     check_row_objective(&mut o, &meta, &scores, |i, s| l2_loss(s, label[i] as f64, 1.0));
-    let meta_w = Metadata { label: label.clone(), weight: Some(weight.clone()), init_score: None };
+    let meta_w = Metadata { label: label.clone(), weight: Some(weight.clone()), init_score: None, ..Default::default() };
     let mut o = regression_obj(&[("objective", "regression")]);
     check_row_objective(&mut o, &meta_w, &scores, |i, s| l2_loss(s, label[i] as f64, weight[i] as f64));
 }
@@ -112,6 +112,7 @@ fn regression_losses_match_finite_differences() {
                 label: label.clone(),
                 weight: weighted.then(|| weight.clone()),
                 init_score: None,
+                ..Default::default()
             };
             let w = |i: usize| if weighted { weight[i] as f64 } else { 1.0 };
             check_row_objective_with(&mut o, &meta, &scores, |i, s| w(i) * loss(s, label[i] as f64), check_hess);
@@ -121,7 +122,7 @@ fn regression_losses_match_finite_differences() {
 
 #[test]
 fn regression_boost_from_score_and_renew() {
-    let meta = Metadata { label: vec![1.0, 5.0, 2.0, 9.0, 3.0], weight: None, init_score: None };
+    let meta = Metadata { label: vec![1.0, 5.0, 2.0, 9.0, 3.0], weight: None, init_score: None, ..Default::default() };
     let mut l1 = regression_obj(&[("objective", "l1")]);
     l1.init(&meta, 5).unwrap();
     assert_eq!(l1.boost_from_score(0), 3.0);
@@ -135,10 +136,10 @@ fn regression_boost_from_score_and_renew() {
     let mut out = [0.0];
     p.convert_output(&[1.0], &mut out);
     assert_eq!(out[0], 1.0f64.exp());
-    let bad = Metadata { label: vec![1.0, -1.0], weight: None, init_score: None };
+    let bad = Metadata { label: vec![1.0, -1.0], weight: None, init_score: None, ..Default::default() };
     let e = regression_obj(&[("objective", "gamma")]).init(&bad, 2).unwrap_err();
     assert!(e.to_string().contains("[gamma]: at least one target label is negative"), "{e}");
-    let zero = Metadata { label: vec![0.0, 0.0], weight: None, init_score: None };
+    let zero = Metadata { label: vec![0.0, 0.0], weight: None, init_score: None, ..Default::default() };
     assert!(regression_obj(&[("objective", "tweedie")]).init(&zero, 2).is_err());
     let cfg = Config::from_pairs([("objective", "quantile"), ("alpha", "1.5")]);
     assert!(cfg.is_err() || regression::Regression::new(&cfg.unwrap()).is_err());
@@ -151,7 +152,7 @@ fn binary_matches_finite_differences() {
     let scores = [0.1, -2.0, 0.7, 3.0, 0.0];
     for sigmoid in [1.0, 0.5, 2.0] {
         let cfg = Config::from_pairs([("objective", "binary"), ("sigmoid", &sigmoid.to_string())]).unwrap();
-        let meta = Metadata { label: label.clone(), weight: Some(weight.clone()), init_score: None };
+        let meta = Metadata { label: label.clone(), weight: Some(weight.clone()), init_score: None, ..Default::default() };
         let mut o = binary::BinaryLogloss::new(&cfg).unwrap();
         check_row_objective(&mut o, &meta, &scores, |i, s| {
             logloss(s, label[i] as f64, weight[i] as f64, sigmoid)
@@ -162,7 +163,7 @@ fn binary_matches_finite_differences() {
 #[test]
 fn binary_boost_from_score_is_logit_of_mean() {
     let cfg = Config::from_pairs([("objective", "binary")]).unwrap();
-    let meta = Metadata { label: vec![1.0, 0.0, 0.0, 0.0], weight: None, init_score: None };
+    let meta = Metadata { label: vec![1.0, 0.0, 0.0, 0.0], weight: None, init_score: None, ..Default::default() };
     let mut o = binary::BinaryLogloss::new(&cfg).unwrap();
     o.init(&meta, 4).unwrap();
     assert!((o.boost_from_score(0) - (0.25f64 / 0.75).ln()).abs() < 1e-15);
@@ -171,7 +172,7 @@ fn binary_boost_from_score_is_logit_of_mean() {
 #[test]
 fn binary_single_class_needs_no_training() {
     let cfg = Config::from_pairs([("objective", "binary")]).unwrap();
-    let meta = Metadata { label: vec![1.0; 3], weight: None, init_score: None };
+    let meta = Metadata { label: vec![1.0; 3], weight: None, init_score: None, ..Default::default() };
     let mut o = binary::BinaryLogloss::new(&cfg).unwrap();
     o.init(&meta, 3).unwrap();
     assert!(!o.class_need_train(0));
@@ -188,7 +189,7 @@ fn multiclass_softmax_matches_finite_differences() {
     let cfg = Config::from_pairs([("objective", "multiclass"), ("num_class", "3")]).unwrap();
     let factor = 3.0 / 2.0;
     for w in [None, Some(weight.clone())] {
-        let meta = Metadata { label: label.clone(), weight: w.clone(), init_score: None };
+        let meta = Metadata { label: label.clone(), weight: w.clone(), init_score: None, ..Default::default() };
         let mut o = multiclass::MulticlassSoftmax::new(&cfg);
         o.init(&meta, n).unwrap();
         let mut g = vec![0.0f32; n * k];
@@ -211,12 +212,12 @@ fn multiclass_softmax_matches_finite_differences() {
         }
     }
     // init scores are log class priors; a class absent from the labels is not trained
-    let meta = Metadata { label: vec![0.0, 0.0, 2.0, 0.0], weight: None, init_score: None };
+    let meta = Metadata { label: vec![0.0, 0.0, 2.0, 0.0], weight: None, init_score: None, ..Default::default() };
     let mut o = multiclass::MulticlassSoftmax::new(&cfg);
     o.init(&meta, 4).unwrap();
     assert_eq!(o.boost_from_score(0), 0.75f64.ln());
     assert!(!o.class_need_train(1) && o.class_need_train(0));
-    let bad = Metadata { label: vec![0.0, 3.0], weight: None, init_score: None };
+    let bad = Metadata { label: vec![0.0, 3.0], weight: None, init_score: None, ..Default::default() };
     let err = multiclass::MulticlassSoftmax::new(&cfg).init(&bad, 2).unwrap_err();
     assert!(err.to_string().contains("Label must be in [0, 3), but found 3 in label"));
 }
@@ -227,7 +228,7 @@ fn multiclass_ova_is_per_class_binary() {
     let n = label.len();
     let scores = vec![0.1, -1.0, 0.5, 2.0, 0.3, 0.0, -0.2, 1.0, -0.4, 0.8, 0.9, -1.5];
     let cfg = Config::from_pairs([("objective", "multiclassova"), ("num_class", "3")]).unwrap();
-    let meta = Metadata { label: label.clone(), weight: None, init_score: None };
+    let meta = Metadata { label: label.clone(), weight: None, init_score: None, ..Default::default() };
     let mut o = multiclass::MulticlassOva::new(&cfg).unwrap();
     o.init(&meta, n).unwrap();
     let mut g = vec![0.0f32; 3 * n];
@@ -236,7 +237,7 @@ fn multiclass_ova_is_per_class_binary() {
     for c in 0..3 {
         let y: Vec<f32> = label.iter().map(|&l| (l as usize == c) as i32 as f32).collect();
         let mut b = binary::BinaryLogloss::new(&Config::from_pairs([("objective", "binary")]).unwrap()).unwrap();
-        b.init(&Metadata { label: y, weight: None, init_score: None }, n).unwrap();
+        b.init(&Metadata { label: y, weight: None, init_score: None, ..Default::default() }, n).unwrap();
         let (mut bg, mut bh) = (vec![0.0f32; n], vec![0.0f32; n]);
         b.gradients(ScoreView { scores: &scores[c * n..(c + 1) * n], num_data: n, num_outputs: 1 }, &mut bg, &mut bh);
         assert_eq!(&g[c * n..(c + 1) * n], &bg[..]);
@@ -308,7 +309,7 @@ impl GroupedObjective for CoupledSquares {
 #[test]
 fn grouped_objective_block_hessian_matches_finite_differences() {
     let groups = GroupIndex::from_sizes(&[3, 2]).unwrap();
-    let meta = Metadata { label: vec![1.0, 2.0, 0.0, -1.0, 0.5], weight: None, init_score: None };
+    let meta = Metadata { label: vec![1.0, 2.0, 0.0, -1.0, 0.5], weight: None, init_score: None, ..Default::default() };
     let mut o = CoupledSquares { c: 0.7, label: vec![], how: DiagonalReduction::GershgorinBound };
     o.init(&meta, &groups).unwrap();
     let scores = vec![0.3, -0.2, 1.0, 0.0, 2.0];
@@ -352,7 +353,7 @@ fn grouped_objective_block_hessian_matches_finite_differences() {
 #[test]
 fn grouped_objective_drives_objective_enum() {
     let groups = GroupIndex::from_sizes(&[2, 2]).unwrap();
-    let meta = Metadata { label: vec![1.0, 2.0, 3.0, 4.0], weight: None, init_score: None };
+    let meta = Metadata { label: vec![1.0, 2.0, 3.0, 4.0], weight: None, init_score: None, ..Default::default() };
     let mut obj = Objective::Grouped {
         objective: Box::new(CoupledSquares { c: 1.0, label: vec![], how: DiagonalReduction::GershgorinBound }),
         groups,
