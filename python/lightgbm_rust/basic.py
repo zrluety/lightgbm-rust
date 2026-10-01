@@ -1264,11 +1264,142 @@ class Booster:
         self.__set_objective_to_none = False
         return self
 
-    def dump_model(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        raise _unsupported("Booster.dump_model() (JSON dump)")
+    def dump_model(
+        self,
+        num_iteration: Optional[int] = None,
+        start_iteration: int = 0,
+        importance_type: str = "split",
+        object_hook: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Dump Booster to JSON format (same contract as ``lightgbm.Booster.dump_model``)."""
+        if num_iteration is None:
+            num_iteration = self.best_iteration
+        importance_type_int = _IMPORTANCE[importance_type]
+        assert self._rs is not None
+        text = self._rs.dump_model(int(start_iteration), int(num_iteration), importance_type_int)
+        ret = json.loads(text, object_hook=object_hook)
+        ret["pandas_categorical"] = json.loads(json.dumps(self.pandas_categorical, default=_json_default_with_numpy))
+        return ret
 
     def trees_to_dataframe(self) -> Any:
-        raise _unsupported("Booster.trees_to_dataframe()")
+        """Parse the fitted model into a pandas DataFrame (port of upstream ``trees_to_dataframe``)."""
+        try:
+            from pandas import DataFrame as pd_DataFrame  # noqa: PLC0415
+        except ImportError:
+            raise LightGBMError(
+                "This method cannot be run without pandas installed. "
+                "You must install pandas and restart your session to use this method."
+            ) from None
+
+        if self.num_trees() == 0:
+            raise LightGBMError("There are no trees in this Booster and thus nothing to parse")
+
+        def _is_split_node(tree: Dict[str, Any]) -> bool:
+            return "split_index" in tree.keys()
+
+        def create_node_record(
+            tree: Dict[str, Any],
+            node_depth: int = 1,
+            tree_index: Optional[int] = None,
+            feature_names: Optional[List[str]] = None,
+            parent_node: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            def _get_node_index(tree: Dict[str, Any], tree_index: Optional[int]) -> str:
+                tree_num = f"{tree_index}-" if tree_index is not None else ""
+                is_split = _is_split_node(tree)
+                node_type = "S" if is_split else "L"
+                # if a single node tree it won't have `leaf_index` so return 0
+                node_num = tree.get("split_index" if is_split else "leaf_index", 0)
+                return f"{tree_num}{node_type}{node_num}"
+
+            def _get_split_feature(*, tree: Dict[str, Any], feature_names: Optional[List[str]]) -> Optional[str]:
+                if _is_split_node(tree):
+                    if feature_names is not None:
+                        feature_name = feature_names[tree["split_feature"]]
+                    else:
+                        feature_name = tree["split_feature"]
+                else:
+                    feature_name = None
+                return feature_name
+
+            def _is_single_node_tree(tree: Dict[str, Any]) -> bool:
+                return set(tree.keys()) == {"leaf_value", "leaf_count"}
+
+            node: Dict[str, Union[int, str, None]] = OrderedDict()
+            node["tree_index"] = tree_index
+            node["node_depth"] = node_depth
+            node["node_index"] = _get_node_index(tree, tree_index)
+            node["left_child"] = None
+            node["right_child"] = None
+            node["parent_index"] = parent_node
+            node["split_feature"] = _get_split_feature(tree=tree, feature_names=feature_names)
+            node["split_gain"] = None
+            node["threshold"] = None
+            node["decision_type"] = None
+            node["missing_direction"] = None
+            node["missing_type"] = None
+            node["value"] = None
+            node["weight"] = None
+            node["count"] = None
+
+            if _is_split_node(tree):
+                node["left_child"] = _get_node_index(tree["left_child"], tree_index)
+                node["right_child"] = _get_node_index(tree["right_child"], tree_index)
+                node["split_gain"] = tree["split_gain"]
+                node["threshold"] = tree["threshold"]
+                node["decision_type"] = tree["decision_type"]
+                node["missing_direction"] = "left" if tree["default_left"] else "right"
+                node["missing_type"] = tree["missing_type"]
+                node["value"] = tree["internal_value"]
+                node["weight"] = tree["internal_weight"]
+                node["count"] = tree["internal_count"]
+            else:
+                node["value"] = tree["leaf_value"]
+                if not _is_single_node_tree(tree):
+                    node["weight"] = tree["leaf_weight"]
+                    node["count"] = tree["leaf_count"]
+
+            return node
+
+        def tree_dict_to_node_list(
+            tree: Dict[str, Any],
+            node_depth: int = 1,
+            tree_index: Optional[int] = None,
+            feature_names: Optional[List[str]] = None,
+            parent_node: Optional[str] = None,
+        ) -> List[Dict[str, Any]]:
+            node = create_node_record(
+                tree=tree,
+                node_depth=node_depth,
+                tree_index=tree_index,
+                feature_names=feature_names,
+                parent_node=parent_node,
+            )
+            res = [node]
+            if _is_split_node(tree):
+                for child in ["left_child", "right_child"]:
+                    res.extend(
+                        tree_dict_to_node_list(
+                            tree=tree[child],
+                            node_depth=node_depth + 1,
+                            tree_index=tree_index,
+                            feature_names=feature_names,
+                            parent_node=node["node_index"],
+                        )
+                    )
+            return res
+
+        model_dict = self.dump_model()
+        feature_names = model_dict["feature_names"]
+        model_list = []
+        for tree in model_dict["tree_info"]:
+            model_list.extend(
+                tree_dict_to_node_list(
+                    tree=tree["tree_structure"], tree_index=tree["tree_index"], feature_names=feature_names
+                )
+            )
+
+        return pd_DataFrame(model_list, columns=model_list[0].keys())
 
     def refit(self, *args: Any, **kwargs: Any) -> "Booster":
         raise _unsupported("Booster.refit()")
@@ -1292,10 +1423,20 @@ class Booster:
         return result
 
     def lower_bound(self) -> float:
-        raise _unsupported("Booster.lower_bound()")
+        """Sum over trees of the smallest leaf value (upstream ``GBDT::GetLowerBoundValue``)."""
+        assert self._rs is not None
+        total = 0.0
+        for t in self._rs.tree_arrays():
+            total += min(t["leaf_value"])
+        return total
 
     def upper_bound(self) -> float:
-        raise _unsupported("Booster.upper_bound()")
+        """Sum over trees of the largest leaf value (upstream ``GBDT::GetUpperBoundValue``)."""
+        assert self._rs is not None
+        total = 0.0
+        for t in self._rs.tree_arrays():
+            total += max(t["leaf_value"])
+        return total
 
     # ---- lightgbm-rust extensions (used by differential tests)
 
@@ -1306,6 +1447,16 @@ class Booster:
     def _last_gradients(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         assert self._rs is not None
         return self._rs.last_gradients()
+
+
+def _json_default_with_numpy(obj: Any) -> Any:
+    """Convert numpy classes to JSON serializable objects."""
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
+        return obj.item()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
 
 
 def _dump_pandas_categorical(pandas_categorical: Optional[List[List]]) -> str:

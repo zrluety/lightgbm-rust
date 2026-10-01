@@ -53,6 +53,95 @@ pub fn parse_f64(s: &str) -> Option<f64> {
     }
 }
 
+/// upstream: utils/common.h `Pow(T base, int power)` (its multiplication order
+/// determines the rounding of [`atof_legacy`]).
+fn pow_legacy(base: f64, power: i32) -> f64 {
+    if power < 0 {
+        1.0 / pow_legacy(base, -power)
+    } else if power == 0 {
+        1.0
+    } else if power % 2 == 0 {
+        pow_legacy(base * base, power / 2)
+    } else if power % 3 == 0 {
+        pow_legacy(base * base * base, power / 3)
+    } else {
+        base * pow_legacy(base, power - 1)
+    }
+}
+
+/// upstream: utils/common.h `Common::Atof`, the legacy, not correctly rounded
+/// parser that `StringToArrayFast` uses for some model fields (`split_gain`,
+/// `internal_value`, `internal_weight`, `shrinkage`). Kept bit-for-bit so
+/// loaded models hold the same doubles as upstream's.
+pub fn atof_legacy(token: &str) -> Option<f64> {
+    let b = token.trim_matches(' ').as_bytes();
+    let mut p = 0;
+    let mut sign = 1.0;
+    if p < b.len() && b[p] == b'-' {
+        sign = -1.0;
+        p += 1;
+    } else if p < b.len() && b[p] == b'+' {
+        p += 1;
+    }
+    let is_num = p < b.len() && (b[p].is_ascii_digit() || matches!(b[p], b'.' | b'e' | b'E'));
+    if !is_num {
+        return match std::str::from_utf8(&b[p..]).ok()?.to_ascii_lowercase().as_str() {
+            "na" | "nan" | "null" => Some(f64::NAN),
+            "inf" | "infinity" => Some(sign * 1e308),
+            _ => None,
+        };
+    }
+    let mut value = 0.0f64;
+    while p < b.len() && b[p].is_ascii_digit() {
+        value = value * 10.0 + (b[p] - b'0') as f64;
+        p += 1;
+    }
+    if p < b.len() && b[p] == b'.' {
+        let mut right = 0.0f64;
+        let mut nn = 0;
+        p += 1;
+        while p < b.len() && b[p].is_ascii_digit() {
+            right = (b[p] - b'0') as f64 + right * 10.0;
+            nn += 1;
+            p += 1;
+        }
+        value += right / pow_legacy(10.0, nn);
+    }
+    let mut frac = false;
+    let mut scale = 1.0f64;
+    if p < b.len() && matches!(b[p], b'e' | b'E') {
+        p += 1;
+        if p < b.len() && b[p] == b'-' {
+            frac = true;
+            p += 1;
+        } else if p < b.len() && b[p] == b'+' {
+            p += 1;
+        }
+        let mut expon: u32 = 0;
+        while p < b.len() && b[p].is_ascii_digit() {
+            expon = expon.wrapping_mul(10).wrapping_add((b[p] - b'0') as u32);
+            p += 1;
+        }
+        expon = expon.min(308);
+        while expon >= 50 {
+            scale *= 1e50;
+            expon -= 50;
+        }
+        while expon >= 8 {
+            scale *= 1e8;
+            expon -= 8;
+        }
+        while expon > 0 {
+            scale *= 10.0;
+            expon -= 1;
+        }
+    }
+    if p != b.len() {
+        return None;
+    }
+    Some(sign * if frac { value / scale } else { value * scale })
+}
+
 #[cfg(test)]
 mod atof_tests {
     //! Ported from upstream tests/cpp_tests/test_common.cpp (`AtofPreciseTest`).
@@ -174,6 +263,17 @@ mod tests {
         assert_eq!(fmt_g17(0.1), "0.10000000000000001");
         assert_eq!(fmt_g17(1e-35_f32 as f64), "1.0000000180025095e-35");
         assert_eq!(fmt_g17(f64::INFINITY), "inf");
+    }
+
+    #[test]
+    fn legacy_atof_matches_upstream_rounding() {
+        // values observed from upstream 4.7.0 after loading a model text
+        assert_eq!(atof_legacy("9.53084e-05"), Some(9.530839999999999e-05));
+        assert_eq!(atof_legacy("-1.39281"), Some(-1.3928099999999999));
+        assert_eq!(atof_legacy("0.5"), Some(0.5));
+        assert_eq!(atof_legacy("-inf"), Some(-1e308));
+        assert!(atof_legacy("nan").unwrap().is_nan());
+        assert_eq!(atof_legacy("1x"), None);
     }
 
     #[test]

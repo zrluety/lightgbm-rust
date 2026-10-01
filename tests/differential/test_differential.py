@@ -399,6 +399,49 @@ def test_multithread(case, recorder):
     rec.finish()
 
 
+def _split_internal(obj, path=""):
+    """Flatten a dump_model dict into (exact items, internal_value/internal_weight values)."""
+    exact, internal = [], []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("internal_value", "internal_weight"):
+                internal.append(v)
+            else:
+                e, i = _split_internal(v, f"{path}.{k}")
+                exact += e
+                internal += i
+    elif isinstance(obj, list):
+        for j, v in enumerate(obj):
+            e, i = _split_internal(v, f"{path}[{j}]")
+            exact += e
+            internal += i
+    else:
+        exact.append(f"{path}={obj!r}")
+    return exact, internal
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_ids())
+def test_dump_model(case, recorder):
+    """JSON dump_model and trees_to_dataframe, for trained models and for the same loaded upstream model."""
+    rec = recorder(case.name)
+    rs, up = train_both(case, valid=False)
+    e_rs, i_rs = _split_internal(rs.dump_model())
+    e_up, i_up = _split_internal(up.dump_model())
+    rec.compare("dump_model (trained, all but internal_*)", "model_text", "\n".join(e_rs), "\n".join(e_up))
+    rec.compare("dump_model internal_value/weight (trained)", "leaf_value", i_rs, i_up)
+    text = up.model_to_string()
+    b_rs, b_up = lgb_rs.Booster(model_str=text), lgb_up.Booster(model_str=text)
+    rec.compare("dump_model (loaded upstream model)", "model_text", repr(b_rs.dump_model()), repr(b_up.dump_model()))
+    rec.compare("dump_model(num_iteration=3, start_iteration=2, gain) (loaded)", "model_text",
+                repr(b_rs.dump_model(3, 2, "gain")), repr(b_up.dump_model(3, 2, "gain")))
+    df_rs = lgb_rs.Booster(model_str=text).trees_to_dataframe()
+    df_up = lgb_up.Booster(model_str=text).trees_to_dataframe()
+    rec.compare("trees_to_dataframe (loaded upstream model)", "model_text", df_rs.to_csv(), df_up.to_csv())
+    rec.compare("lower/upper bound", "predictions", [rs.lower_bound(), rs.upper_bound()],
+                [up.lower_bound(), up.upper_bound()])
+    rec.finish()
+
+
 CV_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
                                            "bin_init_score")]
 

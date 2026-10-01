@@ -3,7 +3,9 @@
 //! upstream: src/boosting/gbdt_model_text.cpp, src/io/tree.cpp.
 
 use crate::boosting::Gbdt;
+use crate::dataset::avoid_inf_f64;
 use crate::error::{LgbmError, Result};
+use crate::fmt::{fmt_g17, parse_f64};
 use crate::tree::Tree;
 
 impl Gbdt {
@@ -71,6 +73,66 @@ impl Gbdt {
             s.push('\n');
             s.push_str("end of parameters\n");
         }
+        Ok(s)
+    }
+
+    /// upstream: `GBDT::DumpModel` (JSON).
+    pub fn dump_model(&self, start_iteration: i32, num_iteration: i32, importance_type: i32) -> Result<String> {
+        let ntpi = self.num_tree_per_iteration;
+        let mut s = String::from("{");
+        s.push_str("\"name\":\"tree\",\n\"version\":\"v4\",\n");
+        s.push_str(&format!("\"num_class\":{},\n", self.num_class));
+        s.push_str(&format!("\"num_tree_per_iteration\":{ntpi},\n"));
+        s.push_str(&format!("\"label_index\":{},\n", self.label_index));
+        s.push_str(&format!("\"max_feature_idx\":{},\n", self.max_feature_idx));
+        if let Some(o) = &self.objective {
+            s.push_str(&format!("\"objective\":\"{}\",\n", o.to_model_string()));
+        }
+        s.push_str("\"average_output\":false,\n");
+        s.push_str(&format!("\"feature_names\":[\"{}\"],\n", self.feature_names.join("\",\"")));
+        s.push_str("\"monotone_constraints\":[],\n");
+        let mut infos = Vec::new();
+        for (name, info) in self.feature_names.iter().zip(&self.feature_infos) {
+            let Some(range) = info.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+                if info != "none" {
+                    return Err(LgbmError::Unsupported("categorical features".into()));
+                }
+                continue;
+            };
+            let (lo, hi) = range
+                .split_once(':')
+                .ok_or_else(|| LgbmError::ModelFormat(format!("bad feature_infos entry {info}")))?;
+            let parse = |v: &str| {
+                parse_f64(v).ok_or_else(|| LgbmError::ModelFormat(format!("bad feature_infos entry {info}")))
+            };
+            infos.push(format!(
+                "\"{name}\":{{\"min_value\":{},\"max_value\":{},\"values\":[]}}",
+                fmt_g17(avoid_inf_f64(parse(lo)?)),
+                fmt_g17(avoid_inf_f64(parse(hi)?))
+            ));
+        }
+        s.push_str(&format!("\"feature_infos\":{{{}}},\n", infos.join(",")));
+
+        let mut num_used = self.models.len();
+        let total_iter = num_used / ntpi;
+        let start_iteration = (start_iteration.max(0) as usize).min(total_iter);
+        if num_iteration > 0 {
+            num_used = num_used.min((start_iteration + num_iteration as usize) * ntpi);
+        }
+        let start_model = start_iteration * ntpi;
+        let trees: Vec<String> = (start_model..num_used)
+            .map(|i| format!("{{\"tree_index\":{i},{}}}", self.models[i].to_json()))
+            .collect();
+        s.push_str(&format!("\"tree_info\":[{}],\n", trees.join(",")));
+
+        let imp = self.feature_importance(num_iteration, importance_type)?;
+        let pairs: Vec<String> = imp
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| v as usize > 0)
+            .map(|(i, &v)| format!("\"{}\":{}", self.feature_names[i], v as usize))
+            .collect();
+        s.push_str(&format!("\n\"feature_importances\":{{{}}}\n}}\n", pairs.join(",")));
         Ok(s)
     }
 

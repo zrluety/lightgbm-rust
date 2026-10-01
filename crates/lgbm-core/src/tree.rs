@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::binning::MissingType;
 use crate::consts::K_ZERO_THRESHOLD;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, avoid_inf_f32, avoid_inf_f64};
 use crate::error::{LgbmError, Result};
 use crate::fmt::{fmt_g6, fmt_g17};
 
@@ -324,6 +324,63 @@ impl Tree {
         s
     }
 
+    /// upstream: `Tree::ToJSON` (stream precision 17, i.e. `%.17g`).
+    pub fn to_json(&self) -> String {
+        let mut s = format!(
+            "\"num_leaves\":{},\n\"num_cat\":0,\n\"shrinkage\":{},\n",
+            self.num_leaves,
+            fmt_g17(self.shrinkage)
+        );
+        if self.num_leaves == 1 {
+            s.push_str(&format!(
+                "\"tree_structure\":{{\"leaf_value\":{}, \n\"leaf_count\":{}}}\n",
+                fmt_g17(self.leaf_value[0]),
+                self.leaf_count[0]
+            ));
+        } else {
+            s.push_str("\"tree_structure\":");
+            self.node_to_json(0, &mut s);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// upstream: `Tree::NodeToJSON`.
+    fn node_to_json(&self, index: i32, s: &mut String) {
+        if index >= 0 {
+            let i = index as usize;
+            let missing = match self.missing_type(i) {
+                0 => "None",
+                1 => "Zero",
+                _ => "NaN",
+            };
+            s.push_str(&format!(
+                "{{\n\"split_index\":{index},\n\"split_feature\":{},\n\"split_gain\":{},\n\"threshold\":{},\n\
+                 \"decision_type\":\"<=\",\n\"default_left\":{},\n\"missing_type\":\"{missing}\",\n\
+                 \"internal_value\":{},\n\"internal_weight\":{},\n\"internal_count\":{},\n\"left_child\":",
+                self.split_feature[i],
+                fmt_g17(avoid_inf_f32(self.split_gain[i]) as f64),
+                fmt_g17(avoid_inf_f64(self.threshold[i])),
+                self.default_left(i),
+                fmt_g17(self.internal_value[i]),
+                fmt_g17(self.internal_weight[i]),
+                self.internal_count[i],
+            ));
+            self.node_to_json(self.left_child[i], s);
+            s.push_str(",\n\"right_child\":");
+            self.node_to_json(self.right_child[i], s);
+            s.push_str("\n}");
+        } else {
+            let leaf = !index as usize;
+            s.push_str(&format!(
+                "{{\n\"leaf_index\":{leaf},\n\"leaf_value\":{},\n\"leaf_weight\":{},\n\"leaf_count\":{}\n}}",
+                fmt_g17(self.leaf_value[leaf]),
+                fmt_g17(self.leaf_weight.get(leaf).copied().unwrap_or(0.0)),
+                self.leaf_count[leaf],
+            ));
+        }
+    }
+
     /// Parse a tree block (the lines after `Tree=i`) as produced by upstream
     /// `Tree::ToString`. Returns the tree and the number of bytes consumed.
     pub fn from_model_str(text: &str) -> Result<(Self, usize)> {
@@ -380,6 +437,17 @@ impl Tree {
             }
             Ok(v)
         }
+        // upstream: StringToArrayFast (legacy Common::Atof)
+        fn arr_f64_legacy(s: &str, n: usize, name: &str) -> Result<Vec<f64>> {
+            let v: Vec<f64> = s
+                .split_whitespace()
+                .map(|t| crate::fmt::atof_legacy(t).ok_or_else(|| LgbmError::ModelFormat(format!("bad value {t:?} in {name}"))))
+                .collect::<Result<_>>()?;
+            if v.len() != n {
+                return Err(LgbmError::ModelFormat(format!("{name} has {} values, expected {n}", v.len())));
+            }
+            Ok(v)
+        }
         let num_leaves: usize = need(&kv, "num_leaves")?
             .trim()
             .parse()
@@ -399,7 +467,7 @@ impl Tree {
         let mut t = Tree::new(n);
         t.num_leaves = n;
         t.leaf_value = arr_f64(need(&kv, "leaf_value")?, n, "leaf_value")?;
-        t.shrinkage = kv.get("shrinkage").and_then(|s| crate::fmt::parse_f64(s.trim())).unwrap_or(1.0);
+        t.shrinkage = kv.get("shrinkage").and_then(|s| crate::fmt::atof_legacy(s.trim())).unwrap_or(1.0);
         t.leaf_count = match kv.get("leaf_count") {
             Some(s) => arr(s, n, "leaf_count")?,
             None => vec![0; n],
@@ -418,7 +486,7 @@ impl Tree {
             t.split_feature = arr(need(&kv, "split_feature")?, ni, "split_feature")?;
             t.threshold = arr_f64(need(&kv, "threshold")?, ni, "threshold")?;
             t.split_gain = match kv.get("split_gain") {
-                Some(s) => arr_f64(s, ni, "split_gain")?.into_iter().map(|x| x as f32).collect(),
+                Some(s) => arr_f64_legacy(s, ni, "split_gain")?.into_iter().map(|x| x as f32).collect(),
                 None => vec![0.0; ni],
             };
             t.internal_count = match kv.get("internal_count") {
@@ -426,11 +494,11 @@ impl Tree {
                 None => vec![0; ni],
             };
             t.internal_value = match kv.get("internal_value") {
-                Some(s) => arr_f64(s, ni, "internal_value")?,
+                Some(s) => arr_f64_legacy(s, ni, "internal_value")?,
                 None => vec![0.0; ni],
             };
             t.internal_weight = match kv.get("internal_weight") {
-                Some(s) => arr_f64(s, ni, "internal_weight")?,
+                Some(s) => arr_f64_legacy(s, ni, "internal_weight")?,
                 None => vec![0.0; ni],
             };
             t.decision_type = match kv.get("decision_type") {

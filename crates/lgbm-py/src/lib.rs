@@ -398,6 +398,13 @@ impl RsBooster {
         detached(py, || g.save_model_to_string(start_iteration, num_iteration, importance_type))
     }
 
+    /// upstream: `LGBM_BoosterDumpModel` (JSON text).
+    #[pyo3(signature = (start_iteration=0, num_iteration=-1, importance_type=0))]
+    fn dump_model(&self, py: Python<'_>, start_iteration: i32, num_iteration: i32, importance_type: i32) -> PyResult<String> {
+        let g = &self.inner;
+        detached(py, || g.dump_model(start_iteration, num_iteration, importance_type))
+    }
+
     #[pyo3(signature = (num_iteration=-1, importance_type=0))]
     fn feature_importance<'py>(&self, py: Python<'py>, num_iteration: i32, importance_type: i32) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let v = guarded(|| self.inner.feature_importance(num_iteration, importance_type))?;
