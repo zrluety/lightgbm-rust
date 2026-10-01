@@ -6,11 +6,12 @@
 //! piece follows.
 //!
 //! Layering (no module depends on a later one):
-//! `consts`, `error`, `fmt`, `random` -> `config` -> `binning` -> `dataset`
-//! -> `objective`, `metric` -> `tree` -> `histogram` -> `learner` ->
+//! `consts`, `error`, `fmt`, `random`, `arrow` -> `config` -> `binning` ->
+//! `dataset` -> `objective`, `metric` -> `tree` -> `histogram` -> `learner` ->
 //! `boosting` -> `predict`, `io`.
 
 pub mod array_args;
+pub mod arrow;
 pub mod binning;
 pub mod boosting;
 pub mod config;

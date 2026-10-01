@@ -17,6 +17,7 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use lgbm_core::arrow::{ArrowArrayStream, ArrowChunkedArray};
 use lgbm_core::boosting::PredictKind;
 use lgbm_core::{Config, Dataset, DatasetFields, DenseMatrix, DenseValues, Gbdt, LgbmError};
 use numpy::{
@@ -26,7 +27,7 @@ use numpy::{
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyCapsule, PyCapsuleMethods, PyDict};
 
 create_exception!(_lightgbm_rust, LightGBMError, PyException, "Error thrown by lightgbm-rust.");
 
@@ -515,6 +516,53 @@ fn dataset_update_param_checking(old: Vec<(String, String)>, new: Vec<(String, S
     guarded(|| lgbm_core::config::dataset_update_param_checking(&old, &new))
 }
 
+/// Consume the `ArrowArrayStream` in an `__arrow_c_stream__` capsule.
+fn arrow_stream(capsule: &Bound<'_, PyAny>) -> PyResult<ArrowChunkedArray> {
+    let capsule = capsule
+        .cast::<PyCapsule>()
+        .map_err(|_| PyTypeError::new_err("expected the PyCapsule returned by __arrow_c_stream__()"))?;
+    let ptr = capsule.pointer_checked(Some(c"arrow_array_stream"))?;
+    guarded(|| unsafe { ArrowChunkedArray::from_stream(ptr.as_ptr().cast::<ArrowArrayStream>()) })
+}
+
+/// A table stream as column-major float64 values: `(values, num_rows, num_columns)`.
+///
+/// upstream: c_api.cpp `DatasetCreateFromArrowChunkedArray` and
+/// `LGBM_BoosterPredictForArrowChunkedArray` read every field as double.
+#[pyfunction]
+fn arrow_table_to_columns<'py>(
+    py: Python<'py>,
+    capsule: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, usize, usize)> {
+    let table = arrow_stream(capsule)?;
+    let (values, n, ncol) = guarded(|| {
+        let ncol = table.num_fields()?;
+        let n = table.len();
+        let mut values = Vec::with_capacity(n * ncol);
+        for j in 0..ncol {
+            values.extend(table.field_values::<f64>(j)?);
+        }
+        Ok((values, n, ncol))
+    })?;
+    Ok((values.into_pyarray(py), n, ncol))
+}
+
+/// Values of a field stream as `dtype` ("float32", "float64" or "int32"); the
+/// fields of a table are concatenated (multiclass init scores).
+///
+/// upstream: metadata.cpp `SetLabel` / `SetWeights` (label_t), `SetInitScore`
+/// (double, `InitScoreView`), `SetQuery` / `SetPosition` (data_size_t).
+#[pyfunction]
+fn arrow_field_values<'py>(py: Python<'py>, capsule: &Bound<'py, PyAny>, dtype: &str) -> PyResult<Bound<'py, PyAny>> {
+    let arr = arrow_stream(capsule)?;
+    Ok(match dtype {
+        "float32" => guarded(|| arr.values::<f32>())?.into_pyarray(py).into_any(),
+        "float64" => guarded(|| arr.concatenated_values::<f64>())?.into_pyarray(py).into_any(),
+        "int32" => guarded(|| arr.values::<i32>())?.into_pyarray(py).into_any(),
+        other => return Err(PyValueError::new_err(format!("unsupported dtype {other}"))),
+    })
+}
+
 #[pymodule]
 fn _lightgbm_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("LightGBMError", m.py().get_type::<LightGBMError>())?;
@@ -526,5 +574,7 @@ fn _lightgbm_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(param_specs, m)?)?;
     m.add_function(wrap_pyfunction!(validate_params, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_update_param_checking, m)?)?;
+    m.add_function(wrap_pyfunction!(arrow_table_to_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(arrow_field_values, m)?)?;
     Ok(())
 }

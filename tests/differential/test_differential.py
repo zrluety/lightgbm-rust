@@ -520,6 +520,65 @@ def test_cv_init_model(case, recorder):
     rec.finish()
 
 
+ARROW_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_weighted", "mc_basic", "bin_init_score",
+                                              "reg_sparse")]
+
+
+def _arrow_table(pa, X):
+    """Chunked columns of mixed types: int64 with nulls, float32, float64 with nulls for NaN, and bool."""
+    cols, names = [], []
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        half = len(col) // 3
+        if j % 4 == 0:
+            ints = np.where(np.isnan(col), 0, np.round(col * 10)).astype(np.int64)
+            chunks = [pa.array(ints[:half], mask=np.isnan(col[:half])), pa.array(ints[half:], mask=np.isnan(col[half:]))]
+        elif j % 4 == 1:
+            chunks = [pa.array(col.astype(np.float32))]
+        elif j % 4 == 2:
+            chunks = [pa.array(col[:half], mask=np.isnan(col[:half])), pa.array([], type=pa.float64()),
+                      pa.array(col[half:], mask=np.isnan(col[half:]))]
+        else:
+            chunks = [pa.array(col > 0)]
+        cols.append(pa.chunked_array(chunks))
+        names.append(f"f{j}")
+    return pa.Table.from_arrays(cols, names=names)
+
+
+@pytest.mark.parametrize("frame", ["pyarrow", "polars"])
+@pytest.mark.parametrize("case", ARROW_CASES, ids=[c.name for c in ARROW_CASES])
+def test_arrow_inputs(case, frame, recorder):
+    """pyarrow Table / polars DataFrame features and Arrow label/weight/init_score, against upstream on the same input."""
+    pa = pytest.importorskip("pyarrow")
+    rec = recorder(f"{case.name}[{frame}]")
+    table, valid = _arrow_table(pa, case.X), _arrow_table(pa, case.Xv)
+    label = pa.chunked_array([pa.array(case.y[:100]), pa.array(case.y[100:])])
+    weight = None if case.weight is None else pa.chunked_array([pa.array(case.weight)])
+    init_score = case.init_score
+    if init_score is not None:
+        init_score = (pa.chunked_array([pa.array(init_score)]) if init_score.ndim == 1 else
+                      pa.Table.from_arrays([pa.array(init_score[:, k]) for k in range(init_score.shape[1])],
+                                           names=[f"k{k}" for k in range(init_score.shape[1])]))
+    if frame == "polars":
+        pl = pytest.importorskip("polars")
+        table, valid, label = pl.from_arrow(table), pl.from_arrow(valid), pl.from_arrow(label)
+        weight = None if weight is None else pl.from_arrow(weight)
+        if init_score is not None:
+            init_score = pl.from_arrow(init_score)
+
+    def run(mod):
+        ds = mod.Dataset(table, label=label, weight=weight, init_score=init_score)
+        return mod.train(case.full_params, ds, num_boost_round=case.num_boost_round)
+
+    rs, up = run(lgb_rs), run(lgb_up)
+    rec.compare("model_text", "model_text", rs.model_to_string(), up.model_to_string())
+    rec.compare("raw_score[holdout table]", "predictions", rs.predict(valid, raw_score=True),
+                up.predict(valid, raw_score=True))
+    rec.compare("pred_leaf[holdout table]", "tree_structure", rs.predict(valid, pred_leaf=True),
+                up.predict(valid, pred_leaf=True))
+    rec.finish()
+
+
 def leaf_values(b):
     return np.concatenate([np.asarray(t["leaf_value"], dtype=float) for t in _trees_of(b)])
 

@@ -20,6 +20,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
+import narwhals as nw
+import narwhals.dependencies as nwd
 import numpy as np
 
 from . import _lightgbm_rust as _rs
@@ -326,9 +328,11 @@ def _to_float_matrix(data: Any, feature_name: Any = "auto", categorical_feature:
         raise _unsupported("scipy.sparse input")
     if isinstance(data, Sequence) or (isinstance(data, list) and data and isinstance(data[0], Sequence)):
         raise _unsupported("lightgbm.Sequence input")
-    mod = type(data).__module__
-    if mod.startswith("polars") or mod.startswith("pyarrow"):
-        raise _unsupported(f"{type(data).__name__} input")
+    if _is_arrow_like_frame(data):
+        if feature_name == "auto":
+            names = list(nw.from_native(data).schema.names())
+        values, nrow, ncol = _rs.arrow_table_to_columns(nw.from_native(data).__arrow_c_stream__())
+        return values.reshape((ncol, nrow)).T, names
     if _is_pandas_df(data):
         data, names = _pandas_to_numpy(data, feature_name, categorical_feature)
     elif isinstance(data, list) and data and all(isinstance(m, np.ndarray) for m in data):
@@ -390,6 +394,52 @@ def _list_to_1d_numpy(*, data: Any, dtype: Any, name: str) -> np.ndarray:
 
 def _to_1d(data: Any, dtype: Any, name: str) -> np.ndarray:
     return _list_to_1d_numpy(data=data, dtype=dtype, name=name)
+
+
+def _is_arrow_like_frame(data: Any) -> bool:
+    """A non-pandas frame that narwhals exports through the Arrow C stream (pyarrow Table, polars DataFrame)."""
+    return nwd.is_into_dataframe(data) and not _is_pandas_df(data)
+
+
+def _is_arrow_like_field(data: Any) -> bool:
+    """upstream: the Arrow branch of ``Dataset.set_field``."""
+    return (nwd.is_into_dataframe(data) or nwd.is_into_series(data)) and not (
+        _is_pandas_df(data) or _is_pandas_series(data)
+    )
+
+
+def _arrow_field_to_numpy(data: Any, dtype: str) -> np.ndarray:
+    """upstream: ``LGBM_DatasetSetFieldFromArrowStream`` (tables are concatenated column by column)."""
+    return _rs.arrow_field_values(nw.from_native(data, allow_series=True).__arrow_c_stream__(), dtype)
+
+
+def _weight_is_all_ones(weight: Any) -> bool:
+    """upstream: ``Dataset.set_weight`` drops weights that are all one."""
+    if nwd.is_into_series(weight):
+        return bool((nw.from_native(weight, series_only=True) == 1).all())
+    return bool(np.all(weight == 1))
+
+
+def _field_1d_to_numpy(data: Any, dtype: Any, name: str) -> np.ndarray:
+    if _is_arrow_like_field(data):
+        return _arrow_field_to_numpy(data, np.dtype(dtype).name)
+    return _to_1d(data, dtype, name)
+
+
+def _label_to_numpy(label: Any) -> np.ndarray:
+    """upstream: ``Dataset.set_label`` (a one-column pandas DataFrame is accepted)."""
+    if _is_pandas_df(label):
+        if len(label.columns) > 1:
+            raise ValueError("DataFrame for label cannot have multiple columns")
+        return np.ravel(np.asarray(label, dtype=np.float32))
+    return _field_1d_to_numpy(label, np.float32, "label")
+
+
+def _init_score_to_numpy(init_score: Any) -> np.ndarray:
+    if _is_arrow_like_field(init_score):
+        return _arrow_field_to_numpy(init_score, "float64")
+    s = np.asarray(init_score, dtype=np.float64)
+    return np.ascontiguousarray(s.ravel(order="F") if s.ndim == 2 else s)
 
 
 class Sequence:
@@ -572,16 +622,13 @@ class Dataset:
             names = list(self.feature_name)
         self._has_non_default_feature_names = names is not None
         n = mat.shape[0]
-        label = np.zeros(n, dtype=np.float32) if self.label is None else _to_1d(self.label, np.float32, "label")
+        label = np.zeros(n, dtype=np.float32) if self.label is None else _label_to_numpy(self.label)
         weight = None
-        if self.weight is not None:
-            weight = _to_1d(self.weight, np.float32, "weight")
-            if np.all(weight == 1):
-                weight = None
+        if self.weight is not None and not _weight_is_all_ones(self.weight):
+            weight = _field_1d_to_numpy(self.weight, np.float32, "weight")
         init_score = None
         if self.init_score is not None:
-            s = np.asarray(self.init_score, dtype=np.float64)
-            init_score = np.ascontiguousarray(s.ravel(order="F") if s.ndim == 2 else s)
+            init_score = _init_score_to_numpy(self.init_score)
 
         ref_rs = None
         if self.reference is not None:
@@ -787,13 +834,9 @@ class Dataset:
         if self._rs is None:
             raise Exception(f"Cannot set {field_name} before construct dataset")
         if field_name in ("label", "weight"):
-            values = None if data is None else _to_1d(data, np.float32, field_name)
+            values = None if data is None else _field_1d_to_numpy(data, np.float32, field_name)
         elif field_name == "init_score":
-            if data is None:
-                values = None
-            else:
-                s = np.asarray(data, dtype=np.float64)
-                values = np.ascontiguousarray(s.ravel(order="F") if s.ndim == 2 else s)
+            values = None if data is None else _init_score_to_numpy(data)
         elif field_name in ("group", "position"):
             if data is None:
                 return self
@@ -833,7 +876,7 @@ class Dataset:
         return self
 
     def set_weight(self, weight: Any) -> "Dataset":
-        if weight is not None and np.all(np.asarray(weight) == 1):
+        if weight is not None and _weight_is_all_ones(weight):
             weight = None
         self.weight = weight
         if self._rs is not None:
@@ -910,6 +953,9 @@ class Dataset:
                     self.data = self.data.iloc[self.used_indices].copy()
                 elif isinstance(self.data, Sequence):
                     self.data = self.data[self.used_indices]
+                elif nwd.is_into_dataframe(self.data):
+                    indices = np.array(self.used_indices)
+                    self.data = nw.from_native(self.data)[indices].to_native()
                 else:
                     _log_warning(
                         f"Cannot subset {type(self.data).__name__} type of raw data.\nReturning original raw data"
