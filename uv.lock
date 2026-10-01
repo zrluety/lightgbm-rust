@@ -89,9 +89,10 @@ wheels = [
 
 [[package]]
 name = "lightgbm-rust"
-version = "0.1.0"
+version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "narwhals" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -133,6 +134,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "narwhals", specifier = ">=1.15" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
     { name = "scipy", marker = "extra == 'scipy'", specifier = ">=1.10" },
