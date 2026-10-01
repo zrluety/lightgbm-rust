@@ -134,7 +134,58 @@ impl FlatTree {
     }
 }
 
+/// Prediction early stopping: stop adding iterations to a row once its
+/// margin exceeds `margin_threshold`, checked every `round_period`
+/// iterations.
+///
+/// upstream: src/boosting/prediction_early_stop.cpp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PredictEarlyStop {
+    pub round_period: usize,
+    pub margin_threshold: f64,
+    /// Margin between the two largest raw scores (else `2 |score|`).
+    pub multiclass: bool,
+}
+
+impl PredictEarlyStop {
+    /// upstream: `CreateBinary` / `CreateMulticlass` callbacks.
+    #[inline]
+    fn should_stop(&self, raw: &[f64]) -> bool {
+        let margin = if self.multiclass {
+            let (mut a, mut b) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for &v in raw {
+                if v > a {
+                    b = a;
+                    a = v;
+                } else if v > b {
+                    b = v;
+                }
+            }
+            a - b
+        } else {
+            2.0 * raw[0].abs()
+        };
+        margin > self.margin_threshold
+    }
+}
+
 impl Gbdt {
+    /// Early stopping for a prediction, as upstream's `Predictor` sets it up:
+    /// only when requested and the objective does not need accurate
+    /// predictions (binary, multiclass, ranking).
+    pub fn prediction_early_stop(&self, enabled: bool, freq: i32, margin: f64) -> Result<Option<PredictEarlyStop>> {
+        if !enabled || self.objective.as_ref().is_none_or(|o| o.need_accurate_prediction()) {
+            return Ok(None);
+        }
+        if freq <= 0 {
+            return Err(LgbmError::InvalidParameter("Check failed: (early_stop_freq) > (0)".into()));
+        }
+        if !(margin >= 0.0) {
+            return Err(LgbmError::InvalidParameter("Check failed: (early_stop_margin) >= (0)".into()));
+        }
+        Ok(Some(PredictEarlyStop { round_period: freq as usize, margin_threshold: margin, multiclass: self.num_class != 1 }))
+    }
+
     /// upstream: `GBDT::InitPredict` iteration window.
     fn predict_window(&self, start_iteration: i32, num_iteration: i32) -> (usize, usize) {
         let total = self.models.len() / self.num_tree_per_iteration;
@@ -167,6 +218,20 @@ impl Gbdt {
         kind: PredictKind,
         start_iteration: i32,
         num_iteration: i32,
+    ) -> Result<Vec<f64>> {
+        self.predict_matrix_early_stop(mat, kind, start_iteration, num_iteration, None)
+    }
+
+    /// [`Gbdt::predict_matrix`] with optional early stopping (see
+    /// [`Gbdt::prediction_early_stop`]); it only affects Normal and Raw
+    /// predictions.
+    pub fn predict_matrix_early_stop(
+        &self,
+        mat: &Matrix<'_>,
+        kind: PredictKind,
+        start_iteration: i32,
+        num_iteration: i32,
+        early_stop: Option<PredictEarlyStop>,
     ) -> Result<Vec<f64>> {
         if kind == PredictKind::Contrib {
             return self.predict_contrib(mat, start_iteration, num_iteration);
@@ -212,13 +277,30 @@ impl Gbdt {
                         _ => {
                             let raw = &mut raw[..nb * ntpi];
                             raw.fill(0.0);
+                            let mut stopped = [false; BLOCK];
+                            let mut active = nb;
                             for it in 0..num {
                                 for k in 0..ntpi {
                                     let m = it * ntpi + k;
                                     flat[m].leaves(rows, stride, leaf);
                                     let values = &models[m].leaf_value;
                                     for r in 0..nb {
-                                        raw[r * ntpi + k] += values[leaf[r]];
+                                        if !stopped[r] {
+                                            raw[r * ntpi + k] += values[leaf[r]];
+                                        }
+                                    }
+                                }
+                                if let Some(es) = early_stop
+                                    && (it + 1) % es.round_period == 0
+                                {
+                                    for r in 0..nb {
+                                        if !stopped[r] && es.should_stop(&raw[r * ntpi..(r + 1) * ntpi]) {
+                                            stopped[r] = true;
+                                            active -= 1;
+                                        }
+                                    }
+                                    if active == 0 {
+                                        break;
                                     }
                                 }
                             }

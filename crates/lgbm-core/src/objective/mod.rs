@@ -80,6 +80,11 @@ pub trait RowObjective: Send + Sync {
     fn convert_output(&self, raw: &[f64], out: &mut [f64]) {
         out.copy_from_slice(raw);
     }
+    /// upstream: `ObjectiveFunction::NeedAccuratePrediction` (false allows
+    /// prediction early stopping).
+    fn need_accurate_prediction(&self) -> bool {
+        true
+    }
     /// Full `objective=` string, e.g. `binary sigmoid:1`.
     fn to_model_string(&self) -> String;
 }
@@ -371,6 +376,13 @@ impl Objective {
         match self {
             Objective::Row(o) => o.convert_output(raw, out),
             Objective::Grouped { objective, .. } => objective.convert_output(raw, out),
+        }
+    }
+
+    pub fn need_accurate_prediction(&self) -> bool {
+        match self {
+            Objective::Row(o) => o.need_accurate_prediction(),
+            Objective::Grouped { .. } => true,
         }
     }
 

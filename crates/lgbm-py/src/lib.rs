@@ -472,7 +472,8 @@ impl RsBooster {
     }
 
     /// Predict a dense matrix. Returns a 2-D array `(nrows, width)`.
-    #[pyo3(signature = (data, kind="normal", start_iteration=0, num_iteration=-1))]
+    /// `params` are the prediction parameters (upstream's predict `parameter` string).
+    #[pyo3(signature = (data, kind="normal", start_iteration=0, num_iteration=-1, params=Vec::new()))]
     fn predict<'py>(
         &self,
         py: Python<'py>,
@@ -480,13 +481,19 @@ impl RsBooster {
         kind: &str,
         start_iteration: i32,
         num_iteration: i32,
+        params: Vec<(String, String)>,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let kind = predict_kind(kind)?;
+        let cfg = config_from(params)?;
+        let g = &self.inner;
+        let early_stop = guarded(|| {
+            g.prediction_early_stop(cfg.pred_early_stop, cfg.pred_early_stop_freq, cfg.pred_early_stop_margin)
+        })?;
         let mat = Matrix::extract(data)?;
         let view = mat.view()?;
         let nrows = view.nrows();
-        let g = &self.inner;
-        let out = detached(py, || g.predict_matrix(&view, kind, start_iteration, num_iteration))?;
+        let out =
+            detached(py, || g.predict_matrix_early_stop(&view, kind, start_iteration, num_iteration, early_stop))?;
         let width = if nrows == 0 { 0 } else { out.len() / nrows };
         out.into_pyarray(py).reshape([nrows, width])
     }

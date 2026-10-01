@@ -99,6 +99,7 @@ const HONORED: &[&str] = &[
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
     "lambdarank_position_bias_regularization", "eval_at", "categorical_feature",
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
+    "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -122,7 +123,7 @@ const NO_EFFECT: &[&str] = &[
     // Quantization sub-options are inert unless use_quantized_grad (gated).
     "num_grad_quant_bins", "quant_train_renew_leaf", "stochastic_rounding",
     "monotone_constraints_method", "monotone_penalty", "top_k", "refit_decay_rate",
-    "linear_lambda", "pred_early_stop_freq", "pred_early_stop_margin",
+    "linear_lambda",
     "convert_model_language", "convert_model", "parser_config_file",
 ];
 
@@ -371,6 +372,9 @@ pub struct Config {
     pub cat_l2: f64,
     pub cat_smooth: f64,
     pub min_data_per_group: i32,
+    pub pred_early_stop: bool,
+    pub pred_early_stop_freq: i32,
+    pub pred_early_stop_margin: f64,
     /// Canonical key -> value string as supplied (after alias resolution).
     pub explicit: BTreeMap<String, String>,
     /// Non-fatal diagnostics (unknown keys, duplicate aliases), mirroring upstream warnings.
@@ -449,6 +453,9 @@ impl Default for Config {
             cat_l2: 10.0,
             cat_smooth: 10.0,
             min_data_per_group: 100,
+            pred_early_stop: false,
+            pred_early_stop_freq: 10,
+            pred_early_stop_margin: 10.0,
             explicit: BTreeMap::new(),
             warnings: Vec::new(),
         }
@@ -700,6 +707,9 @@ impl Config {
         set_f64!(cat_l2);
         set_f64!(cat_smooth);
         set_int!(min_data_per_group);
+        set_bool!(pred_early_stop);
+        set_int!(pred_early_stop_freq);
+        set_f64!(pred_early_stop_margin);
 
         if self.objective != "custom" && !SUPPORTED_OBJECTIVES.contains(&self.objective.as_str()) {
             return Err(LgbmError::Unsupported(format!("objective={}", self.objective)));

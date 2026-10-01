@@ -69,6 +69,10 @@ impl RowObjective for BinaryLogloss {
         "binary"
     }
 
+    fn need_accurate_prediction(&self) -> bool {
+        false
+    }
+
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         self.is_pos = match self.pos_class {
             None => meta.label.iter().map(|&l| l > 0.0).collect(),

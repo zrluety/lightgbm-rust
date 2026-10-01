@@ -876,6 +876,70 @@ def test_ranking_multithread(case, recorder):
     rec.finish()
 
 
+# --------------------------------------------------------------------------- prediction early stopping
+
+
+PRED_ES_CASES = [c for c in CASES if c.name in ("bin_basic", "bin_init_score", "mc_basic", "ova_basic", "reg_basic",
+                                                "l1_basic", "cat_binary", "mc_60_rounds")]
+PRED_ES_PARAMS = [
+    {"pred_early_stop": True},
+    {"pred_early_stop": True, "pred_early_stop_freq": 1, "pred_early_stop_margin": 0.5},
+    {"pred_early_stop": True, "pred_early_stop_freq": 3, "pred_early_stop_margin": 2.0},
+    {"pred_early_stop": True, "pred_early_stop_freq": 7, "pred_early_stop_margin": 0.0},
+    {"pred_early_stop": False, "pred_early_stop_freq": 1, "pred_early_stop_margin": 0.1},
+]
+
+
+@pytest.mark.parametrize("case", PRED_ES_CASES, ids=[c.name for c in PRED_ES_CASES])
+def test_pred_early_stop(case, recorder):
+    """upstream prediction_early_stop.cpp: binary / multiclass margins; no effect for regression objectives."""
+    rec = recorder(case.name)
+    rs, up = train_both(case, valid=False)
+    stops = not np.array_equal(up.predict(case.Xv, raw_score=True, **PRED_ES_PARAMS[1]), up.predict(case.Xv, raw_score=True))
+    assert stops == (case.objective in ("binary", "multiclass", "multiclassova")), "case does not exercise early stopping"
+    for i, p in enumerate(PRED_ES_PARAMS):
+        for kw in ({}, {"raw_score": True}, {"start_iteration": 2, "num_iteration": 11, "raw_score": True},
+                   {"pred_leaf": True}):
+            rec.compare(f"params[{i}] {kw}", "predictions", rs.predict(case.Xv, **kw, **p), up.predict(case.Xv, **kw, **p))
+    sp = pytest.importorskip("scipy.sparse")
+    p = PRED_ES_PARAMS[2]
+    rec.compare("csr input", "predictions", rs.predict(sp.csr_matrix(case.Xv), **p), up.predict(sp.csr_matrix(case.Xv), **p))
+    # a model loaded from text keeps its objective, so early stopping still applies
+    text = up.model_to_string()
+    rec.compare("loaded upstream model", "predictions", lgb_rs.Booster(model_str=text).predict(case.Xv, **p),
+                lgb_up.Booster(model_str=text).predict(case.Xv, **p))
+    rec.finish()
+
+
+@pytest.mark.parametrize("case", [c for c in RANK_CASES if c.name in ("rank_basic", "xendcg_basic")],
+                         ids=lambda c: c.name)
+def test_pred_early_stop_ranking(case, recorder):
+    rec = recorder(case.name)
+    models = []
+    for mod in (lgb_rs, lgb_up):
+        train, _ = _rank_datasets(mod, case)
+        models.append(mod.train(case.full_params, train, num_boost_round=case.rounds))
+    assert not np.array_equal(models[1].predict(case.Xv, **PRED_ES_PARAMS[1]), models[1].predict(case.Xv))
+    for i, p in enumerate(PRED_ES_PARAMS):
+        rec.compare(f"params[{i}]", "predictions", models[0].predict(case.Xv, **p), models[1].predict(case.Xv, **p))
+    rec.finish()
+
+
+def test_pred_early_stop_errors():
+    case = next(c for c in CASES if c.name == "bin_basic")
+    rs, up = train_both(case, valid=False, rounds=3)
+    reg = next(c for c in CASES if c.name == "reg_basic")
+    rs_reg, up_reg = train_both(reg, valid=False, rounds=3)
+    for b, mod in ((rs, lgb_rs), (up, lgb_up)):
+        with pytest.raises(mod.basic.LightGBMError, match=r"Check failed: \(early_stop_freq\) > \(0\)"):
+            b.predict(case.Xv, pred_early_stop=True, pred_early_stop_freq=0)
+        with pytest.raises(mod.basic.LightGBMError, match=r"Check failed: \(early_stop_margin\) >= \(0\)"):
+            b.predict(case.Xv, pred_early_stop=True, pred_early_stop_margin=-1.0)
+    # objectives needing accurate predictions skip the checks entirely
+    np.testing.assert_array_equal(rs_reg.predict(reg.Xv, pred_early_stop=True, pred_early_stop_freq=0),
+                                  up_reg.predict(reg.Xv, pred_early_stop=True, pred_early_stop_freq=0))
+
+
 # --------------------------------------------------------------------------- pandas categorical
 
 

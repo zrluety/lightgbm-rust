@@ -86,6 +86,10 @@ impl RowObjective for MulticlassSoftmax {
         "multiclass"
     }
 
+    fn need_accurate_prediction(&self) -> bool {
+        false
+    }
+
     fn num_outputs(&self) -> usize {
         self.num_class
     }
@@ -193,6 +197,10 @@ impl MulticlassOva {
 impl RowObjective for MulticlassOva {
     fn name(&self) -> &str {
         "multiclassova"
+    }
+
+    fn need_accurate_prediction(&self) -> bool {
+        false
     }
 
     fn num_outputs(&self) -> usize {

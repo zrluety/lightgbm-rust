@@ -276,6 +276,10 @@ impl RowObjective for LambdarankNdcg {
         "lambdarank"
     }
 
+    fn need_accurate_prediction(&self) -> bool {
+        false
+    }
+
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         self.base.init(meta)?;
         dcg::check_metadata(meta)?;
@@ -380,6 +384,10 @@ impl RowObjective for RankXendcg {
         "rank_xendcg"
     }
 
+    fn need_accurate_prediction(&self) -> bool {
+        false
+    }
+
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         self.base.init(meta)?;
         self.rands = (0..self.base.num_queries())
@@ -407,6 +415,10 @@ pub struct RankingForPrediction(pub &'static str);
 impl RowObjective for RankingForPrediction {
     fn name(&self) -> &str {
         self.0
+    }
+
+    fn need_accurate_prediction(&self) -> bool {
+        false
     }
 
     fn init(&mut self, _meta: &Metadata, _num_data: usize) -> Result<()> {

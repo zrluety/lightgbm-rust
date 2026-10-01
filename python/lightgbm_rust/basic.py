@@ -659,6 +659,12 @@ class _InnerPredictor:
                 validate_features: bool = False) -> np.ndarray:
         if isinstance(data, Dataset):
             raise TypeError("Cannot use Dataset instance for prediction, please use raw data instead")
+        # upstream passes all of pred_parameter to the C API; only these keys affect prediction here
+        early_stop = {
+            k: v
+            for k, v in self.pred_parameter.items()
+            if k in _ConfigAliases.get("pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin")
+        }
         return self._booster.predict(
             data,
             start_iteration=start_iteration,
@@ -667,6 +673,7 @@ class _InnerPredictor:
             pred_leaf=pred_leaf,
             pred_contrib=pred_contrib,
             validate_features=validate_features,
+            **early_stop,
         )
 
     def current_iteration(self) -> int:
@@ -1541,8 +1548,9 @@ class Booster:
     ) -> np.ndarray:
         if isinstance(data, Dataset):
             raise TypeError("Cannot use Dataset instance for prediction, please use raw data instead")
+        pred_params = _param_dict_to_pairs(kwargs)
         if kwargs:
-            _emit_engine_warnings(_rs.validate_params(_param_dict_to_pairs(kwargs)), kwargs)
+            _emit_engine_warnings(_rs.validate_params(pred_params), kwargs)
         if num_iteration is None:
             num_iteration = self.best_iteration if start_iteration <= 0 else -1
         if num_iteration is None or num_iteration <= 0:
@@ -1567,7 +1575,7 @@ class Booster:
             return sparse
         # upstream: _InnerPredictor.predict (contrib overrides leaf, which overrides raw)
         kind = "contrib" if pred_contrib else ("leaf" if pred_leaf else ("raw" if raw_score else "normal"))
-        preds = self._rs.predict(mat, kind, int(start_iteration), int(num_iteration))
+        preds = self._rs.predict(mat, kind, int(start_iteration), int(num_iteration), pred_params)
         nrow = _matrix_nrows(mat)
         flat = preds.ravel()
         if pred_leaf:
