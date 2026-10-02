@@ -1717,6 +1717,32 @@ def test_feature_contri_errors_and_params():
     assert "[feature_contri: 0.10000000000000001,0.33333333333333331,1,2.5,9.9999999999999995e-08,1]" in texts[1]
 
 
+def test_cegb_changes_trees():
+    for case in CASES:
+        if not case.name.startswith("cegb") or case.name == "cegb_tradeoff_only":
+            continue
+        trees = []
+        for params in (case.full_params, {k: v for k, v in case.full_params.items() if not k.startswith("cegb")}):
+            b = lgb_up.train(params, lgb_up.Dataset(case.X, label=case.y, weight=case.weight), case.num_boost_round)
+            trees.append(b.model_to_string().split("Tree=0")[1].split("end of trees")[0])
+        assert trees[0] != trees[1], case.name
+
+
+def test_cegb_errors_and_params():
+    case = next(c for c in CASES if c.name == "cegb_all")
+    for key in ("cegb_penalty_feature_coupled", "cegb_penalty_feature_lazy"):
+        for mod in (lgb_rs, lgb_up):
+            with pytest.raises(mod.basic.LightGBMError, match=re.escape(f"{key} should be the same size as feature number.")):
+                mod.train({**case.full_params, key: [1.0, 2.0]}, mod.Dataset(case.X, label=case.y), 1)
+    texts = [mod.train({**case.full_params, "cegb_penalty_feature_lazy": [0.1, 1 / 3, 0.0, 2.5, 1e-7, 1.0]},
+                       mod.Dataset(case.X, label=case.y, weight=case.weight), 3).model_to_string()
+             for mod in (lgb_rs, lgb_up)]
+    assert texts[0] == texts[1]
+    assert "[cegb_penalty_feature_lazy: 0.10000000000000001,0.33333333333333331,0,2.5,9.9999999999999995e-08,1]" \
+        in texts[1]
+    assert "[cegb_tradeoff: 0.5]" in texts[1]
+
+
 def test_bin_params_errors_and_warnings(tmp_path, capfd):
     case = next(c for c in CASES if c.name == "bins_by_feature")
     bad_json = {"not_array.json": '{"feature": 0}', "bad.json": "[{", "range.json": '[{"feature": 6}]'}

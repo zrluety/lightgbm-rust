@@ -258,6 +258,8 @@ _IC_OVERLAP = [[0, 1, 2], [2, 3], [4]]
 _RF_BAG = {"boosting": "rf", "bagging_freq": 1, "bagging_fraction": 0.7}
 _FORCED_A = str(ROOT / "tests" / "differential" / "data" / "forced_bins_a.json")
 _FORCED_CAT = str(ROOT / "tests" / "differential" / "data" / "forced_bins_categorical.json")
+_CEGB_LAZY = [0.1, 0.5, 0.02, 1.0, 0.3, 0.05]
+_CEGB_COUPLED = [50.0, 200.0, 10.0, 400.0, 30.0, 5.0]
 
 CASES = [
     make_case("reg_basic", "regression", {}),
@@ -438,6 +440,35 @@ CASES = [
     make_case("bins_by_feature_forced", "regression", {"max_bin_by_feature": [5, 3, 4, 300, 2, 6],
                                                        "forcedbins_filename": _FORCED_A, "min_data_in_bin": 1},
               kind="discrete"),
+    # CEGB (upstream cost_effective_gradient_boosting.hpp); lazy bits are numbered by bag position in subset
+    # mode (bagging_fraction 0.4, GOSS 0.2 + 0.1), where the bag size changes every tree
+    make_case("cegb_split", "regression", {"cegb_penalty_split": 0.05}),
+    make_case("cegb_coupled", "regression", {"cegb_penalty_feature_coupled": _CEGB_COUPLED}),
+    make_case("cegb_lazy", "regression", {"cegb_penalty_feature_lazy": _CEGB_LAZY}),
+    make_case("cegb_all", "binary", {"cegb_penalty_split": 0.001, "cegb_penalty_feature_coupled": [2, 8, 1, 20, 3, 0.5],
+                                     "cegb_penalty_feature_lazy": [0.002, 0.01, 0.0, 0.02, 0.005, 0.001],
+                                     "cegb_tradeoff": 0.5}, weighted=True),
+    make_case("cegb_tradeoff_only", "regression", {"cegb_tradeoff": 0.3}),
+    make_case("cegb_lazy_bagging", "regression", {"cegb_penalty_feature_lazy": _CEGB_LAZY, "bagging_fraction": 0.8,
+                                                  "bagging_freq": 1}),
+    make_case("cegb_lazy_subset", "regression", {"cegb_penalty_feature_lazy": _CEGB_LAZY, "bagging_fraction": 0.4,
+                                                 "bagging_freq": 1}),
+    make_case("cegb_goss", "regression", {"cegb_penalty_feature_lazy": _CEGB_LAZY,
+                                          "cegb_penalty_feature_coupled": _CEGB_COUPLED,
+                                          "data_sample_strategy": "goss", "top_rate": 0.2, "other_rate": 0.1}),
+    make_case("cegb_monotone", "regression", {"cegb_penalty_feature_coupled": _CEGB_COUPLED,
+                                              "monotone_constraints": _MC, "mc_method": "advanced",
+                                              "monotone_penalty": 1.0}),
+    make_case("cegb_categorical", "binary", {"cegb_penalty_feature_lazy": [0.01, 0.05, 0.002, 0.1, 0.03, 0.005],
+                                             "cegb_penalty_feature_coupled": [5, 20, 1, 40, 3, 0.5],
+                                             "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("cegb_multiclass", "multiclass", {"num_class": 3, "cegb_penalty_split": 0.002,
+                                                "cegb_penalty_feature_lazy": [0.01, 0.05, 0.002, 0.1, 0.03, 0.005],
+                                                "extra_trees": True}),
+    make_case("cegb_rf", "regression", {**_RF_BAG, "cegb_penalty_feature_lazy": _CEGB_LAZY,
+                                        "cegb_penalty_feature_coupled": _CEGB_COUPLED}),
+    make_case("cegb_dart", "regression", {"boosting": "dart", "cegb_penalty_feature_lazy": _CEGB_LAZY,
+                                          "bagging_fraction": 0.3, "bagging_freq": 2}),
     # interaction constraints (upstream ColSampler::GetByNode with Tree::branch_features)
     make_case("ic_disjoint", "regression", {"interaction_constraints": _IC}),
     make_case("ic_overlap", "regression", {"interaction_constraints": _IC_OVERLAP}),

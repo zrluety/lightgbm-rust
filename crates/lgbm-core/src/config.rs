@@ -102,7 +102,8 @@ const HONORED: &[&str] = &[
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
     "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin", "bagging_by_query",
     "auc_mu_weights", "refit_decay_rate", "monotone_constraints", "monotone_constraints_method",
-    "monotone_penalty", "feature_contri", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
+    "monotone_penalty", "feature_contri", "cegb_tradeoff", "cegb_penalty_split", "cegb_penalty_feature_lazy",
+    "cegb_penalty_feature_coupled", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
     "group_column", "ignore_column", "precise_float_parser", "two_round", "max_bin_by_feature",
     "forcedbins_filename",
@@ -413,6 +414,12 @@ pub struct Config {
     pub monotone_penalty: f64,
     /// Split-gain multiplier by real feature index; empty means 1 for all.
     pub feature_contri: Vec<f64>,
+    pub cegb_tradeoff: f64,
+    pub cegb_penalty_split: f64,
+    /// By real feature index; empty means no lazy penalty.
+    pub cegb_penalty_feature_lazy: Vec<f64>,
+    /// By real feature index; empty means no coupled penalty.
+    pub cegb_penalty_feature_coupled: Vec<f64>,
     pub drop_rate: f64,
     pub max_drop: i32,
     pub skip_drop: f64,
@@ -530,6 +537,10 @@ impl Default for Config {
             monotone_constraints_method: "basic".into(),
             monotone_penalty: 0.0,
             feature_contri: Vec::new(),
+            cegb_tradeoff: 1.0,
+            cegb_penalty_split: 0.0,
+            cegb_penalty_feature_lazy: Vec::new(),
+            cegb_penalty_feature_coupled: Vec::new(),
             drop_rate: 0.1,
             max_drop: 50,
             skip_drop: 0.5,
@@ -803,15 +814,25 @@ impl Config {
             self.monotone_constraints_method = v.clone();
         }
         set_f64!(monotone_penalty);
-        if let Some(v) = p.get("feature_contri") {
-            // upstream: Common::StringToArray<double> (std::stod per token)
-            self.feature_contri = split_tokens(v)
+        // upstream: Common::StringToArray<double> (std::stod per token)
+        let doubles = |key: &str, v: &str| -> Result<Vec<f64>> {
+            split_tokens(v)
                 .map(|t| {
-                    crate::fmt::parse_f64(t.trim()).ok_or_else(|| {
-                        LgbmError::InvalidParameter(format!("cannot parse feature_contri value `{t}`"))
-                    })
+                    crate::fmt::parse_f64(t.trim())
+                        .ok_or_else(|| LgbmError::InvalidParameter(format!("cannot parse {key} value `{t}`")))
                 })
-                .collect::<Result<_>>()?;
+                .collect()
+        };
+        if let Some(v) = p.get("feature_contri") {
+            self.feature_contri = doubles("feature_contri", v)?;
+        }
+        set_f64!(cegb_tradeoff);
+        set_f64!(cegb_penalty_split);
+        if let Some(v) = p.get("cegb_penalty_feature_lazy") {
+            self.cegb_penalty_feature_lazy = doubles("cegb_penalty_feature_lazy", v)?;
+        }
+        if let Some(v) = p.get("cegb_penalty_feature_coupled") {
+            self.cegb_penalty_feature_coupled = doubles("cegb_penalty_feature_coupled", v)?;
         }
         if let Some(v) = p.get("interaction_constraints") {
             // upstream: Config::Set, Common::StringToArrayofArrays<int>(s, '[', ']', ',')
@@ -1063,6 +1084,7 @@ impl Config {
     fn value_string(&self, name: &str) -> Option<String> {
         let b = |x: bool| if x { "1".to_string() } else { "0".to_string() };
         let g = crate::fmt::fmt_g6;
+        let g17_join = |v: &[f64]| v.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(",");
         Some(match name {
             "num_iterations" => self.num_iterations.to_string(),
             "learning_rate" => g(self.learning_rate),
@@ -1094,9 +1116,11 @@ impl Config {
             }
             "monotone_constraints_method" => self.monotone_constraints_method.clone(),
             "monotone_penalty" => g(self.monotone_penalty),
-            "feature_contri" => {
-                self.feature_contri.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(",")
-            }
+            "feature_contri" => g17_join(&self.feature_contri),
+            "cegb_tradeoff" => g(self.cegb_tradeoff),
+            "cegb_penalty_split" => g(self.cegb_penalty_split),
+            "cegb_penalty_feature_lazy" => g17_join(&self.cegb_penalty_feature_lazy),
+            "cegb_penalty_feature_coupled" => g17_join(&self.cegb_penalty_feature_coupled),
             "interaction_constraints" => self.interaction_constraints.clone(),
             "verbosity" => self.verbosity.to_string(),
             "max_bin" => self.max_bin.to_string(),
@@ -1335,10 +1359,10 @@ mod tests {
 
     #[test]
     fn unimplemented_non_default_is_rejected() {
-        let e = Config::from_pairs([("cegb_tradeoff", "0.5")]).unwrap_err();
+        let e = Config::from_pairs([("tree_learner", "data")]).unwrap_err();
         assert!(matches!(e, LgbmError::Unsupported(_)));
         // the default value is accepted
-        assert!(Config::from_pairs([("cegb_tradeoff", "1.0")]).is_ok());
+        assert!(Config::from_pairs([("tree_learner", "serial")]).is_ok());
         assert!(Config::from_pairs([("objective", "multiclass")]).is_err());
     }
 

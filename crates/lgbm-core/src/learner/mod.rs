@@ -10,6 +10,7 @@
 //! results match upstream's row-wise mode for the same thread count; with
 //! one thread both modes give identical sums).
 
+mod cegb;
 pub mod col_sampler;
 pub mod constraints;
 pub mod partition;
@@ -26,6 +27,8 @@ use crate::multi_val_bin::{HistSlots, MultiValBin, merge_blocks};
 use crate::random::Random;
 use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
 use crate::tree::{SplitArgs, Tree, construct_bitset, find_in_bitset};
+pub(crate) use cegb::Cegb;
+use cegb::RowView;
 use col_sampler::ColSampler;
 use constraints::{LeafConstraints, Method, monotone_split_gain_penalty};
 use partition::DataPartition;
@@ -90,6 +93,13 @@ pub struct SerialTreeLearner {
     track_branch_features: bool,
     /// Real split features on each leaf's path (empty unless tracked).
     branch_features: Vec<Vec<i32>>,
+    /// upstream `cegb_` (present iff `CostEfficientGradientBoosting::IsEnable`).
+    cegb: Option<Cegb>,
+    /// Upstream's learner row count: the bag size when bagging uses a subset.
+    view_num_data: usize,
+    /// Position of each row in the bag when bagging uses a subset (kept only
+    /// with CEGB, whose lazy penalties index rows that way).
+    bag_local: Option<Vec<u32>>,
     pub trace: Option<TreeTrace>,
 }
 
@@ -131,7 +141,14 @@ impl SerialTreeLearner {
                     .map(|f| Random::new(cfg.extra_seed.wrapping_add(data.upstream_inner_index(f) as i32)))
                     .collect()
             });
+        let cegb = Cegb::is_enable(cfg).then(|| {
+            let upstream_inner = (0..data.num_features()).map(|f| data.upstream_inner_index(f)).collect();
+            Cegb::new(cfg, num_leaves, upstream_inner, num_data)
+        });
         Self {
+            cegb,
+            view_num_data: num_data,
+            bag_local: None,
             col_sampler,
             extra_rands,
             constraints,
@@ -211,10 +228,29 @@ impl SerialTreeLearner {
         self.partition.add_leaf_outputs(&self.team, leaf_values, score);
     }
 
-    /// upstream: `SerialTreeLearner::SetBaggingData` (non-subset mode).
-    /// `used` are the in-bag rows in ascending order; `None` trains on all rows.
-    pub fn set_bagging_data(&mut self, used: Option<&[u32]>) {
+    /// upstream: `SerialTreeLearner::SetBaggingData`. `used` are the in-bag
+    /// rows in ascending order; `None` trains on all rows. Rows are always
+    /// partitioned by their global index; `subset` (upstream's subset mode)
+    /// only changes how CEGB numbers them.
+    pub fn set_bagging_data(&mut self, used: Option<&[u32]>, subset: bool) {
         self.partition.set_used_data_indices(used);
+        match used {
+            Some(u) if subset => {
+                self.view_num_data = u.len();
+                if self.cegb.is_some() {
+                    let mut local = self.bag_local.take().unwrap_or_default();
+                    local.resize(self.data.num_data(), 0);
+                    for (pos, &row) in u.iter().enumerate() {
+                        local[row as usize] = pos as u32;
+                    }
+                    self.bag_local = Some(local);
+                }
+            }
+            _ => {
+                self.view_num_data = self.data.num_data();
+                self.bag_local = None;
+            }
+        }
     }
 
     /// Train one tree on `grad`/`hess` (length `num_data`).
@@ -233,6 +269,9 @@ impl SerialTreeLearner {
         }
         if let Some(c) = self.constraints.as_mut() {
             c.reset();
+        }
+        if let Some(c) = self.cegb.as_mut() {
+            c.before_train();
         }
         let root_cnt = self.partition.leaf_count(0);
         if self.multi_val.is_some() {
@@ -457,9 +496,6 @@ impl SerialTreeLearner {
                     &mut s_split,
                 );
                 s_split.feature = real;
-                if s_split.monotone_type != 0 {
-                    s_split.gain *= s_penalty;
-                }
                 let mut l_split = SplitInfo::default();
                 let mut l_ok = false;
                 if larger.leaf >= 0 {
@@ -478,9 +514,6 @@ impl SerialTreeLearner {
                         &mut l_split,
                     );
                     l_split.feature = real;
-                    if l_split.monotone_type != 0 {
-                        l_split.gain *= l_penalty;
-                    }
                 }
                 FeatResult {
                     smaller_split: s_split,
@@ -499,13 +532,21 @@ impl SerialTreeLearner {
         let mut l_best = SplitInfo::default();
         let mut s_spl = Vec::with_capacity(nf);
         let mut l_spl = Vec::with_capacity(nf);
-        for (f, r) in results.into_iter().enumerate() {
+        let view = RowView { num_data: self.view_num_data, local: self.bag_local.as_deref() };
+        let s_rows = self.partition.indices_on_leaf(sm_leaf);
+        let l_rows = if larger.leaf >= 0 { self.partition.indices_on_leaf(larger.leaf as usize) } else { &[] };
+        let mut cegb = self.cegb.as_mut();
+        for (f, mut r) in results.into_iter().enumerate() {
             if is_used[f] {
+                finish_split(cegb.as_deref_mut(), &view, s_rows, f, &smaller, s_penalty, &mut r.smaller_split);
                 if s_node[f] && r.smaller_split.better_than(&s_best) {
                     s_best = r.smaller_split;
                 }
-                if larger.leaf >= 0 && l_node[f] && r.larger_split.better_than(&l_best) {
-                    l_best = r.larger_split;
+                if larger.leaf >= 0 {
+                    finish_split(cegb.as_deref_mut(), &view, l_rows, f, &larger, l_penalty, &mut r.larger_split);
+                    if l_node[f] && r.larger_split.better_than(&l_best) {
+                        l_best = r.larger_split;
+                    }
                 }
             }
             s_spl.push(r.smaller_splittable);
@@ -526,6 +567,17 @@ impl SerialTreeLearner {
             .data
             .inner_feature_index(info.feature as usize)
             .expect("split feature is used");
+        if let Some(c) = self.cegb.as_mut() {
+            let view = RowView { num_data: self.view_num_data, local: self.bag_local.as_deref() };
+            c.update_leaf_best_splits(
+                best_leaf,
+                &info,
+                inner,
+                &mut self.best_split_per_leaf[..tree.num_leaves],
+                self.partition.indices_on_leaf(best_leaf),
+                &view,
+            );
+        }
         let mapper = self.data.feature_bin_mapper(inner);
         let next_leaf = tree.num_leaves;
         let meta = self.metas[inner];
@@ -657,15 +709,37 @@ impl SerialTreeLearner {
                 &mut new_split,
             );
             new_split.feature = self.data.real_feature_index(f) as i32;
-            if new_split.monotone_type != 0 {
-                new_split.gain *= penalty;
-            }
+            let ls = LeafSplits { leaf: leaf as i32, num_data, ..LeafSplits::none() };
+            let view = RowView { num_data: self.view_num_data, local: self.bag_local.as_deref() };
+            let rows = self.partition.indices_on_leaf(leaf);
+            finish_split(self.cegb.as_mut(), &view, rows, f, &ls, penalty, &mut new_split);
             if new_split.better_than(&best) && node_used[f] {
                 best = new_split;
             }
         }
         self.hist_pool[leaf] = Some(lh);
         self.best_split_per_leaf[leaf] = best;
+    }
+}
+
+/// The end of upstream `ComputeBestSplitForFeature`: the CEGB penalty (which
+/// records the split as found), then the monotone depth penalty.
+fn finish_split(
+    cegb: Option<&mut Cegb>,
+    view: &RowView<'_>,
+    rows: &[u32],
+    inner: usize,
+    ls: &LeafSplits,
+    monotone_penalty: f64,
+    split: &mut SplitInfo,
+) {
+    if let Some(c) = cegb {
+        debug_assert_eq!(rows.len(), ls.num_data as usize);
+        let delta = c.delta_gain(inner, split.feature as usize, ls.leaf as usize, split, rows, view);
+        split.gain -= delta;
+    }
+    if split.monotone_type != 0 {
+        split.gain *= monotone_penalty;
     }
 }
 

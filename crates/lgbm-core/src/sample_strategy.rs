@@ -41,6 +41,9 @@ pub struct SampleStrategy {
     need_re_bagging: bool,
     label: Vec<f32>,
     by_query: Option<ByQuery>,
+    /// upstream `is_use_subset_`: the tree learner trains on a copy of the
+    /// in-bag rows, so its row indices are positions in the bag.
+    use_subset: bool,
 }
 
 /// upstream `bagging_by_query`: whole queries are drawn (one draw per query
@@ -134,7 +137,16 @@ impl SampleStrategy {
             }
             _ => None,
         };
+        let use_subset = match kind {
+            // upstream GOSSStrategy::ResetSampleConfig
+            Kind::Goss { top_rate, other_rate, .. } => top_rate + other_rate <= 0.5,
+            // upstream BaggingSampleStrategy::ResetSampleConfig (non-CUDA)
+            Kind::Bagging { freq, .. } => {
+                (bag_cnt as f64 / n as f64) / freq as f64 <= 0.5 && data.num_feature_groups() < 100
+            }
+        };
         Ok(Some(Self {
+            use_subset,
             kind,
             num_data: n,
             num_tree_per_iteration,
@@ -329,6 +341,11 @@ impl SampleStrategy {
 
     pub fn bag_cnt(&self) -> usize {
         self.bag_cnt
+    }
+
+    /// upstream `SampleStrategy::is_use_subset`.
+    pub fn is_use_subset(&self) -> bool {
+        self.use_subset
     }
 
     pub fn in_bag(&self) -> &[u32] {

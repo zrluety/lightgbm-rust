@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
-use crate::learner::SerialTreeLearner;
+use crate::learner::{Cegb, SerialTreeLearner};
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
 use crate::random::Random;
@@ -245,6 +245,8 @@ impl Gbdt {
         let pool = build_pool(config.num_threads)?;
         let sampler =
             SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
+        // upstream: SerialTreeLearner::Init -> CostEfficientGradientBoosting::Init
+        Cegb::check(&config, train.num_total_features())?;
         let learner = SerialTreeLearner::new(train.clone(), &config);
         if is_rf {
             // upstream: RF::Init after GBDT::Init
@@ -615,7 +617,7 @@ impl Gbdt {
             let st = self.train.as_mut().unwrap();
             if let Some(s) = st.sampler.as_mut() {
                 if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                    st.learner.set_bagging_data(Some(s.in_bag()));
+                    st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
                 }
             }
         }
@@ -743,7 +745,7 @@ impl Gbdt {
                     let st = self.train.as_mut().unwrap();
                     if let Some(s) = st.sampler.as_mut() {
                         if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                            st.learner.set_bagging_data(Some(s.in_bag()));
+                            st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
                         }
                     }
                 }
@@ -794,7 +796,7 @@ impl Gbdt {
             let st = self.train.as_mut().unwrap();
             if let Some(s) = st.sampler.as_mut() {
                 if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                    st.learner.set_bagging_data(Some(s.in_bag()));
+                    st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
                 }
             }
         }
