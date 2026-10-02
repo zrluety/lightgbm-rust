@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
-use crate::learner::{Cegb, SerialTreeLearner, load_forced_splits};
+use crate::learner::{Cegb, SerialTreeLearner, load_forced_splits, reload_forced_splits};
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
 use crate::random::Random;
@@ -44,7 +44,7 @@ struct ValidSet {
 struct TrainState {
     data: Arc<Dataset>,
     learner: SerialTreeLearner,
-    sampler: Option<SampleStrategy>,
+    sampler: SampleStrategy,
     scores: Vec<f64>,
     has_init_score: bool,
     grad: Vec<f32>,
@@ -115,6 +115,40 @@ pub struct Gbdt {
     warnings: Vec<String>,
 }
 
+/// upstream: the bagging `CHECK` of `RF::Init` and `RF::ResetConfig`.
+fn check_rf_sampling(config: &Config) -> Result<()> {
+    if (config.bagging_freq > 0 && config.bagging_fraction < 1.0 && config.bagging_fraction > 0.0)
+        || (config.feature_fraction < 1.0 && config.feature_fraction > 0.0)
+    {
+        return Ok(());
+    }
+    Err(LgbmError::InvalidParameter(
+        "Check failed: (config->bagging_freq > 0 && config->bagging_fraction < 1.0f && \
+         config->bagging_fraction > 0.0f) || (config->feature_fraction < 1.0f && \
+         config->feature_fraction > 0.0f)"
+            .into(),
+    ))
+}
+
+/// upstream: the per-feature size `CHECK_EQ`s of `GBDT::Init` and `GBDT::ResetConfig`.
+fn check_feature_sizes(config: &Config, num_total_features: usize) -> Result<()> {
+    if !config.monotone_constraints.is_empty() && num_total_features != config.monotone_constraints.len() {
+        return Err(LgbmError::InvalidParameter(
+            "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
+             (config->monotone_constraints.size())"
+                .into(),
+        ));
+    }
+    if !config.feature_contri.is_empty() && num_total_features != config.feature_contri.len() {
+        return Err(LgbmError::InvalidParameter(
+            "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
+             (config->feature_contri.size())"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_pool(num_threads: i32) -> Result<Option<Arc<rayon::ThreadPool>>> {
     if num_threads <= 0 {
         return Ok(None);
@@ -177,17 +211,8 @@ impl Gbdt {
         }
         let is_rf = config.boosting == "rf";
         // upstream: RF::Init, before GBDT::Init
-        if is_rf
-            && config.data_sample_strategy == "bagging"
-            && !((config.bagging_freq > 0 && config.bagging_fraction < 1.0 && config.bagging_fraction > 0.0)
-                || (config.feature_fraction < 1.0 && config.feature_fraction > 0.0))
-        {
-            return Err(LgbmError::InvalidParameter(
-                "Check failed: (config->bagging_freq > 0 && config->bagging_fraction < 1.0f && \
-                 config->bagging_fraction > 0.0f) || (config->feature_fraction < 1.0f && \
-                 config->feature_fraction > 0.0f)"
-                    .into(),
-            ));
+        if is_rf && config.data_sample_strategy == "bagging" {
+            check_rf_sampling(&config)?;
         }
         if is_rf && config.bagging_by_query {
             return Err(LgbmError::Unsupported(
@@ -195,20 +220,7 @@ impl Gbdt {
             ));
         }
         // upstream: GBDT::Init
-        if !config.monotone_constraints.is_empty() && train.num_total_features() != config.monotone_constraints.len() {
-            return Err(LgbmError::InvalidParameter(
-                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
-                 (config->monotone_constraints.size())"
-                    .into(),
-            ));
-        }
-        if !config.feature_contri.is_empty() && train.num_total_features() != config.feature_contri.len() {
-            return Err(LgbmError::InvalidParameter(
-                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
-                 (config->feature_contri.size())"
-                    .into(),
-            ));
-        }
+        check_feature_sizes(&config, train.num_total_features())?;
         if !config.monotone_constraints.is_empty() {
             if let Some(o) = objective.as_ref().filter(|o| o.is_renew_tree_output()) {
                 return Err(LgbmError::InvalidParameter(format!(
@@ -241,7 +253,6 @@ impl Gbdt {
         // upstream: c_api.cpp `CreateObjectiveAndMetrics` inits every training
         // metric (and so runs its checks) whether or not it is reported
         let metrics = Self::make_metrics(&config, &train)?;
-        let metrics = if config.is_provide_training_metric { metrics } else { Vec::new() };
         let pool = build_pool(config.num_threads)?;
         let sampler =
             SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
@@ -592,17 +603,221 @@ impl Gbdt {
         }
     }
 
-    /// upstream: `Booster::ResetConfig` -> `GBDT::ResetConfig` (and
-    /// `DART::ResetConfig`, which reseeds the drop generator).
-    fn reset_config(&mut self) {
-        let Some(cfg) = self.config.as_ref() else { return };
-        if let Some(st) = self.train.as_mut() {
-            st.shrinkage_rate = cfg.learning_rate;
-            if let Some(d) = st.dart.as_mut() {
-                d.random_for_drop = Random::new(cfg.drop_seed);
-                d.sum_weight = 0.0;
+    /// Change parameters during training. Returns upstream's warnings.
+    ///
+    /// upstream: `Booster::ResetConfig` (c_api.cpp): the parameters are
+    /// checked on a fresh config, merged into the current one, a given
+    /// `objective` is re-created (`GBDT::ResetTrainingData` on the same
+    /// data), then `GBDT::ResetConfig` (with the `RF` and `DART` variants).
+    pub fn reset_parameter<I, K, V>(&mut self, pairs: I) -> Result<Vec<String>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let (Some(old), Some(st)) = (self.config.as_ref(), self.train.as_ref()) else {
+            return Err(LgbmError::Unsupported(
+                "reset_parameter without training data (upstream dereferences the missing training set)".into(),
+            ));
+        };
+        let data = st.data.clone();
+        let new_config = Config::from_pairs(pairs)?;
+        let param = new_config.explicit.clone();
+        let changed = |k: &str, differs: bool| param.contains_key(k) && differs;
+        if changed("num_class", new_config.num_class != old.num_class) {
+            return Err(LgbmError::InvalidParameter("Cannot change num_class during training".into()));
+        }
+        if changed("boosting", new_config.boosting != old.boosting) {
+            return Err(LgbmError::InvalidParameter("Cannot change boosting during training".into()));
+        }
+        if changed("metric", new_config.metric != old.metric) {
+            return Err(LgbmError::InvalidParameter("Cannot change metric during training".into()));
+        }
+        crate::config::dataset_update_param_checking(old, &new_config)?;
+        let mut cfg = old.clone();
+        cfg.warnings.clear();
+        cfg.set_map(&param)?;
+        let mut warnings = new_config.warnings;
+        warnings.append(&mut cfg.warnings);
+        if cfg.num_threads != old.num_threads {
+            self.pool = build_pool(cfg.num_threads)?;
+            self.train.as_mut().unwrap().sampler.set_num_threads(resolve_num_threads(cfg.num_threads));
+        }
+        if param.contains_key("objective") {
+            let mut objective = create_objective(&cfg)?;
+            if let Some(o) = objective.as_mut() {
+                o.init(&data.metadata, data.num_data())?;
+                warnings.extend(o.take_warnings());
+            }
+            self.set_training_objective(objective)?;
+            if self.is_rf {
+                self.rf_reset_training_data()?;
             }
         }
+        self.reset_config(cfg)?;
+        Ok(warnings)
+    }
+
+    /// The objective part of upstream `GBDT::ResetTrainingData`.
+    fn set_training_objective(&mut self, objective: Option<Objective>) -> Result<()> {
+        if let Some(o) = objective.as_ref() {
+            if o.num_outputs() != self.num_tree_per_iteration {
+                return Err(LgbmError::InvalidParameter(
+                    "Check failed: (num_tree_per_iteration_) == (objective_function_->NumModelPerIteration())".into(),
+                ));
+            }
+            let monotone = self.config.as_ref().is_some_and(|c| !c.monotone_constraints.is_empty());
+            if o.is_renew_tree_output() && monotone {
+                return Err(LgbmError::InvalidParameter(format!(
+                    "Cannot use ``monotone_constraints`` in {} objective, please disable it.",
+                    o.name()
+                )));
+            }
+        }
+        self.objective = objective;
+        Ok(())
+    }
+
+    /// upstream: `RF::ResetTrainingData` after `GBDT::ResetTrainingData`.
+    /// The training scores are divided by the iteration count (also when
+    /// they are already averaged) and the fixed gradients are recomputed.
+    fn rf_reset_training_data(&mut self) -> Result<()> {
+        let ntpi = self.num_tree_per_iteration;
+        let st = self.train.as_mut().expect("training state");
+        let iters = st.iter + self.num_init_iteration;
+        if iters > 0 {
+            // upstream: 1.0f / (iter_ + num_init_iteration_), a float division
+            let val = (1.0f32 / iters as f32) as f64;
+            for s in st.scores.iter_mut() {
+                *s *= val;
+            }
+        }
+        if ntpi != self.num_class {
+            return Err(LgbmError::InvalidParameter("Check failed: (num_tree_per_iteration_) == (num_class_)".into()));
+        }
+        if self.objective.is_none() {
+            return Err(LgbmError::InvalidParameter(
+                "RF mode do not support custom objective function, please use built-in objectives.".into(),
+            ));
+        }
+        self.rf_boosting();
+        Ok(())
+    }
+
+    /// upstream: `GBDT::ResetConfig`, with `RF::ResetConfig` (its bagging
+    /// check, no shrinkage) and `DART::ResetConfig` (reseeds the drops).
+    fn reset_config(&mut self, cfg: Config) -> Result<()> {
+        if self.is_rf {
+            if cfg.data_sample_strategy == "bagging" {
+                check_rf_sampling(&cfg)?;
+            } else if cfg.data_sample_strategy != "goss" {
+                return Err(LgbmError::InvalidParameter(
+                    "Check failed: (config->data_sample_strategy) == (std::string(\"goss\"))".into(),
+                ));
+            }
+            if cfg.bagging_by_query {
+                return Err(LgbmError::Unsupported(
+                    "boosting=rf with bagging_by_query (upstream RF bags in TrainOneIter, outside GBDT::Boosting)"
+                        .into(),
+                ));
+            }
+        }
+        let st = self.train.as_mut().expect("training state");
+        let nf = st.data.num_total_features();
+        check_feature_sizes(&cfg, nf)?;
+        if let Some(o) = self.objective.as_ref().filter(|o| o.is_renew_tree_output()) {
+            if !cfg.monotone_constraints.is_empty() {
+                return Err(LgbmError::InvalidParameter(format!(
+                    "Cannot use ``monotone_constraints`` in {} objective, please disable it.",
+                    o.name()
+                )));
+            }
+        }
+        st.shrinkage_rate = cfg.learning_rate;
+        st.learner.reset_config(&cfg)?;
+        st.sampler.reset_sample_config(&cfg, &st.data, self.objective.as_ref(), false)?;
+        let old_file = self.config.as_ref().map(|c| c.forcedsplits_filename.as_str());
+        if old_file.is_some_and(|f| f != cfg.forcedsplits_filename) {
+            st.learner.set_forced_split(reload_forced_splits(&cfg.forcedsplits_filename));
+        }
+        if self.is_rf {
+            st.shrinkage_rate = 1.0;
+        }
+        if let Some(d) = st.dart.as_mut() {
+            d.random_for_drop = Random::new(cfg.drop_seed);
+            d.sum_weight = 0.0;
+        }
+        self.config = Some(cfg);
+        Ok(())
+    }
+
+    /// Continue training on a new dataset that shares the training set's
+    /// bin mappers (Python `Booster.update(train_set=...)`).
+    ///
+    /// upstream: `Booster::ResetTrainingData` (`CreateObjectiveAndMetrics`)
+    /// -> `GBDT::ResetTrainingData` (and `RF::ResetTrainingData`): the
+    /// training scores are rebuilt from the init score and this session's
+    /// trees (not those of a merged init model).
+    pub fn reset_training_data(&mut self, data: Arc<Dataset>) -> Result<Vec<String>> {
+        let (Some(cfg), Some(st)) = (self.config.as_ref(), self.train.as_ref()) else {
+            return Err(LgbmError::Unsupported("updating the training data of a booster that is not training".into()));
+        };
+        if Arc::ptr_eq(&data, &st.data) {
+            return Ok(Vec::new());
+        }
+        if !data.same_bins_as(&st.data) {
+            return Err(LgbmError::InvalidParameter(
+                "Cannot reset training data, since new training data has different bin mappers".into(),
+            ));
+        }
+        let n = data.num_data();
+        let ntpi = self.num_tree_per_iteration;
+        let mut warnings = Vec::new();
+        let mut objective = create_objective(cfg)?;
+        if let Some(o) = objective.as_mut() {
+            o.init(&data.metadata, n)?;
+            warnings.extend(o.take_warnings());
+        }
+        let metrics = Self::make_metrics(cfg, &data)?;
+        let mut scores = vec![0.0; n * ntpi];
+        let has_init_score = match data.init_score() {
+            Some(s) if s.len() == n * ntpi => {
+                scores.copy_from_slice(s);
+                true
+            }
+            Some(s) => {
+                return Err(LgbmError::InvalidData(format!(
+                    "init_score has {} values, expected {}",
+                    s.len(),
+                    n * ntpi
+                )));
+            }
+            None => false,
+        };
+        self.set_training_objective(objective)?;
+        let cfg = self.config.as_ref().unwrap();
+        let first = self.num_init_iteration * ntpi;
+        let st = self.train.as_mut().unwrap();
+        for (j, t) in self.models[first..first + st.iter * ntpi].iter().enumerate() {
+            let k = j % ntpi;
+            t.add_prediction_to_score(&data, &mut scores[k * n..(k + 1) * n]);
+        }
+        st.learner.reset_training_data(data.clone())?;
+        st.scores = scores;
+        st.has_init_score = has_init_score;
+        st.grad = vec![0.0; n * ntpi];
+        st.hess = vec![0.0; n * ntpi];
+        st.metrics = metrics;
+        st.sampler.reset_sample_config(cfg, &data, self.objective.as_ref(), true)?;
+        self.max_feature_idx = data.num_total_features() as i32 - 1;
+        self.label_index = data.label_idx;
+        self.feature_names = data.feature_names().to_vec();
+        self.feature_infos = data.feature_infos();
+        st.data = data;
+        if self.is_rf {
+            self.rf_reset_training_data()?;
+        }
+        Ok(warnings)
     }
 
     /// One random-forest iteration: a tree on the fixed gradients, then the
@@ -617,10 +832,9 @@ impl Gbdt {
         let init_iter = self.num_init_iteration;
         {
             let st = self.train.as_mut().unwrap();
-            if let Some(s) = st.sampler.as_mut() {
-                if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                    st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
-                }
+            let s = &mut st.sampler;
+            if s.bagging(st.iter, &mut st.grad, &mut st.hess)? {
+                st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
             }
         }
         for k in 0..ntpi {
@@ -737,7 +951,7 @@ impl Gbdt {
             None => {
                 if self.objective.is_none() {
                     return Err(LgbmError::InvalidParameter(
-                        "no objective function; provide gradients and hessians".into(),
+                        "No objective function provided".into(),
                     ));
                 }
                 for (k, s) in init_scores.iter_mut().enumerate() {
@@ -745,16 +959,15 @@ impl Gbdt {
                 }
                 if by_query {
                     let st = self.train.as_mut().unwrap();
-                    if let Some(s) = st.sampler.as_mut() {
-                        if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                            st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
-                        }
+                    let s = &mut st.sampler;
+                    if s.bagging(st.iter, &mut st.grad, &mut st.hess)? {
+                        st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
                     }
                 }
                 self.training_score();
                 let st = self.train.as_mut().unwrap();
                 let obj = self.objective.as_ref().unwrap();
-                let sampled = st.sampler.as_ref().and_then(|s| s.sampled_queries());
+                let sampled = st.sampler.sampled_queries();
                 let view = ScoreView { scores: &st.scores, num_data: n, num_outputs: ntpi };
                 let pool = self.pool.clone();
                 let mut compute = || match sampled {
@@ -769,10 +982,10 @@ impl Gbdt {
             Some((g, h)) => {
                 if self.objective.is_some() {
                     return Err(LgbmError::InvalidParameter(
-                        "custom gradients require objective=none/custom".into(),
+                        "Check failed: objective_function_ == nullptr".into(),
                     ));
                 }
-                if by_query && self.train.as_ref().unwrap().sampler.is_some() {
+                if by_query && self.train.as_ref().unwrap().sampler.sampled_queries().is_some() {
                     return Err(LgbmError::Unsupported(
                         "bagging_by_query with custom gradients: upstream skips bagging but still \
                          updates the scores of rows from its never-filled bagging buffer"
@@ -796,10 +1009,9 @@ impl Gbdt {
         // upstream: data_sample_strategy_->Bagging
         if !by_query {
             let st = self.train.as_mut().unwrap();
-            if let Some(s) = st.sampler.as_mut() {
-                if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
-                    st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
-                }
+            let s = &mut st.sampler;
+            if s.bagging(st.iter, &mut st.grad, &mut st.hess)? {
+                st.learner.set_bagging_data(Some(s.in_bag()), s.is_use_subset());
             }
         }
 
@@ -819,8 +1031,8 @@ impl Gbdt {
                     Some(p) => p.install(|| learner.train(g, h))?,
                     None => learner.train(g, h)?,
                 };
-                if let Some(s) = st.sampler.as_ref().filter(|s| s.by_query_subset()) {
-                    for (i, &row) in s.in_bag().iter().enumerate() {
+                if st.sampler.by_query_subset() {
+                    for (i, &row) in st.sampler.in_bag().iter().enumerate() {
                         st.grad[offset + i] = st.grad[offset + row as usize];
                         st.hess[offset + i] = st.hess[offset + row as usize];
                     }
@@ -1005,16 +1217,8 @@ impl Gbdt {
     /// Evaluate the built-in metrics on the training data.
     pub fn eval_train(&self) -> Vec<EvalResult> {
         let Some(st) = self.train.as_ref() else { return Vec::new() };
-        let metrics: Vec<Metric> = if st.metrics.is_empty() {
-            self.config
-                .as_ref()
-                .and_then(|c| Self::make_metrics(c, &st.data).ok())
-                .unwrap_or_default()
-        } else {
-            st.metrics.clone()
-        };
         let mut out = Vec::new();
-        for m in &metrics {
+        for m in &st.metrics {
             self.push_evals(&mut out, "training", m, &st.scores);
         }
         out
@@ -1136,28 +1340,6 @@ impl Gbdt {
         self.loaded_parameters.as_deref()
     }
 
-    /// Switch to caller-supplied gradients (upstream: `reset_parameter({"objective": "none"})`).
-    /// Scores accumulated so far are kept.
-    pub fn clear_objective(&mut self) {
-        self.objective = None;
-        if let Some(c) = self.config.as_mut() {
-            c.objective = "custom".into();
-        }
-        self.reset_config();
-    }
-
-    /// upstream: `Booster::ResetConfig` with only `learning_rate` changed
-    /// (`GBDT::ResetConfig` sets `shrinkage_rate_`); applies to later iterations.
-    pub fn set_learning_rate(&mut self, value: &str) -> Result<()> {
-        let Some(c) = self.config.as_mut() else {
-            return Err(LgbmError::Unsupported("reset_parameter on a loaded model".into()));
-        };
-        c.learning_rate = crate::config::parse_checked_double("learning_rate", value)?;
-        c.explicit.insert("learning_rate".into(), value.trim().to_string());
-        self.reset_config();
-        Ok(())
-    }
-
     /// Drop the training state (datasets, scores, learner) and keep the model.
     pub fn free_training_state(&mut self) {
         self.train = None;
@@ -1177,8 +1359,8 @@ fn update_score(st: &mut TrainState, pool: &Option<Arc<rayon::ThreadPool>>, tree
     let offset = k * n;
     let mut update = || {
         st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
-        if let Some(s) = st.sampler.as_ref().filter(|s| s.bag_cnt() < n) {
-            tree.add_prediction_to_score_rows(&st.data, s.out_of_bag(), &mut st.scores[offset..offset + n]);
+        if st.sampler.is_bagging() {
+            tree.add_prediction_to_score_rows(&st.data, st.sampler.out_of_bag(), &mut st.scores[offset..offset + n]);
         }
         for v in st.valid.iter_mut() {
             let vn = v.data.num_data();

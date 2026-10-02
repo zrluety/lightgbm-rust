@@ -31,6 +31,16 @@ enum Kind {
 #[derive(Debug, Clone)]
 pub struct SampleStrategy {
     kind: Kind,
+    /// upstream's strategy class (`GOSSStrategy` or `BaggingSampleStrategy`),
+    /// chosen once from `data_sample_strategy`.
+    goss: bool,
+    /// The bagging fields of the strategy's `config_` (fraction, freq,
+    /// pos fraction, neg fraction), which a reset compares against.
+    bag_config: (f64, i32, f64, f64),
+    /// The tree learner was given a subset bag (since the last dataset change).
+    learner_on_subset: bool,
+    /// The tree learner was given the row list of a full-data bag.
+    learner_had_rows: bool,
     num_data: usize,
     num_tree_per_iteration: usize,
     num_threads: usize,
@@ -73,16 +83,56 @@ fn block_info_force_size(num_threads: usize, cnt: usize, min_cnt_per_block: usiz
 
 impl SampleStrategy {
     /// upstream: `CreateSampleStrategy` + `ResetSampleConfig(config, true)`.
-    /// Returns `None` when no subsampling is configured.
     pub fn new(
         cfg: &Config,
         data: &Dataset,
         objective: Option<&Objective>,
         num_tree_per_iteration: usize,
         num_threads: usize,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
+        let goss = cfg.data_sample_strategy == "goss";
+        let mut s = Self {
+            kind: Kind::Bagging { fraction: 1.0, freq: 0, balanced: None },
+            goss,
+            bag_config: (cfg.bagging_fraction, cfg.bagging_freq, cfg.pos_bagging_fraction, cfg.neg_bagging_fraction),
+            learner_on_subset: false,
+            learner_had_rows: false,
+            num_data: data.num_data(),
+            num_tree_per_iteration,
+            num_threads: num_threads.max(1),
+            rands: Vec::new(),
+            indices: Vec::new(),
+            bag_cnt: data.num_data(),
+            need_re_bagging: false,
+            label: Vec::new(),
+            by_query: None,
+            use_subset: false,
+        };
+        s.reset_sample_config(cfg, data, objective, true)?;
+        Ok(s)
+    }
+
+    /// upstream: `ResetSampleConfig` of `GOSSStrategy` or
+    /// `BaggingSampleStrategy`; `is_change_dataset` with a new training set.
+    /// A bagging reset that keeps the fractions and frequency keeps the
+    /// current bag and generators, as upstream.
+    pub fn reset_sample_config(
+        &mut self,
+        cfg: &Config,
+        data: &Dataset,
+        objective: Option<&Objective>,
+        is_change_dataset: bool,
+    ) -> Result<()> {
         let n = data.num_data();
-        let kind = if cfg.data_sample_strategy == "goss" {
+        self.num_data = n;
+        if is_change_dataset {
+            // upstream: the tree learner moves to the new dataset
+            self.learner_on_subset = false;
+        }
+        let reseed = |seed: i32| -> Vec<Random> {
+            (0..n.div_ceil(BAGGING_RAND_BLOCK)).map(|i| Random::new(seed.wrapping_add(i as i32))).collect()
+        };
+        if self.goss {
             if cfg.top_rate + cfg.other_rate > 1.0 {
                 return Err(LgbmError::InvalidParameter(
                     "Check failed: (config_->top_rate + config_->other_rate) <= (1.0f)".into(),
@@ -96,70 +146,76 @@ impl SampleStrategy {
             if cfg.bagging_freq > 0 && cfg.bagging_fraction != 1.0 {
                 return Err(LgbmError::InvalidParameter("Cannot use bagging in GOSS".into()));
             }
-            Kind::Goss { top_rate: cfg.top_rate, other_rate: cfg.other_rate, learning_rate: cfg.learning_rate }
+            self.kind = Kind::Goss { top_rate: cfg.top_rate, other_rate: cfg.other_rate, learning_rate: cfg.learning_rate };
+            self.indices.resize(n, 0);
+            self.rands = reseed(cfg.bagging_seed);
+            // upstream keeps `bag_data_cnt_` from the last bag
+            self.use_subset = cfg.top_rate + cfg.other_rate <= 0.5;
+            return self.check_subset_switch();
+        }
+        let num_pos = objective.map_or(0, |o| o.num_positive_data());
+        let balanced = (cfg.pos_bagging_fraction < 1.0 || cfg.neg_bagging_fraction < 1.0) && num_pos > 0;
+        if !((cfg.bagging_fraction < 1.0 || balanced) && cfg.bagging_freq > 0) {
+            if !is_change_dataset && (self.bag_cnt < n || self.need_re_bagging) {
+                return Err(LgbmError::Unsupported(
+                    "disabling bagging during training after a bag was drawn (upstream keeps training on the \
+                     stale bag and stops updating out-of-bag scores)"
+                        .into(),
+                ));
+            }
+            // upstream leaves `config_` (and so `bag_config`) unchanged here
+            self.bag_cnt = n;
+            self.indices.clear();
+            self.use_subset = false;
+            self.by_query = None;
+            return Ok(());
+        }
+        self.need_re_bagging = false;
+        let bag_config = (cfg.bagging_fraction, cfg.bagging_freq, cfg.pos_bagging_fraction, cfg.neg_bagging_fraction);
+        if !is_change_dataset && self.bag_config == bag_config {
+            if self.by_query.is_some() != cfg.bagging_by_query && self.bag_cnt < n {
+                return Err(LgbmError::Unsupported("changing bagging_by_query during training".into()));
+            }
+            return Ok(());
+        }
+        self.bag_config = bag_config;
+        let freq = cfg.bagging_freq;
+        self.kind = Kind::Bagging {
+            fraction: cfg.bagging_fraction,
+            freq,
+            balanced: balanced.then_some((cfg.pos_bagging_fraction, cfg.neg_bagging_fraction)),
+        };
+        self.bag_cnt = if balanced {
+            (num_pos as f64 * cfg.pos_bagging_fraction) as usize
+                + ((n - num_pos) as f64 * cfg.neg_bagging_fraction) as usize
         } else {
-            let num_pos = objective.map_or(0, |o| o.num_positive_data());
-            let balanced = (cfg.pos_bagging_fraction < 1.0 || cfg.neg_bagging_fraction < 1.0) && num_pos > 0;
-            if !((cfg.bagging_fraction < 1.0 || balanced) && cfg.bagging_freq > 0) {
-                return Ok(None);
-            }
-            Kind::Bagging {
-                fraction: cfg.bagging_fraction,
-                freq: cfg.bagging_freq,
-                balanced: balanced.then_some((cfg.pos_bagging_fraction, cfg.neg_bagging_fraction)),
-            }
+            (cfg.bagging_fraction * n as f64) as usize
         };
-        let bag_cnt = match kind {
-            Kind::Bagging { balanced: Some((pos, neg)), .. } => {
-                let num_pos = objective.map_or(0, |o| o.num_positive_data());
-                (num_pos as f64 * pos) as usize + ((n - num_pos) as f64 * neg) as usize
-            }
-            Kind::Bagging { fraction, .. } => (fraction * n as f64) as usize,
-            Kind::Goss { .. } => n,
-        };
-        let label = match kind {
-            Kind::Bagging { balanced: Some(_), .. } => data.label().to_vec(),
-            _ => Vec::new(),
-        };
-        let by_query = match kind {
-            Kind::Bagging { freq, .. } if cfg.bagging_by_query => {
-                // upstream has zero queries without query data: every bag is
-                // empty and no tree can split
-                let boundaries = data.metadata.query_boundaries.clone().unwrap_or_else(|| vec![0]);
-                // upstream ResetSampleConfig (non-CUDA): subset when
-                // average_bag_rate <= 0.5 and num_feature_groups < 100
-                let average_bag_rate = (bag_cnt as f64 / n as f64) / freq as f64;
-                Some(ByQuery {
-                    boundaries,
-                    sampled: Vec::new(),
-                    use_subset: average_bag_rate <= 0.5 && data.num_feature_groups() < 100,
-                })
-            }
-            _ => None,
-        };
-        let use_subset = match kind {
-            // upstream GOSSStrategy::ResetSampleConfig
-            Kind::Goss { top_rate, other_rate, .. } => top_rate + other_rate <= 0.5,
-            // upstream BaggingSampleStrategy::ResetSampleConfig (non-CUDA)
-            Kind::Bagging { freq, .. } => {
-                (bag_cnt as f64 / n as f64) / freq as f64 <= 0.5 && data.num_feature_groups() < 100
-            }
-        };
-        Ok(Some(Self {
-            use_subset,
-            kind,
-            num_data: n,
-            num_tree_per_iteration,
-            num_threads: num_threads.max(1),
-            rands: (0..n.div_ceil(BAGGING_RAND_BLOCK))
-                .map(|i| Random::new(cfg.bagging_seed.wrapping_add(i as i32)))
-                .collect(),
-            indices: vec![0; n],
-            bag_cnt,
-            need_re_bagging: matches!(kind, Kind::Bagging { .. }),
-            label,
-            by_query,
-        }))
+        self.label = if balanced { data.label().to_vec() } else { Vec::new() };
+        self.indices.resize(n, 0);
+        self.rands = reseed(cfg.bagging_seed);
+        // upstream ResetSampleConfig (non-CUDA): subset when
+        // average_bag_rate <= 0.5 and num_feature_groups < 100
+        let average_bag_rate = (self.bag_cnt as f64 / n as f64) / freq as f64;
+        self.use_subset = average_bag_rate <= 0.5 && data.num_feature_groups() < 100;
+        self.by_query = cfg.bagging_by_query.then(|| ByQuery {
+            // upstream has zero queries without query data: every bag is
+            // empty and no tree can split
+            boundaries: data.metadata.query_boundaries.clone().unwrap_or_else(|| vec![0]),
+            sampled: Vec::new(),
+            use_subset: self.use_subset,
+        });
+        self.need_re_bagging = true;
+        self.check_subset_switch()
+    }
+
+    pub fn set_num_threads(&mut self, num_threads: usize) {
+        self.num_threads = num_threads.max(1);
+    }
+
+    /// Whether upstream's `bag_data_cnt_ < num_data_` (rows are left out).
+    pub fn is_bagging(&self) -> bool {
+        self.bag_cnt < self.num_data
     }
 
     /// upstream `bag_query_indices_` when `bagging_by_query` is on.
@@ -217,17 +273,18 @@ impl SampleStrategy {
     /// upstream: `SampleStrategy::Bagging`. Returns `true` when a new bag was
     /// drawn (the tree learner must then be given [`in_bag`](Self::in_bag)).
     /// GOSS rescales the gradients and Hessians of sampled small-gradient rows.
-    pub fn bagging(&mut self, iter: usize, grad: &mut [f32], hess: &mut [f32]) -> bool {
+    pub fn bagging(&mut self, iter: usize, grad: &mut [f32], hess: &mut [f32]) -> Result<bool> {
         match self.kind {
             Kind::Bagging { fraction, freq, balanced } => {
                 let n = self.num_data;
                 if !((self.bag_cnt < n && iter as i32 % freq == 0) || self.need_re_bagging) {
-                    return false;
+                    return Ok(false);
                 }
                 self.need_re_bagging = false;
+                self.note_bag();
                 if self.by_query.is_some() {
                     self.bag_queries(fraction);
-                    return true;
+                    return Ok(true);
                 }
                 // Chunks of upstream's ParallelPartitionRunner are multiples of
                 // BAGGING_RAND_BLOCK, so one sequential pass draws the same values.
@@ -254,15 +311,23 @@ impl SampleStrategy {
                     }
                 }
                 self.bag_cnt = left;
-                true
+                Ok(true)
             }
             Kind::Goss { top_rate, other_rate, learning_rate } => {
                 let n = self.num_data;
                 self.bag_cnt = n;
                 // upstream: `iter < static_cast<int>(1.0f / config_->learning_rate)`
                 if (iter as i64) < (1.0f32 as f64 / learning_rate) as i64 {
-                    return false;
+                    if self.learner_on_subset {
+                        return Err(LgbmError::Unsupported(
+                            "a GOSS warm-up iteration after a subset bag (a learning_rate reset; upstream trains \
+                             the full gradients on the previous bag's dataset)"
+                                .into(),
+                        ));
+                    }
+                    return Ok(false);
                 }
+                self.note_bag();
                 let (nblock, block) = block_info_force_size(self.num_threads, n, BAGGING_RAND_BLOCK);
                 let mut left_all: Vec<u32> = Vec::with_capacity(n);
                 let mut right_all: Vec<u32> = Vec::new();
@@ -279,9 +344,31 @@ impl SampleStrategy {
                 self.bag_cnt = left_all.len();
                 self.indices[..left_all.len()].copy_from_slice(&left_all);
                 self.indices[left_all.len()..].copy_from_slice(&right_all);
-                true
+                Ok(true)
             }
         }
+    }
+
+    fn note_bag(&mut self) {
+        if self.use_subset {
+            self.learner_on_subset = true;
+        } else {
+            self.learner_had_rows = true;
+        }
+    }
+
+    /// Upstream's tree learner keeps the dataset of a subset bag (and the
+    /// row list of a full-data bag); a bag of the other kind then reads past
+    /// them.
+    fn check_subset_switch(&self) -> Result<()> {
+        if (self.use_subset && self.learner_had_rows) || (!self.use_subset && self.learner_on_subset) {
+            return Err(LgbmError::Unsupported(
+                "switching between subset and full-data bagging during training (upstream's tree learner keeps \
+                 the previous bag's dataset or row list and reads past it)"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// upstream: `GOSSStrategy::Helper` for rows `start..start + cnt`.

@@ -46,6 +46,18 @@ impl DataPartition {
         }
     }
 
+    /// upstream: `DataPartition::ResetLeaves`.
+    pub fn reset_leaves(&mut self, max_leaves: usize) {
+        self.leaf_begin.resize(max_leaves, 0);
+        self.leaf_count.resize(max_leaves, 0);
+    }
+
+    /// upstream: `DataPartition::ResetNumData`.
+    pub fn reset_num_data(&mut self, num_data: usize) {
+        self.num_data = num_data;
+        self.indices.resize(num_data, 0);
+    }
+
     /// upstream: `DataPartition::SetUsedDataIndices`; takes effect at the next [`init`](Self::init).
     pub fn set_used_data_indices(&mut self, used: Option<&[u32]>) {
         match used {

@@ -317,17 +317,6 @@ pub(crate) fn parse_double(key: &str, v: &str) -> Result<f64> {
     Err(LgbmError::InvalidParameter(format!("Parameter {key} should be of type double, got \"{v}\"")))
 }
 
-/// Parse and range-check one double parameter the way `Config::Set` does.
-pub(crate) fn parse_checked_double(key: &str, v: &str) -> Result<f64> {
-    let x = parse_double(key, v)?;
-    if let Some(spec) = param_specs().iter().find(|s| s.name == key) {
-        for c in &spec.checks {
-            check_value(key, x, c)?;
-        }
-    }
-    Ok(x)
-}
-
 fn check_value(key: &str, value: f64, check: &str) -> Result<()> {
     let c = check.replace(' ', "");
     let (op, rhs) = if let Some(r) = c.strip_prefix(">=") {
@@ -514,7 +503,7 @@ impl Default for Config {
         Self {
             objective: "regression".into(),
             boosting: "gbdt".into(),
-            metric: vec!["l2".into()],
+            metric: Vec::new(),
             num_iterations: 100,
             learning_rate: 0.1,
             num_leaves: 31,
@@ -636,6 +625,39 @@ impl Config {
         V: AsRef<str>,
     {
         let mut cfg = Config::default();
+        cfg.set(pairs)?;
+        Ok(cfg)
+    }
+
+    /// upstream `Config::Set` on an existing config (`Booster::ResetConfig`):
+    /// only the given keys change, then the conflict checks run again.
+    /// Returns the canonical keys that were given. Warnings are appended.
+    pub fn set<I, K, V>(&mut self, pairs: I) -> Result<BTreeMap<String, String>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let explicit = self.str2map(pairs);
+        self.set_map(&explicit)?;
+        Ok(explicit)
+    }
+
+    /// [`Config::set`] with keys already through `Str2Map` (canonical names).
+    pub fn set_map(&mut self, explicit: &BTreeMap<String, String>) -> Result<()> {
+        self.apply(explicit)?;
+        self.explicit.extend(explicit.iter().map(|(k, v)| (k.clone(), v.clone())));
+        Ok(())
+    }
+
+    /// upstream `Config::Str2Map`, with its warnings pushed to `self.warnings`.
+    fn str2map<I, K, V>(&mut self, pairs: I) -> BTreeMap<String, String>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let cfg = self;
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
 
         // KeepFirstValues
@@ -692,13 +714,22 @@ impl Config {
                 }
             }
         }
-        cfg.apply(&explicit)?;
-        cfg.explicit = explicit;
-        Ok(cfg)
+        explicit
     }
 
     fn apply(&mut self, p: &BTreeMap<String, String>) -> Result<()> {
         let reg = registry();
+        // upstream `GetString` (string and list parameters) ignores an empty
+        // value; `metric` reads it as "derive from the objective"
+        let given: BTreeMap<String, String> = p
+            .iter()
+            .filter(|(name, value)| {
+                let ty = reg.specs[reg.by_name[name.as_str()]].cpp_type.as_str();
+                !value.is_empty() || name.as_str() == "metric" || matches!(ty, "int" | "double" | "bool")
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let p = &given;
         for (name, value) in p {
             let spec = &reg.specs[reg.by_name[name]];
             if spec.cpp_type == "int" || spec.cpp_type == "double" {
@@ -778,12 +809,14 @@ impl Config {
                 _ => return Err(LgbmError::InvalidParameter(format!("Unknown sample strategy {v}"))),
             };
         }
+        // upstream GetMetricType: the objective's metric only when none is set
         let metric_value = p.get("metric").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-        self.metric = if metric_value.is_empty() {
-            parse_metrics(&self.objective)
-        } else {
-            parse_metrics(&metric_value)
-        };
+        if p.contains_key("metric") {
+            self.metric = if metric_value.is_empty() { Vec::new() } else { parse_metrics(&metric_value) };
+        }
+        if self.metric.is_empty() && metric_value.is_empty() {
+            self.metric = parse_metrics(&self.objective);
+        }
 
         set_int!(num_iterations);
         set_f64!(learning_rate);

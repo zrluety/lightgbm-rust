@@ -18,6 +18,11 @@ import pytest
 import lightgbm_rust as lgb_rs
 
 from .conftest import (
+    _COL,
+    _FS,
+    _IC,
+    _MC,
+    _RF_BAG,
     CASES,
     DETERMINISTIC,
     REGRESSION_OBJECTIVES,
@@ -1285,6 +1290,298 @@ def test_reset_parameter_errors():
             bst.reset_parameter({"learning_rate": "1.5x"})
         with pytest.raises(mod.basic.LightGBMError, match="Unknown token abc in data file"):
             mod.train({**case.full_params, "lambda_l2": "abc"}, mod.Dataset(case.X, label=case.y), num_boost_round=1)
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot change boosting during training"):
+            bst.reset_parameter({"boosting": "dart"})
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot change metric during training"):
+            bst.reset_parameter({"metric": "l1"})
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot change max_bin after constructed Dataset handle."):
+            bst.reset_parameter({"max_bin": 63})
+        with pytest.raises(mod.basic.LightGBMError, match="Number of classes must be 1 for non-multiclass training"):
+            bst.reset_parameter({"num_class": 3})
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Number of classes should be specified and greater than 1 for multiclass training"):
+            bst.reset_parameter({"objective": "multiclass"})
+        bst.reset_parameter({"boosting": "gbdt", "metric": "l2", "max_bin": 255})
+        mono = mod.Booster({**case.full_params, "monotone_constraints": [1, 0, 0, 0, 0, 0]},
+                           mod.Dataset(case.X, label=case.y))
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Cannot use ``monotone_constraints`` in regression_l1 objective, please disable it."):
+            mono.reset_parameter({"objective": "regression_l1"})
+        with pytest.raises(mod.basic.LightGBMError,
+                           match=r"Check failed: \(static_cast<size_t>\(train_data_->num_total_features\(\)\)\) == "
+                                 r"\(config->feature_contri.size\(\)\)"):
+            bst.reset_parameter({"feature_contri": [1.0, 2.0]})
+        mc = mod.Booster({**case.full_params, "objective": "multiclass", "num_class": 3},
+                         mod.Dataset(case.X, label=np.arange(len(case.y)) % 3))
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot change num_class during training"):
+            mc.reset_parameter({"objective": "multiclass", "num_class": 4})
+        mc.reset_parameter({"objective": "multiclassova", "num_class": 3})
+        rf = mod.Booster({**case.full_params, "boosting": "rf", "bagging_fraction": 0.7, "bagging_freq": 1},
+                         mod.Dataset(case.X, label=case.y))
+        with pytest.raises(mod.basic.LightGBMError, match=r"Check failed: \(config->bagging_freq > 0 && "):
+            rf.reset_parameter({"bagging_fraction": 1.0})
+        tr = mod.Dataset(case.X, label=case.y, free_raw_data=False)
+        upd = mod.Booster(case.full_params, tr)
+        upd.update()
+        with pytest.raises(TypeError, match="Training data should be Dataset instance, met int"):
+            upd.update(train_set=1)
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Cannot reset training data, since new training data has different bin mappers"):
+            upd.update(train_set=mod.Dataset(case.X[:500] * 3.0, label=case.y[:500]))
+        other = mod.Dataset(case.X[:500], label=case.y[:500], reference=tr)
+        other._predictor = object()
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Replace training data failed, you should use same predictor for these data"):
+            upd.update(train_set=other)
+
+
+def _per_round(values, rounds=12):
+    return [values[i % len(values)] for i in range(rounds)]
+
+
+_LEAVES_SCHEDULE = [31, 7, 63, 15, 100, 2, 31, 40, 5, 63, 64, 31]
+_FF_SCHEDULE = [1.0, 0.5, 0.5, 0.8, 1.0, 0.34, 1.0, 1.0, 0.6, 0.6, 0.9, 0.7]
+_CEGB = {"cegb_penalty_split": 0.5, "cegb_penalty_feature_lazy": [0.1] * 6, "cegb_penalty_feature_coupled": [1.0] * 6}
+_GOSS_FULL = {"data_sample_strategy": "goss", "learning_rate": 0.5, "top_rate": 0.4, "other_rate": 0.2}
+
+# Each case resets parameters through the reset_parameter callback before every round.
+# Schedules that upstream cannot run (it reads past its buffers) are in
+# test_reset_parameter_unsupported.
+RESET_SCHEDULES = [
+    (make_case("reset_num_leaves", "regression", {}, rounds=12), {"num_leaves": _LEAVES_SCHEDULE}),
+    (make_case("reset_num_leaves_col_wise", "regression", dict(_COL), rounds=12), {"num_leaves": _LEAVES_SCHEDULE}),
+    (make_case("reset_feature_fraction", "regression", {}, rounds=12), {"feature_fraction": _FF_SCHEDULE}),
+    (make_case("reset_feature_fraction_seed", "regression", {"feature_fraction": 0.5}, rounds=12),
+     {"feature_fraction_seed": _per_round([1, 1, 2, 2, 3, 3, 1, 1, 4, 4, 5, 5])}),
+    (make_case("reset_feature_fraction_bynode", "regression", {}, rounds=12),
+     {"feature_fraction_bynode": _FF_SCHEDULE}),
+    (make_case("reset_regularization", "regression", {}, rounds=12),
+     {"lambda_l2": _per_round([0.0, 1.0, 10.0, 0.5]), "lambda_l1": _per_round([0.0, 0.5, 0.0]),
+      "max_depth": _per_round([-1, 3, 5, 2]), "min_gain_to_split": _per_round([0, 0.5, 0, 1.0]),
+      "path_smooth": _per_round([0, 1, 5, 0]), "max_delta_step": _per_round([0, 0.3, 0, 1])}),
+    (make_case("reset_min_data_in_leaf", "regression", {"feature_pre_filter": False}, rounds=12),
+     {"min_data_in_leaf": _per_round([20, 5, 50, 100]), "min_sum_hessian_in_leaf": _per_round([1e-3, 1.0, 10.0])}),
+    (make_case("reset_extra_trees", "regression", {"extra_trees": True}, rounds=12),
+     {"lambda_l2": _per_round([0.0, 1.0])}),
+    (make_case("reset_extra_seed", "regression", {"extra_trees": True}, rounds=12),
+     {"extra_seed": _per_round([1, 2, 3, 4])}),
+    (make_case("reset_bagging_full", "regression", {"bagging_fraction": 0.7, "bagging_freq": 1}, rounds=12),
+     {"bagging_fraction": _per_round([0.7, 0.6, 0.9, 0.8])}),
+    (make_case("reset_bagging_subset", "regression", {"bagging_fraction": 0.3, "bagging_freq": 1}, rounds=12),
+     {"bagging_fraction": _per_round([0.3, 0.2, 0.4, 0.1])}),
+    (make_case("reset_bagging_seed", "regression", {"bagging_fraction": 0.5, "bagging_freq": 1}, rounds=12),
+     {"bagging_seed": _per_round([3, 3, 4, 5])}),
+    (make_case("reset_bagging_freq", "regression", {"bagging_fraction": 0.3, "bagging_freq": 2}, rounds=12),
+     {"bagging_freq": _per_round([2, 3, 1, 1, 4, 2])}),
+    (make_case("reset_bagging_enable", "regression", {"bagging_fraction": 1.0, "bagging_freq": 1}, rounds=12),
+     {"bagging_fraction": [1.0, 1.0, 0.6, 0.6, 0.7, 0.8, 0.9, 0.6, 0.7, 0.7, 0.8, 0.8]}),
+    (make_case("reset_balanced_bagging", "binary", {"pos_bagging_fraction": 0.5, "bagging_freq": 1}, rounds=12),
+     {"neg_bagging_fraction": _per_round([1.0, 0.9, 0.7, 0.8])}),
+    (make_case("reset_goss_learning_rate", "regression", dict(_GOSS_FULL), rounds=12),
+     {"learning_rate": _per_round([0.5, 0.3, 0.1, 0.05])}),
+    (make_case("reset_goss_rates", "regression", {"data_sample_strategy": "goss", "learning_rate": 0.5}, rounds=12),
+     {"top_rate": _per_round([0.2, 0.3, 0.1, 0.25]), "other_rate": _per_round([0.1, 0.2, 0.05, 0.1])}),
+    (make_case("reset_cegb", "regression", dict(_CEGB), rounds=12),
+     {"cegb_penalty_split": _per_round([0.5, 0.1, 2.0]), "cegb_tradeoff": _per_round([1.0, 0.5, 2.0, 1.0])}),
+    (make_case("reset_cegb_fewer_leaves", "regression", dict(_CEGB), rounds=12),
+     {"num_leaves": _per_round([31, 15, 7, 31])}),
+    (make_case("reset_cegb_enable", "regression", {}, rounds=12),
+     {"cegb_penalty_split": _per_round([0.0, 0.0, 0.5, 0.5, 0.0, 1.0])}),
+    (make_case("reset_rf_feature_fraction", "regression", dict(_RF_BAG), rounds=12),
+     {"feature_fraction": _per_round([1.0, 0.5, 0.8, 0.8])}),
+    (make_case("reset_rf_bagging", "regression", dict(_RF_BAG), rounds=12),
+     {"bagging_fraction": _per_round([0.7, 0.6, 0.9, 0.7])}),
+    (make_case("reset_dart_learning_rate", "regression", {"boosting": "dart"}, rounds=12),
+     {"learning_rate": _per_round([0.1, 0.2, 0.05])}),
+    (make_case("reset_dart_drop", "regression", {"boosting": "dart"}, rounds=12),
+     {"drop_rate": _per_round([0.1, 0.5, 0.3]), "drop_seed": _per_round([4, 4, 5, 6])}),
+    (make_case("reset_monotone_method", "regression", {"monotone_constraints": _MC}, rounds=12),
+     {"monotone_constraints_method": _per_round(["basic", "intermediate", "advanced"])}),
+    (make_case("reset_monotone_penalty", "regression", {"monotone_constraints": _MC}, rounds=12),
+     {"monotone_penalty": _per_round([0.0, 1.0, 2.0])}),
+    (make_case("reset_monotone_constraints", "regression", {"monotone_constraints": _MC}, rounds=12),
+     {"monotone_constraints": _per_round([_MC, [0] * 6, [1, -1, 0, 0, 0, 0]])}),
+    (make_case("reset_feature_contri", "regression", {}, rounds=12),
+     {"feature_contri": _per_round([[1.0] * 6, [0.5, 1, 1, 1, 1, 2.0]])}),
+    (make_case("reset_interaction_constraints", "regression", {"interaction_constraints": _IC}, rounds=12),
+     {"feature_fraction": _per_round([1.0, 0.5, 0.8]), "num_leaves": _per_round([31, 63, 15])}),
+    (make_case("reset_forced_splits", "regression", {"forcedsplits_filename": _FS["three"]}, rounds=12),
+     {"forcedsplits_filename": _per_round([_FS["three"], _FS["three"], "", _FS["root"], "missing.json"])}),
+    (make_case("reset_multiclass", "multiclass", {"num_class": 3}, rounds=12),
+     {"num_leaves": _per_round([31, 15, 63]), "feature_fraction": _per_round([1.0, 0.6]),
+      "lambda_l2": _per_round([0.0, 2.0, 0.5])}),
+    (make_case("reset_threads_bagging", "regression", {"num_threads": 4, "bagging_fraction": 0.6, "bagging_freq": 1},
+               n=40000, rounds=12),
+     {"bagging_fraction": _per_round([0.6, 0.7, 0.8]), "num_leaves": _per_round([31, 63, 15])}),
+    (make_case("reset_threads_col_wise", "regression", {"num_threads": 4, **_COL}, n=40000, rounds=12),
+     {"feature_fraction": _per_round([1.0, 0.5, 0.8]), "num_threads": _per_round([4, 2, 1, 4])}),
+]
+
+
+@pytest.mark.parametrize("case,schedule", RESET_SCHEDULES, ids=[c.name for c, _ in RESET_SCHEDULES])
+def test_reset_parameter_schedules(case, schedule, recorder):
+    """Booster::ResetConfig through the reset_parameter callback (GBDT/RF/DART and tree learner resets)."""
+    rec = recorder(case.name)
+    hist = {}
+    models = {}
+    for mod in (lgb_rs, lgb_up):
+        res: Dict[str, Any] = {}
+        train = mod.Dataset(case.X, label=case.y, weight=case.weight, free_raw_data=False)
+        bst = mod.train(case.full_params, train, num_boost_round=case.num_boost_round,
+                        valid_sets=[train.create_valid(case.Xv, label=case.yv)],
+                        callbacks=[mod.reset_parameter(**schedule), mod.record_evaluation(res)])
+        models[mod.__name__] = bst.model_to_string()
+        hist[mod.__name__] = res
+    rec.compare("model_text", "model_text", models["lightgbm_rust"], models["lightgbm"])
+    # 4 threads: upstream's OpenMP metric reduction adds per-thread sums in arrival order
+    tol = "multithread" if case.full_params.get("num_threads", 1) > 1 else "metrics"
+    for m, v in hist["lightgbm"]["valid_0"].items():
+        rec.compare(f"valid_0.{m}[per iteration]", tol, hist["lightgbm_rust"]["valid_0"].get(m), v)
+    rec.finish()
+
+
+RESET_CV = [c for c in RESET_SCHEDULES
+            if c[0].name in ("reset_num_leaves", "reset_feature_fraction", "reset_bagging_full", "reset_goss_rates")]
+
+
+@pytest.mark.parametrize("case,schedule", RESET_CV, ids=[c.name for c, _ in RESET_CV])
+def test_reset_parameter_cv(case, schedule, recorder):
+    """The reset_parameter callback resets every fold's booster."""
+    rec = recorder(case.name)
+    res = {}
+    for mod in (lgb_rs, lgb_up):
+        res[mod.__name__] = mod.cv(case.full_params, mod.Dataset(case.X, label=case.y),
+                                   num_boost_round=case.num_boost_round, nfold=3, stratified=False, seed=3,
+                                   return_cvbooster=True, callbacks=[mod.reset_parameter(**schedule)])
+    for k in res["lightgbm"]:
+        if k == "cvbooster":
+            for i, (b_rs, b_up) in enumerate(zip(res["lightgbm_rust"][k].boosters, res["lightgbm"][k].boosters)):
+                rec.compare(f"cv fold {i} model", "model_text", b_rs.model_to_string(), b_up.model_to_string())
+        else:
+            rec.compare(f"cv[{k}]", "metrics", res["lightgbm_rust"][k], res["lightgbm"][k])
+    rec.finish()
+
+
+# Datasets constructed outside train() get no parameters, and upstream's Dataset
+# constructor then resets OpenMP to all cores (multi-threaded metric sums).
+_ONE_THREAD = {"num_threads": 1, "verbosity": -1}
+
+# Rounds (0-based) before which reset_parameter is called on a Booster.
+RESET_OBJECTIVES = [
+    (make_case("reset_objective_regression", "regression", {}, rounds=12),
+     {3: {"objective": "huber"}, 6: {"objective": "regression_l1"}, 9: {"objective": "fair", "fair_c": 0.5}}),
+    (make_case("reset_objective_binary", "binary", {}, weighted=True, rounds=12),
+     {4: {"objective": "cross_entropy"}, 8: {"objective": "binary", "sigmoid": 0.7}}),
+    (make_case("reset_objective_rf", "regression", dict(_RF_BAG), rounds=12),
+     {4: {"objective": "huber"}, 8: {"objective": "regression"}}),
+    (make_case("reset_objective_multiclass", "multiclass", {"num_class": 3}, rounds=12),
+     {4: {"objective": "multiclassova", "num_class": 3}}),
+    (make_case("reset_seed", "regression", {"bagging_fraction": 0.5, "bagging_freq": 1, "feature_fraction": 0.7},
+               rounds=12),
+     {3: {"seed": 7}, 7: {"seed": 9, "learning_rate": 0.3}}),
+]
+
+
+@pytest.mark.parametrize("case,steps", RESET_OBJECTIVES, ids=[c.name for c, _ in RESET_OBJECTIVES])
+def test_reset_objective(case, steps, recorder):
+    """Booster.reset_parameter with `objective` (the objective is re-created on the training data)."""
+    rec = recorder(case.name)
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        train = mod.Dataset(case.X, label=case.y, weight=case.weight, free_raw_data=False)
+        bst = mod.Booster(case.full_params, train)
+        bst.add_valid(train.create_valid(case.Xv, label=case.yv, params=_ONE_THREAD), "valid")
+        evals = []
+        for i in range(case.num_boost_round):
+            if i in steps:
+                bst.reset_parameter(steps[i])
+            bst.update()
+            evals.append([e[2] for e in bst.eval_valid()])
+        out[mod.__name__] = (bst.model_to_string(), evals, bst.predict(case.Xv))
+    rec.compare("model_text", "model_text", out["lightgbm_rust"][0], out["lightgbm"][0])
+    rec.compare("valid[per iteration]", "metrics", out["lightgbm_rust"][1], out["lightgbm"][1])
+    rec.compare("predict", "predictions", out["lightgbm_rust"][2], out["lightgbm"][2])
+    rec.finish()
+
+
+UPDATE_TRAIN_SET = [
+    (make_case("update_train_set", "regression", {}, rounds=12), None),
+    (make_case("update_train_set_binary", "binary", {}, weighted=True, rounds=12), None),
+    (make_case("update_train_set_bagging", "regression", {"bagging_fraction": 0.5, "bagging_freq": 1}, rounds=12),
+     None),
+    (make_case("update_train_set_goss", "regression", {"data_sample_strategy": "goss", "learning_rate": 0.5},
+               rounds=12), None),
+    (make_case("update_train_set_rf", "regression", dict(_RF_BAG), rounds=12), None),
+    (make_case("update_train_set_dart", "regression", {"boosting": "dart"}, rounds=12), None),
+    (make_case("update_train_set_multiclass", "multiclass", {"num_class": 3}, rounds=12), None),
+    (make_case("update_train_set_cegb", "regression", dict(_CEGB), rounds=12), None),
+    (make_case("update_train_set_feature_fraction", "regression", {"feature_fraction": 0.5}, rounds=12), None),
+    (make_case("update_train_set_reset", "regression", {}, rounds=12), {"learning_rate": 0.3, "num_leaves": 63}),
+]
+
+
+@pytest.mark.parametrize("case,extra", UPDATE_TRAIN_SET, ids=[c.name for c, _ in UPDATE_TRAIN_SET])
+def test_update_train_set(case, extra, recorder):
+    """Booster.update(train_set=...) with a row subset built with reference=train (GBDT::ResetTrainingData)."""
+    rec = recorder(case.name)
+    idx = np.random.default_rng(5).choice(len(case.y), 1500, replace=False)
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        train = mod.Dataset(case.X, label=case.y, weight=case.weight, free_raw_data=False)
+        bst = mod.Booster(case.full_params, train)
+        bst.add_valid(train.create_valid(case.Xv, label=case.yv, params=_ONE_THREAD), "valid")
+        evals = []
+        for i in range(case.num_boost_round):
+            if i == 5:
+                w = None if case.weight is None else case.weight[idx]
+                if extra:
+                    bst.reset_parameter(extra)
+                bst.update(train_set=mod.Dataset(case.X[idx], label=case.y[idx], weight=w, reference=train,
+                                                 params=_ONE_THREAD))
+            else:
+                bst.update()
+            evals.append([e[2] for e in bst.eval_valid() + bst.eval_train()])
+        out[mod.__name__] = (bst.model_to_string(), evals)
+    rec.compare("model_text", "model_text", out["lightgbm_rust"][0], out["lightgbm"][0])
+    rec.compare("valid and training[per iteration]", "metrics", out["lightgbm_rust"][1], out["lightgbm"][1])
+    rec.finish()
+
+
+def test_reset_parameter_unsupported():
+    """Resets that upstream cannot run correctly: it reads or writes past its buffers (a check failure,
+    segfault or garbage), or keeps training on a stale bag. lightgbm-rust raises instead."""
+    case = make_case("reset_unsupported", "regression", {}, rounds=6)
+    unsupported = "not supported by lightgbm-rust yet"
+
+    def run(params, schedule):
+        lgb_rs.train({**case.full_params, **params}, lgb_rs.Dataset(case.X, label=case.y), num_boost_round=6,
+                     callbacks=[lgb_rs.reset_parameter(**schedule)])
+
+    # subset bag (rate <= 0.5) -> full-data bag: upstream's learner keeps the subset dataset
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: switching between subset and full-data"):
+        run({"bagging_fraction": 0.5, "bagging_freq": 1}, {"bagging_fraction": [0.5, 0.5, 0.7, 0.7, 0.7, 0.7]})
+    # full-data bag -> subset bag: upstream copies the old row list into the smaller subset partition
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: switching between subset and full-data"):
+        run({"bagging_fraction": 0.7, "bagging_freq": 1}, {"bagging_fraction": [0.7, 0.7, 0.3, 0.3, 0.3, 0.3]})
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: switching between subset and full-data"):
+        run({"data_sample_strategy": "goss", "learning_rate": 0.5}, {"top_rate": [0.2, 0.2, 0.2, 0.5, 0.5, 0.5]})
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: disabling bagging during training"):
+        run({"bagging_fraction": 0.7, "bagging_freq": 1}, {"bagging_fraction": [0.7, 0.7, 1.0, 1.0, 1.0, 1.0]})
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: a GOSS warm-up iteration after a subset bag"):
+        run({"data_sample_strategy": "goss", "learning_rate": 0.5}, {"learning_rate": [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]})
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: raising num_leaves with CEGB"):
+        run(dict(_CEGB), {"num_leaves": [31, 31, 63, 63, 63, 63]})
+    loaded = lgb_rs.Booster(model_str=lgb_rs.train(case.full_params, lgb_rs.Dataset(case.X, label=case.y),
+                                                   num_boost_round=2).model_to_string())
+    with pytest.raises(lgb_rs.basic.LightGBMError, match=f"{unsupported}: reset_parameter without training data"):
+        loaded.reset_parameter({"learning_rate": 0.2})
+    train = lgb_rs.Dataset(case.X, label=case.y, free_raw_data=False)
+    bst = lgb_rs.Booster(case.full_params, train)
+    bst.update()
+    train.set_label(case.y * 2.0)
+    with pytest.raises(lgb_rs.basic.LightGBMError,
+                       match=f"{unsupported}: changing fields of the training Dataset during training"):
+        bst.update()
 
 
 METRIC_CASES = [

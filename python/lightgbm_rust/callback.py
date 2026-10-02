@@ -149,10 +149,11 @@ class _ResetParameterCallback:
 
 
 def reset_parameter(**kwargs: Union[list, Callable]) -> Callable:
-    """Create a callback that resets parameters after the first iteration.
+    """Create a callback that resets the parameter after the first iteration.
 
-    lightgbm-rust: ``Booster.reset_parameter`` only supports switching the
-    objective to ``none``; other parameters raise ``LightGBMError``.
+    .. note::
+
+        The initial parameter will still take in-effect on first iteration.
     """
     return _ResetParameterCallback(**kwargs)
 

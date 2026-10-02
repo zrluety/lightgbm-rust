@@ -96,6 +96,21 @@ impl Cegb {
         }
     }
 
+    /// upstream `Init` after the first call (from `ResetConfig`): the
+    /// penalties are read from the new config, the per-leaf splits and the
+    /// used-feature bitsets are kept.
+    pub fn reset_config(&mut self, cfg: &Config) {
+        self.tradeoff = cfg.cegb_tradeoff;
+        self.penalty_split = cfg.cegb_penalty_split;
+        self.coupled = cfg.cegb_penalty_feature_coupled.clone();
+        self.lazy = cfg.cegb_penalty_feature_lazy.clone();
+    }
+
+    /// Leaves `splits_per_leaf` was sized for (upstream sizes it once).
+    pub fn num_leaves(&self) -> usize {
+        self.splits_per_leaf.len().checked_div(self.num_features).unwrap_or(usize::MAX)
+    }
+
     /// upstream `BeforeTrain`.
     pub fn before_train(&mut self) {
         for s in self.splits_per_leaf.iter_mut() {

@@ -184,6 +184,38 @@ fn block_prediction_matches_per_row_traversal() {
 }
 
 #[test]
+fn reset_parameter_and_training_data() {
+    let (n, p) = (1200, 4);
+    let (x, y) = synth(n, p, 13, false);
+    let cfg = Config::from_pairs([("objective", "regression"), ("num_iterations", "6")]).unwrap();
+    let mat = DenseMatrix::from_f64_row_major(&x, n, p).unwrap();
+    let ds = Arc::new(Dataset::from_dense(&mat, DatasetFields { label: &y, ..Default::default() }, &cfg).unwrap());
+    let mut b = Gbdt::new(cfg, ds.clone(), None).unwrap();
+    b.train_one_iter(None).unwrap();
+    b.reset_parameter([("num_leaves", "7"), ("eta", "0.5"), ("objective", "huber")]).unwrap();
+    b.train_one_iter(None).unwrap();
+    assert!(b.trees()[1].num_leaves <= 7);
+    assert_eq!(b.objective().unwrap().name(), "huber");
+    let e = b.reset_parameter([("boosting", "dart")]).unwrap_err();
+    assert!(e.to_string().contains("Cannot change boosting during training"), "{e}");
+
+    // continue on the first half of the rows (same bin mappers)
+    let half = n / 2;
+    let hmat = DenseMatrix::from_f64_row_major(&x[..half * p], half, p).unwrap();
+    let hds = Arc::new(
+        Dataset::from_dense_with_reference(&hmat, DatasetFields { label: &y[..half], ..Default::default() }, &ds, 0)
+            .unwrap(),
+    );
+    b.reset_training_data(hds).unwrap();
+    let raw = b.predict(&hmat, PredictKind::Raw, 0, -1).unwrap();
+    for (a, s) in raw.iter().zip(b.train_scores().unwrap()) {
+        assert!((a - s).abs() <= 1e-9 * (1.0 + s.abs()), "rebuilt scores {a} vs {s}");
+    }
+    b.train_one_iter(None).unwrap();
+    assert_eq!(b.current_iteration(), 3);
+}
+
+#[test]
 fn unsupported_parameters_are_rejected() {
     for (k, v) in [("tree_learner", "data"), ("objective", "multiclass"), ("use_quantized_grad", "true"), ("linear_tree", "true")] {
         let e = Config::from_pairs([(k, v)]);

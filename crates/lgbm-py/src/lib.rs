@@ -647,12 +647,17 @@ impl RsBooster {
         self.inner.loaded_parameters().map(str::to_string)
     }
 
-    fn clear_objective(&mut self) {
-        self.inner.clear_objective();
+    /// upstream: `LGBM_BoosterResetParameter`. Returns upstream's warnings.
+    fn reset_parameter(&mut self, py: Python<'_>, params: Vec<(String, String)>) -> PyResult<Vec<String>> {
+        let g = &mut self.inner;
+        detached(py, || g.reset_parameter(params))
     }
 
-    fn set_learning_rate(&mut self, value: &str) -> PyResult<()> {
-        guarded(|| self.inner.set_learning_rate(value))
+    /// upstream: `LGBM_BoosterResetTrainingData`. Returns upstream's warnings.
+    fn reset_training_data(&mut self, py: Python<'_>, train: PyRef<'_, RsDataset>) -> PyResult<Vec<String>> {
+        let data = train.inner.clone();
+        let g = &mut self.inner;
+        detached(py, || g.reset_training_data(data))
     }
 
     fn free_training_state(&mut self) {

@@ -12,7 +12,9 @@ use crate::random::Random;
 
 #[derive(Debug, Clone)]
 pub struct ColSampler {
+    fraction_bytree: f64,
     fraction_bynode: f64,
+    seed: i32,
     need_reset_bytree: bool,
     used_cnt_bytree: i32,
     random: Random,
@@ -39,28 +41,57 @@ impl ColSampler {
     /// upstream: constructor followed by `SetTrainingData` (which draws the
     /// first per-tree sample).
     pub fn new(data: &Dataset, cfg: &Config) -> Self {
-        let nf = data.num_features();
-        let mut valid: Vec<(usize, usize)> = (0..nf).map(|f| (data.real_feature_index(f), f)).collect();
-        valid.sort_unstable();
-        let need_reset_bytree = cfg.feature_fraction < 1.0;
-        let used_cnt_bytree = if need_reset_bytree { get_cnt(valid.len(), cfg.feature_fraction) } else { valid.len() as i32 };
         let mut s = Self {
+            fraction_bytree: cfg.feature_fraction,
             fraction_bynode: cfg.feature_fraction_bynode,
-            need_reset_bytree,
-            used_cnt_bytree,
+            seed: cfg.feature_fraction_seed,
+            need_reset_bytree: false,
+            used_cnt_bytree: 0,
             random: Random::new(cfg.feature_fraction_seed),
-            is_feature_used: vec![true; nf],
+            is_feature_used: Vec::new(),
             used_feature_indices: Vec::new(),
-            valid_feature_indices: valid.iter().map(|v| v.0).collect(),
-            valid_inner: valid.iter().map(|v| v.1).collect(),
+            valid_feature_indices: Vec::new(),
+            valid_inner: Vec::new(),
             interaction_constraints: cfg
                 .interaction_constraints_vector
                 .iter()
                 .map(|c| c.iter().copied().collect())
                 .collect(),
         };
-        s.reset_by_tree();
+        s.set_training_data(data);
         s
+    }
+
+    /// upstream: `ColSampler::SetTrainingData` (draws a per-tree sample).
+    pub fn set_training_data(&mut self, data: &Dataset) {
+        let nf = data.num_features();
+        let mut valid: Vec<(usize, usize)> = (0..nf).map(|f| (data.real_feature_index(f), f)).collect();
+        valid.sort_unstable();
+        self.is_feature_used.resize(nf, true);
+        self.valid_feature_indices = valid.iter().map(|v| v.0).collect();
+        self.valid_inner = valid.iter().map(|v| v.1).collect();
+        self.update_bytree_count();
+        self.reset_by_tree();
+    }
+
+    /// upstream: `ColSampler::SetConfig` (a new seed restarts the generator;
+    /// draws a per-tree sample). Interaction constraints are kept.
+    pub fn set_config(&mut self, cfg: &Config) {
+        self.fraction_bytree = cfg.feature_fraction;
+        self.fraction_bynode = cfg.feature_fraction_bynode;
+        if self.seed != cfg.feature_fraction_seed {
+            self.seed = cfg.feature_fraction_seed;
+            self.random = Random::new(self.seed);
+        }
+        self.update_bytree_count();
+        self.reset_by_tree();
+    }
+
+    fn update_bytree_count(&mut self) {
+        let total = self.valid_feature_indices.len();
+        self.need_reset_bytree = self.fraction_bytree < 1.0;
+        self.used_cnt_bytree =
+            if self.need_reset_bytree { get_cnt(total, self.fraction_bytree) } else { total as i32 };
     }
 
     /// upstream: `ColSampler::ResetByTree`.

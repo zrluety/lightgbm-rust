@@ -33,7 +33,7 @@ use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
 use crate::tree::{SplitArgs, Tree, construct_bitset, find_in_bitset};
 pub(crate) use cegb::Cegb;
 use cegb::RowView;
-pub(crate) use forced::load_forced_splits;
+pub(crate) use forced::{load_forced_splits, reload_forced_splits};
 use col_sampler::ColSampler;
 use constraints::{LeafConstraints, Method, monotone_split_gain_penalty};
 use partition::DataPartition;
@@ -127,48 +127,83 @@ pub struct SerialTreeLearner {
     pub trace: Option<TreeTrace>,
 }
 
+/// The config-dependent part of upstream `FeatureMetainfo` (`SetFeatureInfo<USE_CONFIG>`).
+fn set_feature_config(meta: &mut FeatureMeta, real: usize, cfg: &Config) {
+    meta.monotone_type = cfg.monotone_constraints.get(real).copied().unwrap_or(0);
+    meta.penalty = cfg.feature_contri.get(real).copied().unwrap_or(1.0);
+}
+
+/// upstream `FeatureMetainfo::rand` (`Random(extra_seed + inner)`), kept only with extra trees.
+fn extra_rands(data: &Dataset, cfg: &Config) -> Option<Vec<Random>> {
+    cfg.extra_trees.then(|| {
+        (0..data.num_features())
+            .map(|f| Random::new(cfg.extra_seed.wrapping_add(data.upstream_inner_index(f) as i32)))
+            .collect()
+    })
+}
+
+/// upstream `LeafConstraintsBase::Create`.
+fn leaf_constraints(cfg: &Config, num_leaves: usize, num_features: usize) -> Option<LeafConstraints> {
+    (!cfg.monotone_constraints.is_empty()).then(|| {
+        LeafConstraints::new(
+            Method::parse(&cfg.monotone_constraints_method),
+            cfg.monotone_constraints.clone(),
+            num_leaves,
+            num_features,
+        )
+    })
+}
+
+fn split_params(cfg: &Config) -> SplitParams {
+    SplitParams {
+        lambda_l1: cfg.lambda_l1,
+        lambda_l2: cfg.lambda_l2,
+        max_delta_step: cfg.max_delta_step,
+        path_smooth: cfg.path_smooth,
+        min_data_in_leaf: cfg.min_data_in_leaf,
+        min_sum_hessian_in_leaf: cfg.min_sum_hessian_in_leaf,
+        min_gain_to_split: cfg.min_gain_to_split,
+        max_cat_to_onehot: cfg.max_cat_to_onehot,
+        max_cat_threshold: cfg.max_cat_threshold,
+        cat_l2: cfg.cat_l2,
+        cat_smooth: cfg.cat_smooth,
+        min_data_per_group: cfg.min_data_per_group,
+    }
+}
+
+fn new_cegb(data: &Dataset, cfg: &Config, num_leaves: usize) -> Cegb {
+    let upstream_inner = (0..data.num_features()).map(|f| data.upstream_inner_index(f)).collect();
+    Cegb::new(cfg, num_leaves, upstream_inner, data.num_data())
+}
+
 impl SerialTreeLearner {
     pub fn new(data: Arc<Dataset>, cfg: &Config) -> Self {
         let metas = (0..data.num_features())
             .map(|f| {
                 let m = data.feature_bin_mapper(f);
-                FeatureMeta {
+                let mut meta = FeatureMeta {
                     num_bin: m.num_bin,
                     missing_type: m.missing_type,
                     offset: if m.most_freq_bin == 0 { 1 } else { 0 },
                     default_bin: m.default_bin,
                     most_freq_bin: m.most_freq_bin,
                     bin_type: m.bin_type,
-                    monotone_type: cfg.monotone_constraints.get(data.real_feature_index(f)).copied().unwrap_or(0),
-                    penalty: cfg.feature_contri.get(data.real_feature_index(f)).copied().unwrap_or(1.0),
-                }
+                    monotone_type: 0,
+                    penalty: 1.0,
+                };
+                set_feature_config(&mut meta, data.real_feature_index(f), cfg);
+                meta
             })
             .collect();
         let num_leaves = cfg.num_leaves.max(2) as usize;
-        let constraints = (!cfg.monotone_constraints.is_empty()).then(|| {
-            LeafConstraints::new(
-                Method::parse(&cfg.monotone_constraints_method),
-                cfg.monotone_constraints.clone(),
-                num_leaves,
-                data.num_features(),
-            )
-        });
+        let constraints = leaf_constraints(cfg, num_leaves, data.num_features());
         let num_data = data.num_data();
         let slots = HistSlots::new(&data);
         let multi_val =
             (!cfg.force_col_wise && data.num_features() > 0).then(|| MultiValBin::new(&data, &slots));
         let col_sampler = ColSampler::new(&data, cfg);
-        let extra_rands = cfg
-            .extra_trees
-            .then(|| {
-                (0..data.num_features())
-                    .map(|f| Random::new(cfg.extra_seed.wrapping_add(data.upstream_inner_index(f) as i32)))
-                    .collect()
-            });
-        let cegb = Cegb::is_enable(cfg).then(|| {
-            let upstream_inner = (0..data.num_features()).map(|f| data.upstream_inner_index(f)).collect();
-            Cegb::new(cfg, num_leaves, upstream_inner, num_data)
-        });
+        let extra_rands = extra_rands(&data, cfg);
+        let cegb = Cegb::is_enable(cfg).then(|| new_cegb(&data, cfg, num_leaves));
         Self {
             cegb,
             view_num_data: num_data,
@@ -193,20 +228,7 @@ impl SerialTreeLearner {
             },
             block_bufs: Vec::new(),
             data,
-            params: SplitParams {
-                lambda_l1: cfg.lambda_l1,
-                lambda_l2: cfg.lambda_l2,
-                max_delta_step: cfg.max_delta_step,
-                path_smooth: cfg.path_smooth,
-                min_data_in_leaf: cfg.min_data_in_leaf,
-                min_sum_hessian_in_leaf: cfg.min_sum_hessian_in_leaf,
-                min_gain_to_split: cfg.min_gain_to_split,
-                max_cat_to_onehot: cfg.max_cat_to_onehot,
-                max_cat_threshold: cfg.max_cat_threshold,
-                cat_l2: cfg.cat_l2,
-                cat_smooth: cfg.cat_smooth,
-                min_data_per_group: cfg.min_data_per_group,
-            },
+            params: split_params(cfg),
             num_leaves,
             max_depth: cfg.max_depth,
             metas,
@@ -224,6 +246,73 @@ impl SerialTreeLearner {
 
     pub fn partition(&self) -> &DataPartition {
         &self.partition
+    }
+
+    /// upstream: `SerialTreeLearner::ResetConfig`. The histogram pool only
+    /// grows (its buffers keep their contents), the column sampler draws a new
+    /// per-tree sample, the extra-trees generators restart
+    /// (`HistogramPool::ResetConfig`), and the constraints are rebuilt.
+    pub fn reset_config(&mut self, cfg: &Config) -> Result<()> {
+        let num_leaves = cfg.num_leaves.max(2) as usize;
+        Cegb::check(cfg, self.data.num_total_features())?;
+        if num_leaves != self.num_leaves {
+            if self.cegb.as_ref().is_some_and(|c| num_leaves > c.num_leaves()) {
+                return Err(LgbmError::Unsupported(
+                    "raising num_leaves with CEGB during training (upstream sizes its per-leaf splits once \
+                     and writes past them)"
+                        .into(),
+                ));
+            }
+            self.num_leaves = num_leaves;
+            if self.hist_pool.len() < num_leaves {
+                self.hist_pool.resize_with(num_leaves, || None);
+                self.hist_built.resize(num_leaves, false);
+            }
+            self.best_split_per_leaf.resize(num_leaves, SplitInfo::default());
+            self.partition.reset_leaves(num_leaves);
+            self.branch_features.resize(num_leaves, Vec::new());
+        }
+        self.col_sampler.set_config(cfg);
+        for (f, meta) in self.metas.iter_mut().enumerate() {
+            set_feature_config(meta, self.data.real_feature_index(f), cfg);
+        }
+        self.extra_rands = extra_rands(&self.data, cfg);
+        self.params = split_params(cfg);
+        self.max_depth = cfg.max_depth;
+        self.monotone_penalty = cfg.monotone_penalty;
+        self.track_branch_features = !cfg.interaction_constraints_vector.is_empty();
+        if Cegb::is_enable(cfg) && self.cegb.is_none() {
+            self.cegb = Some(new_cegb(&self.data, cfg, num_leaves));
+        } else if let Some(c) = self.cegb.as_mut() {
+            // upstream keeps `cegb_` once created and reads the new penalties
+            c.reset_config(cfg);
+        }
+        self.constraints = leaf_constraints(cfg, self.num_leaves, self.data.num_features());
+        let threads = resolve_num_threads(cfg.num_threads);
+        if threads != self.team.num_threads() {
+            self.team = ThreadTeam::new(threads);
+        }
+        Ok(())
+    }
+
+    /// upstream: `SerialTreeLearner::ResetTrainingData` with a dataset that
+    /// shares the bin mappers. The histogram pool, constraints and CEGB state
+    /// are kept; the column sampler draws a new per-tree sample.
+    pub fn reset_training_data(&mut self, data: Arc<Dataset>) -> Result<()> {
+        if data.num_features() != self.data.num_features() {
+            return Err(LgbmError::InvalidParameter(
+                "Check failed: (num_features_) == (train_data_->num_features())".into(),
+            ));
+        }
+        let num_data = data.num_data();
+        self.partition.reset_num_data(num_data);
+        self.partition.set_used_data_indices(None);
+        self.col_sampler.set_training_data(&data);
+        self.multi_val = self.multi_val.is_some().then(|| MultiValBin::new(&data, &self.slots));
+        self.view_num_data = num_data;
+        self.bag_local = None;
+        self.data = data;
+        Ok(())
     }
 
     /// New leaf outputs for `old` from the rows assigned to each leaf by

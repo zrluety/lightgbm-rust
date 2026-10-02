@@ -42,11 +42,7 @@ fn number_value(v: &Value) -> f64 {
 /// file gives no forced splits) and run `CheckForcedSplitFeatures`, which
 /// upstream also runs on the null document of an unset file.
 pub(crate) fn load_forced_splits(path: &str, max_feature_idx: i32) -> Result<Option<Arc<Value>>> {
-    let json = if path.is_empty() {
-        Value::Null
-    } else {
-        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
-    };
+    let json = read_json(path);
     let mut q = VecDeque::from([&json]);
     while let Some(node) = q.pop_front() {
         let feature = int_value(get(node, "feature"));
@@ -63,6 +59,20 @@ pub(crate) fn load_forced_splits(path: &str, max_feature_idx: i32) -> Result<Opt
         }
     }
     Ok((!json.is_null()).then(|| Arc::new(json)))
+}
+
+/// Reload `forcedsplits_filename` as `GBDT::ResetConfig` does: no
+/// `CheckForcedSplitFeatures`.
+pub(crate) fn reload_forced_splits(path: &str) -> Option<Arc<Value>> {
+    let json = read_json(path);
+    (!json.is_null()).then(|| Arc::new(json))
+}
+
+fn read_json(path: &str) -> Value {
+    if path.is_empty() {
+        return Value::Null;
+    }
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
 }
 
 fn unsupported(what: &str) -> LgbmError {

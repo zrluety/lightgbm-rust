@@ -1405,6 +1405,7 @@ class Booster:
             train_set._update_params(params).construct()
             params.update(train_set.get_params())
             self.train_set = train_set
+            self.train_set_version = train_set.version
             pairs = _param_dict_to_pairs(params)
             self._rs = _rs.RsBooster.for_training(train_set._rs, pairs)
             _emit_engine_warnings(self._rs.config_warnings(), params)
@@ -1495,32 +1496,35 @@ class Booster:
         return self
 
     def reset_parameter(self, params: Dict[str, Any]) -> "Booster":
-        """Only ``learning_rate`` and ``objective`` -> none (used for custom objectives) are supported."""
-        original = dict(params)
-        params = dict(params)
-        obj = params.pop("objective", None)
-        if obj is not None:
-            if str(obj).lower() not in ("none", "null", "custom", "na"):
-                raise _unsupported("reset_parameter(objective=...)")
+        """Reset parameters of Booster (upstream ``LGBM_BoosterResetParameter``)."""
+        pairs = _param_dict_to_pairs(params)
+        if pairs:
             assert self._rs is not None
-            self._rs.clear_objective()
-        lr_pairs = [(k, v) for k, v in _param_dict_to_pairs(params) if k in _ConfigAliases.get("learning_rate")]
-        if lr_pairs:
-            assert self._rs is not None
-            self._rs.set_learning_rate(dict(lr_pairs).get("learning_rate", lr_pairs[0][1]))
-        for k in _ConfigAliases.get("learning_rate"):
-            params.pop(k, None)
-        if params:
-            raise _unsupported(f"reset_parameter({sorted(params)})")
-        self.params.update(original)
+            _emit_engine_warnings(self._rs.reset_parameter(pairs), params)
+        self.params.update(params)
         return self
 
     def update(self, train_set: Optional[Dataset] = None, fobj: Optional[Callable] = None) -> bool:
         """Run one boosting iteration. Returns ``True`` if no further split is possible."""
-        if train_set is not None and train_set is not getattr(self, "train_set", None):
-            raise _unsupported("Booster.update(train_set=<new dataset>)")
         if not hasattr(self, "train_set"):
             raise LightGBMError("Cannot update due to null training data")
+        if train_set is None and self.train_set_version != self.train_set.version:
+            train_set = self.train_set
+            is_the_same_train_set = False
+        else:
+            is_the_same_train_set = train_set is self.train_set and self.train_set_version == train_set.version
+        if train_set is not None and not is_the_same_train_set:
+            if not isinstance(train_set, Dataset):
+                raise TypeError(f"Training data should be Dataset instance, met {type(train_set).__name__}")
+            if train_set._predictor is not self.__init_predictor:
+                raise LightGBMError("Replace training data failed, you should use same predictor for these data")
+            if train_set is self.train_set:
+                # upstream's objective and metrics read the in-place changed fields
+                raise _unsupported("changing fields of the training Dataset during training")
+            self.train_set = train_set
+            assert self._rs is not None
+            _emit_engine_warnings(self._rs.reset_training_data(self.train_set.construct()._rs), None)
+            self.train_set_version = self.train_set.version
         assert self._rs is not None
         if fobj is None:
             if self.__set_objective_to_none:
