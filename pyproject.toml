@@ -50,6 +50,12 @@ manifest-path = "crates/lgbm-py/Cargo.toml"
 python-source = "python"
 module-name = "lightgbm_rust._lightgbm_rust"
 features = ["pyo3/extension-module"]
+# The Cargo manifest lives below the workspace root, so maturin declares these
+# license files in metadata without putting them in the sdist unless included.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
 
 [tool.uv]
 # The extension is built explicitly with `uv run maturin develop --release`;

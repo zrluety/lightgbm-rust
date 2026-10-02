@@ -135,6 +135,14 @@ jobs:
           bundled = [name for name in names if "third_party/LightGBM" in name]
           if bundled:
               raise SystemExit("sdist contains the LightGBM submodule")
+          root = names[0].split("/", 1)[0]
+          missing = [
+              name
+              for name in ("LICENSE", "NOTICE")
+              if f"{root}/{name}" not in names
+          ]
+          if missing:
+              raise SystemExit(f"sdist is missing {missing}")
           PY
       - uses: actions/upload-artifact@v4
         with:
