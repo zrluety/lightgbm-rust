@@ -1,6 +1,6 @@
 # Compatibility matrix
 
-Target: LightGBM **v4.7.0** (commit `8f7036f`, see [UPSTREAM.md](UPSTREAM.md)). State as of milestone 4 (in progress: categorical features, prediction early stopping, `bagging_by_query`, binary Dataset files and the scikit-learn estimators added). The numbers come from `tests/report/summary.md` (regenerate with the commands in [TESTING.md](TESTING.md)).
+Target: LightGBM **v4.7.0** (commit `8f7036f`, see [UPSTREAM.md](UPSTREAM.md)). State as of release 0.3.0 (Tier 1 added: `r2`/`average_precision`/`auc_mu`, `Booster.refit`, monotone and interaction constraints, DART, random forest, and CSV/TSV/LibSVM text files). The numbers come from `tests/report/summary.md` (regenerate with the commands in [TESTING.md](TESTING.md)).
 
 **lightgbm-rust does not have full parity with LightGBM.** It implements a CPU subset with numerical and categorical features: GBDT, DART and random forest; the regression objectives, binary, multiclass and multiclass-OVA, and ranking (`lambdarank`, `rank_xendcg`); bagging, GOSS, feature subsampling, extra trees, and monotone and interaction constraints; data from arrays, pandas, pyarrow, polars, scipy.sparse, binary Dataset files and CSV/TSV/LibSVM text files. Within that subset, results match upstream bit for bit on every single-threaded differential case run so far. Everything outside the subset either raises `LightGBMError("not supported by lightgbm-rust yet: ...")` or is absent.
 
