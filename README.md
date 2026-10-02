@@ -64,6 +64,61 @@ booster.save_model("model.txt")  # loadable by upstream lightgbm.Booster(model_f
 
 See [docs/TESTING.md](docs/TESTING.md) for the full test commands. The differential suite was verified on Linux (WSL 2). Each release smoke-tests a small training run on native Windows, macOS, and Linux before publishing.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format).
+
+## Roadmap
+
+Open work is tracked in [GitHub issues](https://github.com/zrluety/lightgbm-rust/issues), labeled by `difficulty:` (small, medium, large), `area:` and `priority:`, and grouped into milestones. Items are listed in the suggested order.
+
+**Phase 1: verification and performance**
+
+- [#1](https://github.com/zrluety/lightgbm-rust/issues/1) Verify wheels natively on Windows and macOS (medium)
+- [#2](https://github.com/zrluety/lightgbm-rust/issues/2) Fix benchmark noise: pin CPUs and add repeats (small)
+- [#3](https://github.com/zrluety/lightgbm-rust/issues/3) Speed up `wide_sparse` and `sparse` prediction (small)
+- [#4](https://github.com/zrluety/lightgbm-rust/issues/4) Reduce memory overhead (medium)
+- [#5](https://github.com/zrluety/lightgbm-rust/issues/5) Speed up `wide_sparse` construction (small)
+- [#6](https://github.com/zrluety/lightgbm-rust/issues/6) Speed up `wide_sparse` training at 4 and 8 threads (medium)
+- [#7](https://github.com/zrluety/lightgbm-rust/issues/7) Add missing benchmarks (small)
+- [#8](https://github.com/zrluety/lightgbm-rust/issues/8) Larger differential datasets and exact 4-thread metrics (medium)
+- [#9](https://github.com/zrluety/lightgbm-rust/issues/9) Port remaining upstream C++ tests (small)
+
+**Phase 2: API gaps**
+
+- [#10](https://github.com/zrluety/lightgbm-rust/issues/10) `Sequence` Dataset input, which unblocks 27 upstream tests (medium)
+- [#11](https://github.com/zrluety/lightgbm-rust/issues/11) `Dataset.add_features_from` (medium)
+- [#12](https://github.com/zrluety/lightgbm-rust/issues/12) `Booster.set_leaf_output`, `shuffle_models`, `set_network` (small)
+- [#13](https://github.com/zrluety/lightgbm-rust/issues/13) Private and plugin hooks used by upstream tests (small)
+
+**Phase 3: parity edges**
+
+- [#14](https://github.com/zrluety/lightgbm-rust/issues/14) Choose histogram layout by timing, like upstream (medium)
+- [#15](https://github.com/zrluety/lightgbm-rust/issues/15) Decide behavior for gated combinations (medium)
+- [#16](https://github.com/zrluety/lightgbm-rust/issues/16) Match upstream error messages and log lines (small)
+- [#17](https://github.com/zrluety/lightgbm-rust/issues/17) Minor storage parity (small)
+- [#18](https://github.com/zrluety/lightgbm-rust/issues/18) Upstream-compatible `.bin` Dataset files (large)
+- [#19](https://github.com/zrluety/lightgbm-rust/issues/19) Bagging subset-copy mode and parallel GOSS (medium)
+
+**Phase 4: distributed training**
+
+- [#20](https://github.com/zrluety/lightgbm-rust/issues/20) Socket network layer and data-parallel learner (large)
+- [#21](https://github.com/zrluety/lightgbm-rust/issues/21) Feature-parallel and voting-parallel learners (large)
+- [#22](https://github.com/zrluety/lightgbm-rust/issues/22) `lightgbm.dask` (large)
+
+**Phase 5: GPU and deferred**
+
+- [#23](https://github.com/zrluety/lightgbm-rust/issues/23) GPU histogram offload with an exact quantized mode (large)
+- [#24](https://github.com/zrluety/lightgbm-rust/issues/24) Full CUDA learner (large)
+- [#25](https://github.com/zrluety/lightgbm-rust/issues/25) Hazard objective and panel loss (medium, deferred)
+
+### Resuming development with an agent
+
+- Read [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) and [docs/TESTING.md](docs/TESTING.md) first, then the issue.
+- Dev pattern: `bash scripts/wsl-dev.sh ...`. Full verification is `target/run_all.sh`; launch it in the background and poll its log.
+- Non-negotiables: bitwise parity with LightGBM 4.7.0 where upstream is deterministic, no weakened assertions or silent skips, no parity claims without evidence, signed commits, and update `docs/COMPATIBILITY.md` and `CHANGELOG.md` with each change.
+- Out of scope for now: native Windows/macOS verification (#1 tracks it) and the hazard panel loss (#25).
+
 ## License
 
 MIT. Ported algorithms follow LightGBM (MIT, © Microsoft Corporation and the LightGBM developers); see [NOTICE](NOTICE).
