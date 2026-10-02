@@ -6,7 +6,8 @@
 //! blocks whose left/right parts are concatenated in block order (upstream
 //! `ParallelPartitionRunner`), which yields the same stable order.
 
-use crate::dataset::BinColumn;
+use crate::bin::{RawBins, split_rows, with_bin};
+use crate::feature_group::FeatureBins;
 use crate::threading::{SharedMut, ThreadTeam};
 
 /// Leaves smaller than this are split on the calling thread.
@@ -103,24 +104,21 @@ impl DataPartition {
 
     /// Split `leaf` on a binned feature; rows whose bin `b` has `lut[b]`
     /// keep `leaf`, the others become `right_leaf`.
-    pub fn split(&mut self, team: &ThreadTeam, leaf: usize, col: &BinColumn, lut: &[bool], right_leaf: usize) {
+    pub fn split(&mut self, team: &ThreadTeam, leaf: usize, bins: FeatureBins, lut: &[bool], right_leaf: usize) {
         let begin = self.leaf_begin[leaf];
         let cnt = self.leaf_count[leaf];
-        let left_cnt = match col {
-            BinColumn::U8(v) => self.split_typed(team, v, begin, cnt, lut),
-            BinColumn::U16(v) => self.split_typed(team, v, begin, cnt, lut),
-            BinColumn::U32(v) => self.split_typed(team, v, begin, cnt, lut),
-        };
+        let raw_lut = bins.raw_lut(lut);
+        let left_cnt = with_bin!(bins.bin, b => self.split_typed(team, b, begin, cnt, &raw_lut));
         self.leaf_count[leaf] = left_cnt;
         self.leaf_begin[right_leaf] = begin + left_cnt;
         self.leaf_count[right_leaf] = cnt - left_cnt;
         self.num_leaves += 1;
     }
 
-    fn split_typed<T: Copy + Into<u32> + Sync>(
+    fn split_typed<B: RawBins>(
         &mut self,
         team: &ThreadTeam,
-        bins: &[T],
+        bins: &B,
         begin: usize,
         cnt: usize,
         lut: &[bool],
@@ -130,7 +128,7 @@ impl DataPartition {
         self.left_buf.resize(cnt.max(self.left_buf.len()), 0);
         self.right_buf.resize(cnt.max(self.right_buf.len()), 0);
         if cnt < PAR_MIN_ROWS || threads <= 1 {
-            let (nl, nr) = split_block(bins, lut, slice, &mut self.left_buf[..cnt], &mut self.right_buf[..cnt]);
+            let (nl, nr) = split_rows(bins, lut, slice, &mut self.left_buf[..cnt], &mut self.right_buf[..cnt]);
             slice[..nl].copy_from_slice(&self.left_buf[..nl]);
             slice[nl..].copy_from_slice(&self.right_buf[..nr]);
             return nl;
@@ -146,7 +144,7 @@ impl DataPartition {
                 let len = block.min(cnt - start);
                 // SAFETY: block `b` writes only `[start, start + len)` of each buffer.
                 let (l, r) = unsafe { (lbuf.slice(start, len), rbuf.slice(start, len)) };
-                split_block(bins, lut, &src_all[start..start + len], l, r)
+                split_rows(bins, lut, &src_all[start..start + len], l, r)
             })
         };
         // upstream: ParallelPartitionRunner::Run — concatenate the blocks'
@@ -191,22 +189,4 @@ impl DataPartition {
             }
         });
     }
-}
-
-/// Stable branchless split of `src` into `l` (rows going left) and `r`.
-#[inline(always)]
-fn split_block<T: Copy + Into<u32>>(bins: &[T], lut: &[bool], src: &[u32], l: &mut [u32], r: &mut [u32]) -> (usize, usize) {
-    let (mut nl, mut nr) = (0usize, 0usize);
-    assert!(l.len() >= src.len() && r.len() >= src.len());
-    for &i in src {
-        let go_left = lut[bins[i as usize].into() as usize];
-        // SAFETY: nl, nr <= number of rows seen so far < src.len() <= l.len(), r.len().
-        unsafe {
-            *l.get_unchecked_mut(nl) = i;
-            *r.get_unchecked_mut(nr) = i;
-        }
-        nl += go_left as usize;
-        nr += !go_left as usize;
-    }
-    (nl, nr)
 }

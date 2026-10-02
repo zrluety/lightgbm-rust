@@ -120,15 +120,8 @@ impl SerialTreeLearner {
             .ok()
             .and_then(|s| self.hist_pool[s].as_ref())
             .ok_or_else(|| unsupported("on a leaf without a histogram buffer"))?;
-        if !hist.fresh[inner] && self.data.num_feature_groups() < self.data.num_features() {
-            // upstream builds bundled features group-wise, overwriting
-            // left-over histograms of features this port does not touch
-            return Err(unsupported(
-                "on a histogram left over from an earlier build when features are bundled",
-            ));
-        }
         let bin = self.data.feature_bin_mapper(inner).value_to_bin(number_value(get(node, "threshold")));
-        let v = self.slots.views[inner];
+        let v = self.offsets.views[inner];
         let mut split = SplitInfo::default();
         gather_info_for_threshold(
             &hist.data[v.start..v.start + v.len],

@@ -17,15 +17,20 @@ use std::path::{Path, PathBuf};
 
 use crate::binning::{BinMapper, BinType, MissingType};
 use crate::config::Config;
-use crate::dataset::{check_max_bin_by_feature, BinColumn, BinConstructConfig, Dataset, Metadata};
+use crate::bin::Bin;
+use crate::dataset::{check_max_bin_by_feature, BinConstructConfig, Dataset, Layout, Metadata};
 use crate::error::{LgbmError, Result};
+use crate::feature_group::{FeatureGroup, SubFeature};
+use crate::feature_groups::GroupSpec;
 
 /// First bytes of a lightgbm-rust binary dataset file.
 pub const MAGIC: &[u8; 16] = b"\x89LGBMRS-DATASET\n";
-/// Version written by this build. Versions 1 (without `label_idx`), 2
-/// (without `max_bin_by_feature` and forced bin bounds) and 3 (without the
-/// multi-value feature group) are also read.
-pub const FORMAT_VERSION: u32 = 4;
+/// Version written by this build, which stores the feature groups and
+/// their (dense, 4-bit or sparse) bins. Versions 1 to 4 stored one column
+/// per feature and are still read, as one group per feature (version 4
+/// keeps its multi-value group); version 1 has no `label_idx`, 2 no
+/// `max_bin_by_feature` and forced bin bounds, 3 no multi-value group.
+pub const FORMAT_VERSION: u32 = 5;
 /// upstream `Dataset::binary_file_token`.
 pub const UPSTREAM_TOKEN: &[u8] = b"______LightGBM_Binary_File_Token______\n";
 
@@ -332,25 +337,14 @@ impl Dataset {
         }
         w.usize_vec(&self.used_features);
         w.usize_vec(&self.upstream_inner);
-        w.usize(self.num_feature_groups);
-        for col in &self.bins {
-            match col {
-                BinColumn::U8(v) => {
-                    w.u8(1);
-                    w.0.extend_from_slice(v);
-                }
-                BinColumn::U16(v) => {
-                    w.u8(2);
-                    for x in v {
-                        w.0.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
-                BinColumn::U32(v) => {
-                    w.u8(4);
-                    for x in v {
-                        w.0.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
+        w.usize(self.groups.len());
+        for g in &self.groups {
+            w.u8(u8::from(g.is_multi_val) | u8::from(g.is_dense_multi_val) << 1 | u8::from(g.is_sparse) << 2);
+            let inner: Vec<usize> = g.subs.iter().map(|s| s.inner).collect();
+            w.usize_vec(&inner);
+            for b in &g.bins {
+                w.u8(b.kind() as u8);
+                b.write(&mut w.0);
             }
         }
         let md = &self.metadata;
@@ -369,7 +363,6 @@ impl Dataset {
         for b in &self.forced_bin_bounds {
             w.f64_vec(b);
         }
-        w.usize_vec(&self.multi_val_group);
         w.0
     }
 
@@ -426,36 +419,78 @@ impl Dataset {
         let bin_mappers = (0..ncol).map(|_| read_bin_mapper(&mut r)).collect::<Result<Vec<_>>>()?;
         let used_features = r.usize_vec("feature map")?;
         let upstream_inner = r.usize_vec("feature map")?;
-        let num_feature_groups = r.usize("feature map")?;
         let expected: Vec<usize> = (0..ncol).filter(|&c| !bin_mappers[c].is_trivial).collect();
-        if used_features != expected || upstream_inner.len() != used_features.len() {
+        let nf = used_features.len();
+        let mut seen = vec![false; nf];
+        if used_features != expected
+            || upstream_inner.len() != nf
+            || upstream_inner.iter().any(|&u| u >= nf || std::mem::replace(&mut seen[u], true))
+        {
             return Err(r.corrupt("feature map"));
         }
-        let mut real_to_inner = vec![None; ncol];
-        for (inner, &real) in used_features.iter().enumerate() {
-            real_to_inner[real] = Some(inner);
-        }
-        let mut bins = Vec::with_capacity(used_features.len());
-        for &real in &used_features {
-            let what = "feature bins";
-            let num_bin = bin_mappers[real].num_bin as u32;
-            let col = match r.u8(what)? {
-                1 => BinColumn::U8(r.take(num_data, what)?.to_vec()),
-                2 => {
-                    let b = r.take(num_data.checked_mul(2).ok_or_else(|| r.corrupt(what))?, what)?;
-                    BinColumn::U16(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+        let sub = |inner: usize| SubFeature::of(inner, &bin_mappers[used_features[inner]]);
+        let (groups, legacy_bins) = if version >= 5 {
+            let what = "feature groups";
+            let num_groups = r.len(1, what)?;
+            let mut groups = Vec::with_capacity(num_groups);
+            let mut k = 0usize;
+            for g in 0..num_groups {
+                let flags = r.u8(what)?;
+                let inner = r.usize_vec(what)?;
+                // features are numbered in group order (upstream inner order)
+                if flags > 7
+                    || inner.is_empty()
+                    || inner.iter().enumerate().any(|(j, &f)| f >= nf || upstream_inner[f] != k + j)
+                {
+                    return Err(r.corrupt(what));
                 }
-                4 => {
-                    let b = r.take(num_data.checked_mul(4).ok_or_else(|| r.corrupt(what))?, what)?;
-                    BinColumn::U32(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+                k += inner.len();
+                let (is_multi_val, is_sparse) = (flags & 1 != 0, flags & 4 != 0);
+                let mut group = if is_sparse && !is_multi_val && inner.len() == 1 {
+                    FeatureGroup::new_single(sub(inner[0]))
+                } else {
+                    FeatureGroup::new(inner.iter().map(|&f| sub(f)).collect(), is_multi_val, g)
+                };
+                if group.is_sparse != is_sparse || group.is_dense_multi_val != (flags & 2 != 0) {
+                    return Err(r.corrupt(what));
                 }
-                _ => return Err(r.corrupt(what)),
-            };
-            if (0..num_data).any(|i| col.get(i) >= num_bin) {
+                for (b, kind) in group.bin_kinds().into_iter().enumerate() {
+                    if r.u8(what)? != kind as u8 {
+                        return Err(r.corrupt(what));
+                    }
+                    let max = group.bin_value_count(b) - 1;
+                    let bin = Bin::read(kind, num_data, max, &mut |n| r.take(n, what).ok().map(<[u8]>::to_vec));
+                    group.bins.push(bin.ok_or_else(|| r.corrupt(what))?);
+                }
+                groups.push(group);
+            }
+            if k != nf {
                 return Err(r.corrupt(what));
             }
-            bins.push(col);
-        }
+            (groups, None)
+        } else {
+            let _num_feature_groups = r.usize("feature map")?;
+            let mut cols = Vec::with_capacity(nf);
+            for &real in &used_features {
+                let what = "feature bins";
+                let num_bin = bin_mappers[real].num_bin as u32;
+                let width = match r.u8(what)? {
+                    w @ (1 | 2 | 4) => w as usize,
+                    _ => return Err(r.corrupt(what)),
+                };
+                let b = r.take(num_data.checked_mul(width).ok_or_else(|| r.corrupt(what))?, what)?;
+                let col: Vec<u32> = match width {
+                    1 => b.iter().map(|&v| v as u32).collect(),
+                    2 => b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
+                    _ => b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(),
+                };
+                if col.iter().any(|&v| v >= num_bin) {
+                    return Err(r.corrupt(what));
+                }
+                cols.push(col);
+            }
+            (Vec::new(), Some(cols))
+        };
         let label = r.f32s(num_data, "metadata")?;
         let weight = if r.bool("metadata")? { Some(r.f32s(num_data, "metadata")?) } else { None };
         let query_boundaries = if r.bool("metadata")? {
@@ -481,7 +516,11 @@ impl Dataset {
         } else {
             (Vec::new(), vec![Vec::new(); ncol])
         };
-        let multi_val_group = if version >= 4 { r.usize_vec("feature groups")? } else { Vec::new() };
+        let multi_val_group = if version == 4 { r.usize_vec("feature groups")? } else { Vec::new() };
+        let mut real_to_inner = vec![None; ncol];
+        for (inner, &real) in used_features.iter().enumerate() {
+            real_to_inner[real] = Some(inner);
+        }
         if multi_val_group.iter().any(|&c| real_to_inner.get(c).is_none_or(Option::is_none)) {
             return Err(r.corrupt("feature groups"));
         }
@@ -497,23 +536,41 @@ impl Dataset {
             let counts: Vec<i32> = b.windows(2).map(|w| w[1] - w[0]).collect();
             metadata.set_query(num_data, Some(&counts))?;
         }
-        Ok(Dataset {
-            num_data,
-            bin_mappers,
-            used_features,
-            upstream_inner,
-            num_feature_groups,
-            multi_val_group,
-            real_to_inner,
-            bins,
-            metadata,
-            feature_names,
-            bin_config,
-            max_bin_by_feature,
-            forced_bin_bounds,
-            data_filename: None,
-            label_idx,
-        })
+        let mut ds = match legacy_bins {
+            None => {
+                let mut ds = Dataset::unfilled(num_data, bin_mappers, feature_names, Layout::Train(Vec::new()));
+                ds.groups = groups;
+                ds.feature_loc = vec![(0, 0); nf];
+                for (g, grp) in ds.groups.iter().enumerate() {
+                    for (s, sf) in grp.subs.iter().enumerate() {
+                        ds.feature_loc[sf.inner] = (g as u32, s as u32);
+                    }
+                }
+                ds.upstream_inner = upstream_inner;
+                ds
+            }
+            Some(cols) => {
+                let layout = legacy_layout(&used_features, &upstream_inner, &multi_val_group);
+                let mut ds = Dataset::unfilled(num_data, bin_mappers, feature_names, Layout::Train(layout));
+                if ds.upstream_inner != upstream_inner {
+                    return Err(r.corrupt("feature groups"));
+                }
+                ds.fill_groups(|b, _| {
+                    b.push_bin_columns(|f, sink| {
+                        for (i, &v) in cols[f].iter().enumerate() {
+                            sink(i, v);
+                        }
+                    })
+                });
+                ds
+            }
+        };
+        ds.metadata = metadata;
+        ds.bin_config = bin_config;
+        ds.max_bin_by_feature = max_bin_by_feature;
+        ds.forced_bin_bounds = forced_bin_bounds;
+        ds.label_idx = label_idx;
+        Ok(ds)
     }
 
     /// Load a dataset from a file, as upstream's `LGBM_DatasetCreateFromFile`
@@ -561,6 +618,27 @@ impl Dataset {
         }
         Ok(ds)
     }
+}
+
+/// The groups of a version 1-4 file, which stored one column per feature:
+/// one group per feature in upstream inner order, with the multi-value
+/// group (version 4) as one group.
+fn legacy_layout(used_features: &[usize], upstream_inner: &[usize], multi_val_group: &[usize]) -> Vec<GroupSpec> {
+    let mut by_upstream = vec![0usize; upstream_inner.len()];
+    for (inner, &u) in upstream_inner.iter().enumerate() {
+        by_upstream[u] = used_features[inner];
+    }
+    let mut out = Vec::new();
+    for real in by_upstream {
+        if multi_val_group.contains(&real) {
+            if multi_val_group[0] == real {
+                out.push(GroupSpec { features: multi_val_group.to_vec(), is_multi_val: true });
+            }
+        } else {
+            out.push(GroupSpec { features: vec![real], is_multi_val: false });
+        }
+    }
+    out
 }
 
 /// upstream `DatasetLoader::CheckDataset` (`is_load_from_binary` branch).
@@ -629,7 +707,7 @@ mod tests {
         }
         assert_eq!(back.used_features, ds.used_features);
         assert_eq!(back.upstream_inner, ds.upstream_inner);
-        assert_eq!(back.num_feature_groups, ds.num_feature_groups);
+        assert_eq!(back.groups, ds.groups);
         assert_eq!(back.feature_names, ds.feature_names);
         assert_eq!(back.bin_config, ds.bin_config);
         for f in 0..ds.num_features() {
@@ -655,27 +733,65 @@ mod tests {
         next[MAGIC.len()] = FORMAT_VERSION as u8 + 1;
         let err = Dataset::from_binary_bytes(&next, Path::new("t")).unwrap_err();
         assert!(matches!(err, LgbmError::Unsupported(_)), "{err}");
-        // version 3 has no multi-value group (empty in the sample)
-        assert!(sample().multi_val_group.is_empty());
-        let mut v3 = bytes[..bytes.len() - 8].to_vec();
-        v3[MAGIC.len()] = 3;
-        let back = Dataset::from_binary_bytes(&v3, Path::new("t")).unwrap();
-        assert_eq!(back.to_binary_bytes(), bytes);
-        // version 2 has no bin-parameter section either (an empty
-        // max_bin_by_feature and an empty bound list per column)
-        let tail = 8 + 8 * sample().num_total_features();
-        let mut v2 = v3[..v3.len() - tail].to_vec();
-        v2[MAGIC.len()] = 2;
-        let back = Dataset::from_binary_bytes(&v2, Path::new("t")).unwrap();
-        assert_eq!(back.to_binary_bytes(), bytes);
-        // version 1 also has no label_idx (after magic, version, 2 sizes, 3 i32 and 2 bool fields)
-        let at = MAGIC.len() + 4 + 8 + 8 + 12 + 2;
-        let mut v1 = v2.clone();
-        v1[MAGIC.len()] = 1;
-        v1.drain(at..at + 4);
-        let back = Dataset::from_binary_bytes(&v1, Path::new("t")).unwrap();
-        assert_eq!(back.label_idx, 0);
-        assert_eq!(back.metadata.label, sample().metadata.label);
+        // the sample has one group per feature, so older files load into the same groups
+        let ds = sample();
+        assert_eq!(ds.num_feature_groups(), ds.num_features());
+        for version in 1..=4 {
+            let back = Dataset::from_binary_bytes(&legacy_bytes(&ds, version), Path::new("t")).unwrap();
+            assert_eq!(back.to_binary_bytes(), bytes, "version {version}");
+        }
+    }
+
+    /// A version 1-4 file (one column of `u8` bins per feature).
+    fn legacy_bytes(ds: &Dataset, version: u32) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.0.extend_from_slice(MAGIC);
+        w.u32(version);
+        w.usize(ds.num_data);
+        w.usize(ds.bin_mappers.len());
+        let c = ds.bin_config;
+        w.i32(c.max_bin);
+        w.i32(c.min_data_in_bin);
+        w.i32(c.bin_construct_sample_cnt);
+        w.bool(c.use_missing);
+        w.bool(c.zero_as_missing);
+        if version >= 2 {
+            w.i32(ds.label_idx);
+        }
+        for name in &ds.feature_names {
+            w.str(name);
+        }
+        for m in &ds.bin_mappers {
+            write_bin_mapper(&mut w, m);
+        }
+        w.usize_vec(&ds.used_features);
+        w.usize_vec(&ds.upstream_inner);
+        w.usize(ds.num_feature_groups());
+        for f in 0..ds.num_features() {
+            w.u8(1);
+            w.0.extend(ds.bin_indices(f).iter().map(|&b| b as u8));
+        }
+        let md = &ds.metadata;
+        w.f32s(&md.label);
+        w.bool(md.weight.is_some());
+        if let Some(wt) = &md.weight {
+            w.f32s(wt);
+        }
+        let queries = md.query_boundaries.as_ref().filter(|b| b.len() > 1);
+        w.bool(queries.is_some());
+        if let Some(b) = queries {
+            w.i32_vec(b);
+        }
+        if version >= 3 {
+            w.i32_vec(&ds.max_bin_by_feature);
+            for b in &ds.forced_bin_bounds {
+                w.f64_vec(b);
+            }
+        }
+        if version >= 4 {
+            w.usize_vec(&[]);
+        }
+        w.0
     }
 
     #[test]

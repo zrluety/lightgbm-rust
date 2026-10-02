@@ -144,25 +144,14 @@ fn log_unterminated(filename: &str) {
     crate::log::info(&format!("Warning: last line of {filename} has no end of line, still using this line"));
 }
 
-/// The note of a full read of `filename` (after `skip_bytes`) whose last
-/// line has no terminator, without reading the lines.
-///
-/// upstream: the end of `TextReader::ReadAllAndProcess`, here for `CountLine`.
-pub fn note_unterminated_last_line(filename: &str, skip_bytes: usize) -> Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let Ok(mut r) = File::open(filename) else { return Ok(()) };
-    let io = |e: std::io::Error| LgbmError::InvalidData(format!("Could not read data file: {e}"));
-    let len = r.seek(SeekFrom::End(0)).map_err(io)?;
-    if len <= skip_bytes as u64 {
-        return Ok(());
-    }
-    r.seek(SeekFrom::End(-1)).map_err(io)?;
-    let mut last = [0u8; 1];
-    r.read_exact(&mut last).map_err(io)?;
-    if last[0] != b'\n' && last[0] != b'\r' {
-        log_unterminated(filename);
-    }
-    Ok(())
+/// Number of lines of `filename` after `skip_bytes` (upstream `TextReader::CountLine`).
+pub fn count_lines(filename: &str, skip_bytes: usize) -> Result<usize> {
+    let mut n = 0usize;
+    for_each_line(filename, skip_bytes, |_| {
+        n += 1;
+        Ok(())
+    })?;
+    Ok(n)
 }
 
 /// All lines of a text file (upstream `TextReader::ReadAllLines`).

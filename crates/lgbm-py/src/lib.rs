@@ -344,6 +344,11 @@ impl RsDataset {
         })
     }
 
+    /// upstream `Dataset::num_groups_`.
+    fn num_feature_groups(&self) -> usize {
+        self.inner.num_feature_groups()
+    }
+
     /// Per-row bin indices of input column `col`, or `None` for trivial features.
     fn bin_indices<'py>(&self, py: Python<'py>, col: usize) -> PyResult<Option<Bound<'py, PyArray1<u32>>>> {
         if col >= self.inner.num_total_features() {

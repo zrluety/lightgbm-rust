@@ -8,24 +8,23 @@
 //! (`Init(const char*)`, `LoadWeights`, `LoadQueryBoundaries`, `LoadPositions`,
 //! `LoadInitialScore`, `CalculateQueryBoundaries`, `CheckOrPartition`).
 //!
-//! The rows are parsed into a CSR matrix and binned like in-memory sparse
-//! input; the sample, the bin mappers, the ignored columns and the metadata
-//! follow the text-file code paths.
+//! Parsed rows are pushed into the feature groups batch by batch, as
+//! upstream's `PushOneRow` does, so only the bins and the labels, weights
+//! and query ids are kept; the sample, the bin mappers, the ignored columns
+//! and the metadata follow the text-file code paths.
 
 use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
-use crate::binning::BinMapper;
 use crate::config::Config;
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::{
     avoid_inf_f32, avoid_inf_f64, check_max_bin_by_feature, find_bin_mappers, sanitize_feature_names,
-    with_num_threads, Dataset, DatasetFields, DenseValues,
+    train_layout, with_num_threads, Dataset, Layout,
 };
 use crate::error::{LgbmError, Result};
 use crate::feature_groups::SampleColumn;
-use crate::matrix::{Matrix, SparseIndptr, SparseMatrix};
 use crate::random::Random;
 use crate::text_parser::{self, Parser};
 
@@ -250,31 +249,23 @@ fn load_initial_score(filename: &str) -> Result<Option<Vec<f64>>> {
     Ok(Some(init))
 }
 
-/// Parsed rows: label, and the feature values kept for binning.
+/// Labels, weights and query ids of the parsed rows.
 struct Rows {
     label: Vec<f32>,
     weight: Option<Vec<f32>>,
     queries: Option<Vec<i32>>,
-    indptr: Vec<i64>,
-    indices: Vec<i32>,
-    values: Vec<f64>,
 }
 
 impl Rows {
     fn new(c: &Columns) -> Self {
-        Self {
-            label: Vec::new(),
-            weight: (c.weight_idx >= 0).then(Vec::new),
-            queries: (c.group_idx >= 0).then(Vec::new),
-            indptr: vec![0],
-            indices: Vec::new(),
-            values: Vec::new(),
-        }
+        Self { label: Vec::new(), weight: (c.weight_idx >= 0).then(Vec::new), queries: (c.group_idx >= 0).then(Vec::new) }
     }
 
     /// upstream: the per-row loop of `ExtractFeaturesFromMemory` /
-    /// `ExtractFeaturesFromFile`. `used[f]` marks the binned features.
-    fn extend(&mut self, lines: &[&[u8]], parser: &Parser, c: &Columns, used: &[bool]) -> Result<()> {
+    /// `ExtractFeaturesFromFile`: records each line's label, weight and
+    /// query id, and returns its parsed `(column, value)` pairs, which the
+    /// caller pushes into the feature groups.
+    fn extend(&mut self, lines: &[&[u8]], parser: &Parser, c: &Columns, ntf: usize) -> Result<Vec<Vec<(i32, f64)>>> {
         let parsed: Vec<(f64, Vec<(i32, f64)>)> = lines
             .par_iter()
             .map(|l| {
@@ -282,21 +273,19 @@ impl Rows {
                 parser.parse_line(l, &mut out).map(|label| (label, out))
             })
             .collect::<Result<_>>()?;
-        let ntf = used.len() as i32;
+        let ntf = ntf as i32;
+        let mut out = Vec::with_capacity(parsed.len());
         for (label, feats) in parsed {
             self.label.push(label as f32);
             let (mut w, mut q) = (0.0f32, 0i32);
-            for (f, v) in feats {
+            for &(f, v) in &feats {
                 if f < 0 {
                     return Err(LgbmError::InvalidData(format!("negative feature index {f} in data file")));
                 }
                 if f >= ntf {
                     continue;
                 }
-                if used[f as usize] {
-                    self.indices.push(f);
-                    self.values.push(v);
-                } else if f == c.weight_idx {
+                if f == c.weight_idx {
                     w = v as f32;
                 } else if f == c.group_idx {
                     q = v as i32;
@@ -308,9 +297,9 @@ impl Rows {
             if let Some(qs) = self.queries.as_mut() {
                 qs.push(q);
             }
-            self.indptr.push(self.indices.len() as i64);
+            out.push(feats);
         }
-        Ok(())
+        Ok(out)
     }
 
     fn num_rows(&self) -> usize {
@@ -391,38 +380,70 @@ fn read_and_sample(filename: &str, skip: usize, cfg: &Config) -> Result<Sampled>
     Ok(Sampled { lines: None, sample, num_data: n })
 }
 
-/// Parse every data line into [`Rows`], from memory or streaming the file.
+/// Parse the `num_data` data lines in batches, from memory or streaming the
+/// file, pushing each batch into `ds`'s feature groups (upstream
+/// `PushOneRow`/`FinishOneRow` per line); returns the labels, weights and
+/// query ids.
 fn extract(
+    ds: &mut Dataset,
     filename: &str,
     skip: usize,
     lines: Option<Vec<Vec<u8>>>,
     parser: &Parser,
     c: &Columns,
-    used: &[bool],
 ) -> Result<Rows> {
+    let n = ds.num_data;
+    let ntf = ds.num_total_features();
     let mut rows = Rows::new(c);
-    match lines {
-        Some(lines) => {
-            let refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
-            rows.extend(&refs, parser, c, used)?;
-        }
-        None => {
-            let mut batch: Vec<Vec<u8>> = Vec::new();
-            let flush = |batch: &mut Vec<Vec<u8>>, rows: &mut Rows| -> Result<()> {
-                let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
-                rows.extend(&refs, parser, c, used)?;
-                batch.clear();
-                Ok(())
-            };
-            text_parser::for_each_line(filename, skip, |l| {
-                batch.push(l.to_vec());
-                if batch.len() == BATCH_LINES {
-                    flush(&mut batch, &mut rows)?;
+    let mut result = Ok(());
+    ds.fill_groups(|b, d| {
+        let mut flush = |batch: &[&[u8]], rows: &mut Rows| -> Result<()> {
+            let row0 = rows.num_rows();
+            if row0 + batch.len() > n {
+                return Err(LgbmError::InvalidData(format!("Data file {filename} changed while it was read")));
+            }
+            let feats = rows.extend(batch, parser, c, ntf)?;
+            b.push_rows(row0, feats.len(), &d.real_to_inner, |k, sink| {
+                for &(f, v) in &feats[k] {
+                    sink(f as usize, v);
+                }
+            });
+            Ok(())
+        };
+        result = (|| match lines {
+            Some(mut lines) => {
+                let mut start = 0;
+                while start < lines.len() {
+                    let end = (start + BATCH_LINES).min(lines.len());
+                    let batch: Vec<Vec<u8>> = lines[start..end].iter_mut().map(std::mem::take).collect();
+                    let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
+                    flush(&refs, &mut rows)?;
+                    start = end;
                 }
                 Ok(())
-            })?;
-            flush(&mut batch, &mut rows)?;
-        }
+            }
+            None => {
+                let mut batch: Vec<Vec<u8>> = Vec::new();
+                let mut flush_batch = |batch: &mut Vec<Vec<u8>>, rows: &mut Rows| -> Result<()> {
+                    let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
+                    flush(&refs, rows)?;
+                    batch.clear();
+                    Ok(())
+                };
+                text_parser::for_each_line(filename, skip, |l| {
+                    batch.push(l.to_vec());
+                    if batch.len() == BATCH_LINES {
+                        flush_batch(&mut batch, &mut rows)?;
+                    }
+                    Ok(())
+                })?;
+                flush_batch(&mut batch, &mut rows)
+            }
+        })();
+    });
+    result?;
+    if rows.num_rows() != n {
+        return Err(LgbmError::InvalidData(format!("Data file {filename} changed while it was read")));
     }
     Ok(rows)
 }
@@ -528,17 +549,6 @@ fn log_num_queries(ds: &Dataset, filename: &str) {
             ds.num_data as f64 / nq as f64
         ));
     }
-}
-
-fn csr<'a>(rows: &'a Rows, ncols: usize) -> Result<Matrix<'a>> {
-    Ok(Matrix::Sparse(SparseMatrix::new(
-        SparseIndptr::I64(&rows.indptr),
-        &rows.indices,
-        DenseValues::F64(&rows.values),
-        rows.num_rows(),
-        ncols,
-        true,
-    )?))
 }
 
 impl Dataset {
@@ -661,9 +671,11 @@ impl Dataset {
             let t1 = std::time::Instant::now();
             let found = find_bin_mappers(&columns, sample.len(), n, &is_cat, &skip_col, cfg, NTF_EXPR)?;
             let bin_time = t1.elapsed();
-            let used: Vec<bool> = found.bin_mappers.iter().map(|m| !m.is_trivial).collect();
+            let layout = train_layout(&found.bin_mappers, &columns, sample.len(), n, cfg);
+            drop(columns);
+            let mut ds = Self::unfilled(n, found.bin_mappers, feature_names, layout);
             // upstream reads the file again only after constructing the bin mappers
-            let (rows, extract_log) = crate::log::defer(|| extract(filename, skip, lines, &parser, &c, &used));
+            let (rows, extract_log) = crate::log::defer(|| extract(&mut ds, filename, skip, lines, &parser, &c));
             let rows = match rows {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -671,12 +683,8 @@ impl Dataset {
                     return Err(e);
                 }
             };
-            let mat = csr(&rows, ntf)?;
-            let label = vec![0.0f32; rows.num_rows()];
-            let fields = DatasetFields { label: &label, ..Default::default() };
-            let mut ds = Self::assemble(&mat, fields, found.bin_mappers, feature_names)?;
             ds.forced_bin_bounds = found.forced_bin_bounds;
-            ds.finish_construct(&columns, sample.len(), cfg, replaced);
+            ds.finish_construct(cfg, replaced);
             crate::log::info(&format!("Construct bin mappers from text data time {:.2} seconds", bin_time.as_secs_f64()));
             log_metadata_init(&c, &side);
             if cfg.two_round {
@@ -691,25 +699,30 @@ impl Dataset {
         };
 
         c.reopen(filename);
-        let lines = if cfg.two_round {
-            text_parser::note_unterminated_last_line(filename, skip)?;
-            None
+        let (lines, n) = if cfg.two_round {
+            (None, text_parser::count_lines(filename, skip)?)
         } else {
-            Some(text_parser::read_all_lines(filename, skip)?)
+            let lines = text_parser::read_all_lines(filename, skip)?;
+            let n = lines.len();
+            (Some(lines), n)
         };
         log_metadata_init(&c, &side);
         if cfg.two_round {
             c.reopen(filename);
         }
-        let used: Vec<bool> = reference.bin_mappers.iter().map(|m: &BinMapper| !m.is_trivial).collect();
-        let rows = extract(filename, skip, lines, &parser, &c, &used)?;
-        if rows.num_rows() == 0 {
+        if n == 0 {
             return Err(LgbmError::InvalidData(format!("Data file {filename} is empty")));
         }
-        let mat = csr(&rows, reference.num_total_features())?;
-        let label = vec![0.0f32; rows.num_rows()];
-        let fields = DatasetFields { label: &label, ..Default::default() };
-        let mut ds = Self::from_matrix_with_reference(&mat, fields, reference, cfg.num_threads)?;
+        let mut ds = Self::unfilled(
+            n,
+            reference.bin_mappers.clone(),
+            reference.feature_names.clone(),
+            Layout::Valid(&reference.upstream_inner),
+        );
+        ds.bin_config = reference.bin_config;
+        ds.forced_bin_bounds = reference.forced_bin_bounds.clone();
+        ds.label_idx = reference.label_idx;
+        let rows = extract(&mut ds, filename, skip, lines, &parser, &c)?;
         set_metadata(&mut ds, filename, rows, side)?;
         ds.data_filename = Some(filename.to_string());
         Ok(ds)
@@ -719,6 +732,7 @@ impl Dataset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::DatasetFields;
 
     fn write(dir: &std::path::Path, name: &str, text: &str) -> String {
         let p = dir.join(name);

@@ -186,18 +186,27 @@ def bench_section() -> list[str]:
             f"host: {data['host']}.", "", "Tasks:", ""]
     for name, t in data["tasks"].items():
         extra = ", ".join(f"{k}={v}" for k, v in t["params"].items())
-        out.append(f"- `{name}`: objective `{t['objective']}`, {t['cols']} features" + (f", {extra}" if extra else ""))
-    out += ["", "Times in seconds (upstream / rust); ratio = rust / upstream train time.", "",
-            "| task | threads | construct | train | ratio | predict | max abs prediction diff |",
-            "|---|---|---|---|---|---|---|"]
+        shape = f"{t.get('rows', data['rows']):,} rows, {t['cols']} features"
+        if t.get("density") is not None:
+            shape += f", scipy CSR with density {t['density']}"
+        out.append(f"- `{name}`: objective `{t['objective']}`, {shape}" + (f", {extra}" if extra else ""))
+    out += ["", "Times in seconds (upstream / rust); ratio = rust / upstream train time. Memory is the peak RSS "
+            "above the RSS after generating the input, in MB (upstream / rust).", "",
+            "| task | threads | construct | train | ratio | predict | memory | max abs prediction diff |",
+            "|---|---|---|---|---|---|---|---|"]
     pairs: dict[tuple[str, int], dict[str, dict]] = {}
     for r in data["results"]:
         pairs.setdefault((r["task"], r["threads"]), {})["rs" if "rust" in r["engine"] else "up"] = r
+
+    def mem(r: dict) -> str:
+        return f"{r['peak_rss_mb'] - r['data_rss_mb']:.0f}" if "peak_rss_mb" in r else "–"
+
     for (task, t), d in pairs.items():
         u, s = d["up"], d["rs"]
         out.append(f"| {task} | {t} | {u['construct_s']:.2f} / {s['construct_s']:.2f} | "
                    f"{u['train_s']:.2f} / {s['train_s']:.2f} | {s['train_s'] / u['train_s']:.2f} | "
-                   f"{u['predict_s']:.2f} / {s['predict_s']:.2f} | {s['max_abs_prediction_diff']:.1e} |")
+                   f"{u['predict_s']:.2f} / {s['predict_s']:.2f} | {mem(u)} / {mem(s)} | "
+                   f"{s['max_abs_prediction_diff']:.1e} |")
     return out + ["", data.get("note", ""), ""]
 
 

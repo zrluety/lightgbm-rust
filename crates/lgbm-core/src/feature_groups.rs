@@ -3,9 +3,9 @@
 //! upstream: src/io/dataset.cpp (`FastFeatureBundling`, `FindGroups`,
 //! `FixSampleIndices`, `GetConflictCount`, `MarkUsed`, and the group loop of
 //! `Dataset::Construct`). Upstream numbers its inner features in shuffled
-//! group order. This engine stores one column per feature and keeps inner
-//! features in column order, so only the resulting numbering is needed: it
-//! seeds per-feature generators (extra trees uses `extra_seed + inner`).
+//! group order; this engine keeps inner features in column order and
+//! records upstream's numbering, which seeds per-feature generators (extra
+//! trees uses `extra_seed + inner`).
 
 use crate::binning::BinMapper;
 use crate::random::Random;
@@ -155,19 +155,18 @@ fn find_groups(
     (kept, multi_val)
 }
 
-/// Upstream's feature groups as far as this engine needs them.
-#[derive(Debug, Clone, Default)]
-pub struct GroupLayout {
-    /// Upstream inner index of every used feature, indexed like `used_features`.
-    pub inner: Vec<usize>,
-    pub num_groups: usize,
-    /// Real column indices of the multi-value group, in group order (empty without one).
-    pub multi_val_features: Vec<usize>,
+/// One of upstream's feature groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSpec {
+    /// Real column indices, in group order.
+    pub features: Vec<usize>,
+    pub is_multi_val: bool,
 }
 
-/// Upstream's group layout of the used features (real column indices,
-/// ascending). `columns` holds every column's sampled non-zero entries.
-pub fn upstream_inner_order(
+/// Upstream's feature groups of the used features (real column indices,
+/// ascending), in upstream group order. `columns` holds every column's
+/// sampled non-zero entries.
+pub fn upstream_groups(
     bin_mappers: &[BinMapper],
     used_features: &[usize],
     columns: &[SampleColumn],
@@ -175,13 +174,9 @@ pub fn upstream_inner_order(
     num_data: usize,
     enable_bundle: bool,
     is_sparse: bool,
-) -> GroupLayout {
+) -> Vec<GroupSpec> {
     if !enable_bundle || used_features.is_empty() {
-        return GroupLayout {
-            inner: (0..used_features.len()).collect(),
-            num_groups: used_features.len(),
-            multi_val_features: Vec::new(),
-        };
+        return used_features.iter().map(|&f| GroupSpec { features: vec![f], is_multi_val: false }).collect();
     }
     let total = total_sample_cnt as i64;
     // upstream FastFeatureBundling: dense features first
@@ -212,14 +207,5 @@ pub fn upstream_inner_order(
         groups.swap(i as usize, j as usize);
         multi_val.swap(i as usize, j as usize);
     }
-    let mut inner_of_real = vec![usize::MAX; bin_mappers.len()];
-    for (inner, f) in groups.iter().flatten().enumerate() {
-        inner_of_real[*f] = inner;
-    }
-    let multi_val_features = groups.iter().zip(&multi_val).find(|(_, m)| **m).map(|(g, _)| g.clone()).unwrap_or_default();
-    GroupLayout {
-        inner: used_features.iter().map(|&f| inner_of_real[f]).collect(),
-        num_groups: groups.len(),
-        multi_val_features,
-    }
+    groups.into_iter().zip(multi_val).map(|(features, is_multi_val)| GroupSpec { features, is_multi_val }).collect()
 }

@@ -4,17 +4,17 @@
 //! `RowFunctionFromCSR`, `CSC_RowIterator`, `LGBM_BoosterPredictForCSR`,
 //! `LGBM_BoosterPredictForCSC`.
 //!
-//! Entries that are not stored are 0.0, so a sparse matrix bins and predicts
-//! exactly like its dense equivalent. Inputs with duplicate entries for the
-//! same cell are accepted, but the last stored entry wins, which only matches
-//! upstream for CSR input.
+//! Entries that are not stored are 0.0, so a sparse matrix predicts exactly
+//! like its dense equivalent. A sparse matrix is binned from its stored
+//! entries in upstream's push order, without densifying.
 
 use rayon::prelude::*;
 
 use crate::binning::BinMapper;
 use crate::consts::K_ZERO_THRESHOLD;
-use crate::dataset::{BinColumn, DenseMatrix, DenseValues};
+use crate::dataset::{DenseMatrix, DenseValues};
 use crate::error::{LgbmError, Result};
+use crate::feature_group::GroupsBuilder;
 use crate::feature_groups::SampleColumn;
 
 /// Offsets into `indices`/`values` (`indptr`), 32- or 64-bit like upstream.
@@ -248,42 +248,47 @@ impl Matrix<'_> {
         }
     }
 
-    /// Bin indices of columns `used`.
-    pub(crate) fn build_bins(&self, used: &[usize], mappers: &[BinMapper]) -> Vec<BinColumn> {
+    /// Push every row into `b`, as upstream's dataset constructors do:
+    /// a dense matrix pushes every value of every row, CSR input the stored
+    /// entries of each row (then `FinishOneRow`), and CSC input each column's
+    /// stored entries (every row of a column whose default bin is not its
+    /// most frequent bin). Upstream pushes CSC columns from several threads,
+    /// so a row where two bundled features conflict keeps the value of the
+    /// thread that wrote last; this follows its one-thread (column) order.
+    pub(crate) fn push_into(
+        &self,
+        b: &mut GroupsBuilder<'_>,
+        used: &[usize],
+        mappers: &[BinMapper],
+        real_to_inner: &[Option<usize>],
+    ) {
         let n = self.nrows();
         match self {
-            Matrix::Dense(mat) => used
-                .par_iter()
-                .map(|&c| {
-                    let m = &mappers[c];
-                    BinColumn::build(m.num_bin, n, |r| m.value_to_bin(mat.get(r, c)))
-                })
-                .collect(),
-            Matrix::Sparse(mat) => {
-                let transposed;
-                let (ptr, rows, vals): (Box<dyn Fn(usize) -> std::ops::Range<usize> + Sync>, _, _) =
-                    if mat.row_major {
-                        transposed = mat.transpose();
-                        let p = &transposed.ptr;
-                        (
-                            Box::new(move |c: usize| p[c]..p[c + 1]),
-                            Rows::Owned(&transposed.idx),
-                            Vals::Owned(&transposed.val),
-                        )
-                    } else {
-                        (Box::new(|c: usize| mat.outer(c)), Rows::Borrowed(mat.indices), Vals::Borrowed(mat))
-                    };
-                used.par_iter()
-                    .map(|&c| {
-                        let m = &mappers[c];
-                        let mut col = BinColumn::filled(m.num_bin, n, m.value_to_bin(0.0));
-                        for k in ptr(c) {
-                            col.set(rows.get(k), m.value_to_bin(vals.get(k)));
-                        }
-                        col
-                    })
-                    .collect()
-            }
+            Matrix::Dense(mat) => b.push_columns(true, |f, rows, sink| {
+                let c = used[f];
+                for r in rows {
+                    sink(r, mat.get(r, c));
+                }
+            }),
+            Matrix::Sparse(mat) if mat.row_major => b.push_rows(0, n, real_to_inner, |r, sink| {
+                for k in mat.outer(r) {
+                    sink(mat.indices[k] as usize, mat.value(k));
+                }
+            }),
+            Matrix::Sparse(mat) => b.push_columns(false, |f, _rows, sink| {
+                let c = used[f];
+                let m = &mappers[c];
+                if m.default_bin == m.most_freq_bin {
+                    for k in mat.outer(c) {
+                        sink(mat.indices[k] as usize, mat.value(k));
+                    }
+                } else {
+                    let mut it = CscRowIterator::new(mat, c);
+                    for r in 0..n {
+                        sink(r, it.get(r as i64));
+                    }
+                }
+            }),
         }
     }
 
@@ -293,36 +298,6 @@ impl Matrix<'_> {
             Matrix::Dense(m) => RowReader::Dense(m),
             Matrix::Sparse(m) if m.row_major => RowReader::Csr(m),
             Matrix::Sparse(m) => RowReader::Owned(m.transpose()),
-        }
-    }
-}
-
-enum Rows<'a> {
-    Owned(&'a [u32]),
-    Borrowed(&'a [i32]),
-}
-
-impl Rows<'_> {
-    #[inline]
-    fn get(&self, k: usize) -> usize {
-        match self {
-            Rows::Owned(v) => v[k] as usize,
-            Rows::Borrowed(v) => v[k] as usize,
-        }
-    }
-}
-
-enum Vals<'a> {
-    Owned(&'a [f64]),
-    Borrowed(&'a SparseMatrix<'a>),
-}
-
-impl Vals<'_> {
-    #[inline]
-    fn get(&self, k: usize) -> f64 {
-        match self {
-            Vals::Owned(v) => v[k],
-            Vals::Borrowed(m) => m.value(k),
         }
     }
 }

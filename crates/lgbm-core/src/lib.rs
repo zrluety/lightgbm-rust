@@ -12,6 +12,7 @@
 
 pub mod array_args;
 pub mod arrow;
+pub mod bin;
 pub mod binary;
 pub mod binning;
 pub mod boosting;
@@ -21,6 +22,7 @@ pub mod dataset;
 pub mod dataset_loader;
 pub mod dcg;
 pub mod error;
+pub mod feature_group;
 pub mod feature_groups;
 pub mod fmt;
 pub mod histogram;

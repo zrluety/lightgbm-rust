@@ -1,16 +1,14 @@
 //! Per-feature gradient/Hessian histograms.
 //!
-//! upstream: `Dataset::ConstructHistograms`, `DenseBin::ConstructHistogram`,
-//! and `Dataset::FixHistogram` (src/io/dataset.cpp, src/io/dense_bin.hpp).
-//!
-//! Layout: `[g0, h0, g1, h1, ...]` with `num_bin - offset` entries, where
+//! upstream: `Dataset::FixHistogram` (src/io/dataset.cpp). Histograms are
+//! built per feature group (see [`crate::bin::construct_histogram`] and
+//! [`crate::multi_val_bin`]); a feature's view of a leaf buffer is
+//! `[g0, h0, g1, h1, ...]` with `num_bin - offset` entries, where
 //! `offset = 1` when bin 0 is the most frequent bin (that bin is never
-//! stored). Rows in the most frequent bin are skipped during accumulation
-//! and recovered afterwards from the leaf totals, exactly as upstream does.
-//! Accumulation runs in data-index order, which fixes the summation order.
+//! stored). Rows in the most frequent bin are not stored and are recovered
+//! afterwards from the leaf totals, exactly as upstream does.
 
 use crate::binning::BinMapper;
-use crate::dataset::BinColumn;
 
 /// Histogram geometry of one feature (subset of upstream `FeatureMetainfo`).
 #[derive(Debug, Clone, Copy)]
@@ -36,54 +34,6 @@ impl HistLayout {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-}
-
-/// Accumulate rows into `hist`. With `indices = Some(idx)`, `og[k]`/`oh[k]`
-/// are the gradients of row `idx[k]` (already gathered); otherwise row `k`.
-pub fn construct(
-    col: &BinColumn,
-    indices: Option<&[u32]>,
-    og: &[f32],
-    oh: &[f32],
-    layout: &HistLayout,
-    hist: &mut [f64],
-) {
-    fn run<T: Copy + Into<u32>>(
-        bins: &[T],
-        indices: Option<&[u32]>,
-        og: &[f32],
-        oh: &[f32],
-        mfb: u32,
-        offset: u32,
-        hist: &mut [f64],
-    ) {
-        let mut add = |b: u32, k: usize| {
-            if b != mfb {
-                let t = ((b - offset) as usize) << 1;
-                hist[t] += og[k] as f64;
-                hist[t + 1] += oh[k] as f64;
-            }
-        };
-        match indices {
-            Some(idx) => {
-                for (k, &i) in idx.iter().enumerate() {
-                    add(bins[i as usize].into(), k);
-                }
-            }
-            None => {
-                for (k, &b) in bins.iter().enumerate() {
-                    add(b.into(), k);
-                }
-            }
-        }
-    }
-    let mfb = layout.most_freq_bin;
-    let off = layout.offset as u32;
-    match col {
-        BinColumn::U8(v) => run(v, indices, og, oh, mfb, off, hist),
-        BinColumn::U16(v) => run(v, indices, og, oh, mfb, off, hist),
-        BinColumn::U32(v) => run(v, indices, og, oh, mfb, off, hist),
     }
 }
 
@@ -118,26 +68,19 @@ mod tests {
 
     #[test]
     fn fix_recovers_most_frequent_bin() {
-        // bins: 0,1,1,2 with mfb = 1 -> rows in bin 1 skipped then recovered
-        let col = BinColumn::U8(vec![0, 1, 1, 2]);
+        // bins 0,1,1,2 with gradients 1,2,3,4 and mfb = 1: bin 1 is not stored
         let layout = HistLayout { num_bin: 3, offset: 0, most_freq_bin: 1 };
-        let g = [1.0f32, 2.0, 3.0, 4.0];
-        let h = [1.0f32; 4];
-        let mut hist = vec![0.0; layout.len()];
-        construct(&col, None, &g, &h, &layout, &mut hist);
-        assert_eq!(hist, vec![1.0, 1.0, 0.0, 0.0, 4.0, 1.0]);
+        let mut hist = vec![1.0, 1.0, 0.0, 0.0, 4.0, 1.0];
         fix(&layout, 10.0, 4.0, &mut hist);
         assert_eq!(hist, vec![1.0, 1.0, 5.0, 2.0, 4.0, 1.0]);
     }
 
     #[test]
-    fn offset_one_drops_bin_zero() {
-        let col = BinColumn::U8(vec![0, 0, 1, 2]);
+    fn offset_one_leaves_the_histogram_alone() {
         let layout = HistLayout { num_bin: 3, offset: 1, most_freq_bin: 0 };
-        let g = [1.0f32, 1.0, 2.0, 3.0];
-        let h = [1.0f32; 4];
-        let mut hist = vec![0.0; layout.len()];
-        construct(&col, Some(&[0, 2, 3]), &[g[0], g[2], g[3]], &[h[0], h[2], h[3]], &layout, &mut hist);
+        assert_eq!(layout.len(), 4);
+        let mut hist = vec![2.0, 1.0, 3.0, 1.0];
+        fix(&layout, 7.0, 3.0, &mut hist);
         assert_eq!(hist, vec![2.0, 1.0, 3.0, 1.0]);
     }
 }

@@ -1314,11 +1314,7 @@ class Dataset:
         raise _unsupported("Dataset.add_features_from()")
 
     def _dump_text(self, filename: Union[str, Path]) -> "Dataset":
-        """Write per-row bin indices in upstream ``Dataset::DumpTextFile`` format.
-
-        Difference: ``num_groups`` equals the number of used features (no
-        exclusive feature bundling).
-        """
+        """Write per-row bin indices in upstream ``Dataset::DumpTextFile`` format."""
         self.construct()
         assert self._rs is not None
         names = self._rs.feature_names()
@@ -1328,7 +1324,7 @@ class Dataset:
         lines = [
             f"num_features: {self._rs.num_used_features()}",
             f"num_total_features: {n_total}",
-            f"num_groups: {self._rs.num_used_features()}",
+            f"num_groups: {self._rs.num_feature_groups()}",
             f"num_data: {self._rs.num_data()}",
             "feature_names: " + "".join(f"{n}, " for n in names),
             "max_bin_by_feature: " + "".join(f"{m}, " for m in self._rs.max_bin_by_feature()),

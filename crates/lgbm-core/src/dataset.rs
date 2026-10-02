@@ -12,10 +12,12 @@
 
 use rayon::prelude::*;
 
+use crate::bin::Bin;
 use crate::binning::{BinMapper, BinParams, BinType};
 use crate::config::Config;
 use crate::error::{LgbmError, Result};
-use crate::feature_groups::{GroupLayout, SampleColumn, upstream_inner_order};
+use crate::feature_group::{FeatureBins, FeatureGroup, GroupsBuilder, SubFeature};
+use crate::feature_groups::{upstream_groups, GroupSpec, SampleColumn};
 use crate::matrix::Matrix;
 use crate::random::Random;
 
@@ -92,52 +94,13 @@ impl<'a> DenseMatrix<'a> {
     }
 }
 
-/// Bin indices of one feature for all rows, using the narrowest integer type.
-#[derive(Debug, Clone)]
-pub enum BinColumn {
-    U8(Vec<u8>),
-    U16(Vec<u16>),
-    U32(Vec<u32>),
-}
-
-impl BinColumn {
-    #[inline]
-    pub fn get(&self, i: usize) -> u32 {
-        match self {
-            BinColumn::U8(v) => v[i] as u32,
-            BinColumn::U16(v) => v[i] as u32,
-            BinColumn::U32(v) => v[i],
-        }
-    }
-
-    pub(crate) fn build(num_bin: i32, n: usize, f: impl Fn(usize) -> u32 + Sync) -> Self {
-        if num_bin <= 256 {
-            BinColumn::U8((0..n).map(|i| f(i) as u8).collect())
-        } else if num_bin <= 65536 {
-            BinColumn::U16((0..n).map(|i| f(i) as u16).collect())
-        } else {
-            BinColumn::U32((0..n).map(&f).collect())
-        }
-    }
-
-    pub(crate) fn filled(num_bin: i32, n: usize, bin: u32) -> Self {
-        if num_bin <= 256 {
-            BinColumn::U8(vec![bin as u8; n])
-        } else if num_bin <= 65536 {
-            BinColumn::U16(vec![bin as u16; n])
-        } else {
-            BinColumn::U32(vec![bin; n])
-        }
-    }
-
-    #[inline]
-    pub(crate) fn set(&mut self, i: usize, bin: u32) {
-        match self {
-            BinColumn::U8(v) => v[i] = bin as u8,
-            BinColumn::U16(v) => v[i] = bin as u16,
-            BinColumn::U32(v) => v[i] = bin,
-        }
-    }
+/// How a new dataset's features are grouped.
+pub(crate) enum Layout<'a> {
+    /// A training dataset's groups (upstream `Dataset::Construct`).
+    Train(Vec<GroupSpec>),
+    /// One group per feature in the reference's upstream inner order, given
+    /// as each inner feature's upstream index (upstream `CreateValid`).
+    Valid(&'a [usize]),
 }
 
 /// Labels, weights, initial scores, and ranking query/position data.
@@ -354,14 +317,11 @@ pub struct Dataset {
     pub(crate) used_features: Vec<usize>,
     /// Upstream's inner index of each inner feature (see `feature_groups`).
     pub(crate) upstream_inner: Vec<usize>,
-    /// upstream `num_feature_groups()`: one group per feature for datasets
-    /// built from a reference (`CreateValid`).
-    pub(crate) num_feature_groups: usize,
-    /// Real column indices of upstream's multi-value feature group, in group
-    /// order (empty without one).
-    pub(crate) multi_val_group: Vec<usize>,
     pub(crate) real_to_inner: Vec<Option<usize>>,
-    pub(crate) bins: Vec<BinColumn>,
+    /// upstream `feature_groups_`, in upstream group order.
+    pub(crate) groups: Vec<FeatureGroup>,
+    /// (group, sub-feature) of each inner feature.
+    pub(crate) feature_loc: Vec<(u32, u32)>,
     pub metadata: Metadata,
     pub(crate) feature_names: Vec<String>,
     pub(crate) bin_config: BinConstructConfig,
@@ -447,37 +407,19 @@ impl Dataset {
             Some(names) => sanitize_feature_names(names)?,
             None => ((0..ncol).map(|i| format!("Column_{i}")).collect(), false),
         };
-        let mut ds = Self::assemble(mat, fields, found.bin_mappers, feature_names)?;
+        let layout = train_layout(&found.bin_mappers, &columns, total_sample_size, n, cfg);
+        let mut ds = Self::assemble(mat, fields, found.bin_mappers, feature_names, layout)?;
         ds.forced_bin_bounds = found.forced_bin_bounds;
-        ds.finish_construct(&columns, total_sample_size, cfg, replaced);
+        ds.finish_construct(cfg, replaced);
         Ok(ds)
     }
 
-    /// Bundling order, recorded parameters and warnings of a freshly binned dataset.
+    /// Recorded parameters and warnings of a freshly binned dataset.
     ///
     /// upstream: the end of `Dataset::Construct`.
-    pub(crate) fn finish_construct(
-        &mut self,
-        columns: &[SampleColumn],
-        total_sample_size: usize,
-        cfg: &Config,
-        names_replaced: bool,
-    ) {
+    pub(crate) fn finish_construct(&mut self, cfg: &Config, names_replaced: bool) {
         self.bin_config = BinConstructConfig::from_config(cfg);
         self.max_bin_by_feature = cfg.max_bin_by_feature.clone();
-        let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
-        let GroupLayout { inner, num_groups, multi_val_features } = upstream_inner_order(
-            &self.bin_mappers,
-            &self.used_features,
-            columns,
-            total_sample_size,
-            self.num_data,
-            explicit_bool("enable_bundle").unwrap_or(true),
-            explicit_bool("is_enable_sparse").unwrap_or(true),
-        );
-        self.upstream_inner = inner;
-        self.num_feature_groups = num_groups;
-        self.multi_val_group = multi_val_features;
         if names_replaced {
             crate::log::warning(FEATURE_NAME_SPACE_WARNING);
         }
@@ -526,8 +468,13 @@ impl Dataset {
                 reference.num_total_features()
             )));
         }
-        let mut ds = Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())?;
-        ds.upstream_inner = reference.upstream_inner.clone();
+        let mut ds = Self::assemble(
+            mat,
+            fields,
+            reference.bin_mappers.clone(),
+            reference.feature_names.clone(),
+            Layout::Valid(&reference.upstream_inner),
+        )?;
         ds.bin_config = reference.bin_config;
         ds.forced_bin_bounds = reference.forced_bin_bounds.clone();
         ds.label_idx = reference.label_idx;
@@ -547,15 +494,8 @@ impl Dataset {
             return Err(LgbmError::InvalidData("used_row_indices should be sorted in Subset".into()));
         }
         let n = used.len();
-        let bins = self
-            .bins
-            .par_iter()
-            .map(|col| match col {
-                BinColumn::U8(v) => BinColumn::U8(used.iter().map(|&i| v[i as usize]).collect()),
-                BinColumn::U16(v) => BinColumn::U16(used.iter().map(|&i| v[i as usize]).collect()),
-                BinColumn::U32(v) => BinColumn::U32(used.iter().map(|&i| v[i as usize]).collect()),
-            })
-            .collect();
+        let used_u32: Vec<u32> = used.iter().map(|&i| i as u32).collect();
+        let groups = self.groups.par_iter().map(|g| g.copy_subrow(&used_u32)).collect();
         let pick_f32 = |v: &[f32]| used.iter().map(|&i| v[i as usize]).collect::<Vec<_>>();
         let init_score = self.metadata.init_score.as_ref().map(|s| {
             let k = s.len() / self.num_data;
@@ -570,10 +510,9 @@ impl Dataset {
             bin_mappers: self.bin_mappers.clone(),
             used_features: self.used_features.clone(),
             upstream_inner: self.upstream_inner.clone(),
-            num_feature_groups: self.num_feature_groups,
-            multi_val_group: self.multi_val_group.clone(),
             real_to_inner: self.real_to_inner.clone(),
-            bins,
+            groups,
+            feature_loc: self.feature_loc.clone(),
             metadata: Metadata {
                 label: pick_f32(&self.metadata.label),
                 weight: self.metadata.weight.as_deref().map(pick_f32),
@@ -637,36 +576,81 @@ impl Dataset {
         fields: DatasetFields<'_>,
         bin_mappers: Vec<BinMapper>,
         feature_names: Vec<String>,
+        layout: Layout<'_>,
     ) -> Result<Self> {
         let n = mat.nrows();
-        let used_features: Vec<usize> =
-            (0..bin_mappers.len()).filter(|&c| !bin_mappers[c].is_trivial).collect();
+        let mut ds = Self::unfilled(n, bin_mappers, feature_names, layout);
+        ds.fill_groups(|b, d| mat.push_into(b, &d.used_features, &d.bin_mappers, &d.real_to_inner));
+        ds.metadata.set_label(n, fields.label)?;
+        ds.metadata.set_weight(n, fields.weight)?;
+        ds.metadata.set_init_score(n, fields.init_score)?;
+        Ok(ds)
+    }
+
+    /// A dataset of `n` rows whose feature groups hold no bins yet (see
+    /// [`Dataset::fill_groups`]), with empty metadata.
+    pub(crate) fn unfilled(n: usize, bin_mappers: Vec<BinMapper>, feature_names: Vec<String>, layout: Layout<'_>) -> Self {
+        let used_features: Vec<usize> = (0..bin_mappers.len()).filter(|&c| !bin_mappers[c].is_trivial).collect();
         let mut real_to_inner = vec![None; bin_mappers.len()];
         for (inner, &real) in used_features.iter().enumerate() {
             real_to_inner[real] = Some(inner);
         }
-        let bins = mat.build_bins(&used_features, &bin_mappers);
-        let mut metadata = Metadata::default();
-        metadata.set_label(n, fields.label)?;
-        metadata.set_weight(n, fields.weight)?;
-        metadata.set_init_score(n, fields.init_score)?;
-        Ok(Self {
+        let sub = |inner: usize| SubFeature::of(inner, &bin_mappers[used_features[inner]]);
+        let groups: Vec<FeatureGroup> = match layout {
+            Layout::Train(specs) => specs
+                .iter()
+                .enumerate()
+                .map(|(g, s)| {
+                    let subs = s.features.iter().map(|&r| sub(real_to_inner[r].expect("grouped features are used"))).collect();
+                    FeatureGroup::new(subs, s.is_multi_val, g)
+                })
+                .collect(),
+            Layout::Valid(upstream_inner) => {
+                let mut by_upstream = vec![0usize; upstream_inner.len()];
+                for (inner, &u) in upstream_inner.iter().enumerate() {
+                    by_upstream[u] = inner;
+                }
+                by_upstream.into_iter().map(|inner| FeatureGroup::new_single(sub(inner))).collect()
+            }
+        };
+        let mut feature_loc = vec![(0u32, 0u32); used_features.len()];
+        let mut upstream_inner = vec![0usize; used_features.len()];
+        let mut k = 0;
+        for (g, grp) in groups.iter().enumerate() {
+            for (s, sf) in grp.subs.iter().enumerate() {
+                feature_loc[sf.inner] = (g as u32, s as u32);
+                upstream_inner[sf.inner] = k;
+                k += 1;
+            }
+        }
+        Self {
             num_data: n,
             forced_bin_bounds: vec![Vec::new(); bin_mappers.len()],
             bin_mappers,
-            upstream_inner: (0..used_features.len()).collect(),
-            num_feature_groups: used_features.len(),
-            multi_val_group: Vec::new(),
+            upstream_inner,
             used_features,
             real_to_inner,
-            bins,
-            metadata,
+            groups,
+            feature_loc,
+            metadata: Metadata::default(),
             feature_names,
             bin_config: BinConstructConfig::default(),
             max_bin_by_feature: Vec::new(),
             data_filename: None,
             label_idx: 0,
-        })
+        }
+    }
+
+    /// Fill the bins of an [`Dataset::unfilled`] dataset: `push(builder, self)`
+    /// pushes every row.
+    pub(crate) fn fill_groups(&mut self, push: impl FnOnce(&mut GroupsBuilder<'_>, &Self)) {
+        let groups = std::mem::take(&mut self.groups);
+        let this: &Self = self;
+        let mappers = this.used_features.iter().map(|&r| &this.bin_mappers[r]).collect();
+        let mut b = GroupsBuilder::new(groups, mappers, this.num_data);
+        push(&mut b, this);
+        let groups = b.finish();
+        self.groups = groups;
     }
 
     pub fn num_data(&self) -> usize {
@@ -697,7 +681,23 @@ impl Dataset {
     }
 
     pub fn num_feature_groups(&self) -> usize {
-        self.num_feature_groups
+        self.groups.len()
+    }
+
+    /// upstream `feature_groups_`, in upstream group order.
+    pub fn feature_groups(&self) -> &[FeatureGroup] {
+        &self.groups
+    }
+
+    /// The multi-value group, if any.
+    pub fn multi_val_group(&self) -> Option<usize> {
+        self.groups.iter().position(|g| g.is_multi_val)
+    }
+
+    /// (group, sub-feature) of inner feature `inner`.
+    pub fn feature_location(&self, inner: usize) -> (usize, usize) {
+        let (g, s) = self.feature_loc[inner];
+        (g as usize, s as usize)
     }
 
     pub fn feature_bin_mapper(&self, inner: usize) -> &BinMapper {
@@ -708,8 +708,10 @@ impl Dataset {
         &self.bin_mappers[real]
     }
 
-    pub fn feature_bins(&self, inner: usize) -> &BinColumn {
-        &self.bins[inner]
+    /// The stored bins of inner feature `inner`.
+    pub fn feature_bins(&self, inner: usize) -> FeatureBins<'_> {
+        let (g, s) = self.feature_location(inner);
+        self.groups[g].feature_bins(s)
     }
 
     pub fn feature_names(&self) -> &[String] {
@@ -750,7 +752,13 @@ impl Dataset {
 
     /// Bin index of each row for the given inner feature (for diagnostics/tests).
     pub fn bin_indices(&self, inner: usize) -> Vec<u32> {
-        (0..self.num_data).map(|i| self.bins[inner].get(i)).collect()
+        let mut c = self.feature_bins(inner).cursor(0);
+        (0..self.num_data).map(|i| c.get(i)).collect()
+    }
+
+    /// Heap bytes of the stored bins.
+    pub fn bin_heap_bytes(&self) -> usize {
+        self.groups.iter().flat_map(|g| &g.bins).map(Bin::heap_bytes).sum()
     }
 
     pub fn bin_mappers(&self) -> &[BinMapper] {
@@ -782,6 +790,29 @@ impl Dataset {
                     && a.bin_upper_bound.iter().zip(&b.bin_upper_bound).all(|(x, y)| x.to_bits() == y.to_bits())
             })
     }
+}
+
+/// The feature groups of a training dataset with these mappers.
+///
+/// upstream: `Dataset::Construct` (`FastFeatureBundling`).
+pub(crate) fn train_layout(
+    bin_mappers: &[BinMapper],
+    columns: &[SampleColumn],
+    total_sample_size: usize,
+    num_data: usize,
+    cfg: &Config,
+) -> Layout<'static> {
+    let used: Vec<usize> = (0..bin_mappers.len()).filter(|&c| !bin_mappers[c].is_trivial).collect();
+    let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
+    Layout::Train(upstream_groups(
+        bin_mappers,
+        &used,
+        columns,
+        total_sample_size,
+        num_data,
+        explicit_bool("enable_bundle").unwrap_or(true),
+        explicit_bool("is_enable_sparse").unwrap_or(true),
+    ))
 }
 
 /// One bin mapper per column from the sampled values; `skip` columns get a

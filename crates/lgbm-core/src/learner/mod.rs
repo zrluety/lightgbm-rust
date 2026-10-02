@@ -4,11 +4,11 @@
 //! leaf_splits.hpp, and `Dataset::ConstructHistograms` / `FixHistogram`.
 //!
 //! Determinism: leaf sums are sequential. Histograms are built either
-//! col-wise (`force_col_wise`: each feature accumulated in data-index order,
-//! parallel over features, so results do not depend on the thread count) or
-//! row-wise (default: upstream's row-block scheme, see `multi_val_bin`, so
-//! results match upstream's row-wise mode for the same thread count; with
-//! one thread both modes give identical sums).
+//! col-wise (`force_col_wise`: each feature group accumulated in data-index
+//! order, parallel over groups, and the multi-value group as row-wise) or
+//! row-wise (default: upstream's row-block scheme over all groups, see
+//! `multi_val_bin`), so results match upstream's mode for the same thread
+//! count.
 
 mod cegb;
 pub mod col_sampler;
@@ -27,8 +27,9 @@ use crate::consts::{K_EPSILON, K_MIN_SCORE};
 use crate::fmt::fmt_f;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
+use crate::bin::{construct_histogram, with_bin};
 use crate::histogram::{self, HistLayout};
-use crate::multi_val_bin::{HistSlots, MultiValBin, merge_blocks};
+use crate::multi_val_bin::{HistOffsets, MultiValBin, TreePlan, share_state_sparse_rate};
 use crate::random::Random;
 use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
 use crate::tree::{SplitArgs, Tree, construct_bitset, find_in_bitset};
@@ -41,17 +42,15 @@ use partition::DataPartition;
 use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_output};
 
 /// Histograms of all features of one leaf in one flat buffer laid out by
-/// [`HistSlots`] (`[g, h]` pairs per bin).
+/// [`HistOffsets`] (`[g, h]` pairs per bin).
 ///
 /// As upstream's `HistogramPool` (when it holds every leaf), each leaf index
 /// owns a buffer that keeps its contents across trees: a build writes only
-/// the features upstream writes, so a forced split can read the same left-over
+/// the regions upstream writes, so a forced split can read the same left-over
 /// values upstream reads.
 struct LeafHist {
     data: Vec<f64>,
     splittable: Vec<bool>,
-    /// Features built (or subtracted) by the last build of this slot.
-    fresh: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,14 +85,16 @@ pub struct SerialTreeLearner {
     hist_pool: Vec<Option<LeafHist>>,
     /// Whether each slot was built in the current tree.
     hist_built: Vec<bool>,
-    /// Row-wise build target when only the by-tree features are copied out
-    /// (upstream's sub-column multi-val bin).
-    subcol_buf: Vec<f64>,
-    /// Upstream inner feature order (its feature-group order).
-    group_order: Vec<usize>,
+    /// Build target of a sub-column multi-value build.
+    mv_scratch: Vec<f64>,
     block_bufs: Vec<Vec<f64>>,
-    slots: HistSlots,
+    offsets: HistOffsets,
+    /// upstream `is_col_wise` (`force_col_wise`; row-wise otherwise).
+    col_wise: bool,
+    /// Col-wise: the multi-value group's bin; row-wise: the bin of all groups.
     multi_val: Option<MultiValBin>,
+    /// The multi-value bin's plan for the current tree.
+    mv_plan: Option<TreePlan>,
     /// `Some(is_col_wise)` when `force_col_wise` or `force_row_wise` is set.
     forced_layout: Option<bool>,
     team: ThreadTeam,
@@ -182,32 +183,10 @@ fn log_share_state(data: &Dataset, forced_layout: Option<bool>) {
     if !crate::log::enabled(crate::log::LogLevel::Debug) || data.num_features() == 0 {
         return;
     }
-    let sparse_rate = |real: usize| data.bin_mapper_by_real(real).sparse_rate;
-    match forced_layout {
-        Some(true) if !data.multi_val_group.is_empty() => {
-            let mut sum = 0.0f64;
-            for &real in &data.multi_val_group {
-                sum += sparse_rate(real);
-            }
-            let rate = sum / data.multi_val_group.len() as f64;
-            crate::log::debug(&format!("Dataset::GetMultiBinFromSparseFeatures: sparse rate {}", fmt_f(rate, 6)));
-        }
-        Some(false) => {
-            let mut order: Vec<usize> = (0..data.num_features()).collect();
-            order.sort_by_key(|&f| data.upstream_inner_index(f));
-            let mut sum_dense_ratio = 0.0f64;
-            for f in order {
-                sum_dense_ratio += 1.0f32 as f64 - sparse_rate(data.real_feature_index(f));
-            }
-            let multi = data.multi_val_group.len();
-            let ncol = if multi > 0 { data.num_feature_groups - 1 + multi } else { data.num_feature_groups };
-            sum_dense_ratio /= ncol as f64;
-            crate::log::debug(&format!(
-                "Dataset::GetMultiBinFromAllFeatures: sparse rate {}",
-                fmt_f(1.0 - sum_dense_ratio, 6)
-            ));
-        }
-        _ => {}
+    let Some(col_wise) = forced_layout else { return };
+    if let Some(rate) = share_state_sparse_rate(data, col_wise) {
+        let name = if col_wise { "GetMultiBinFromSparseFeatures" } else { "GetMultiBinFromAllFeatures" };
+        crate::log::debug(&format!("Dataset::{name}: sparse rate {}", fmt_f(rate, 6)));
     }
 }
 
@@ -253,9 +232,9 @@ impl SerialTreeLearner {
         let num_leaves = cfg.num_leaves.max(2) as usize;
         let constraints = leaf_constraints(cfg, num_leaves, data.num_features());
         let num_data = data.num_data();
-        let slots = HistSlots::new(&data);
-        let multi_val =
-            (!cfg.force_col_wise && data.num_features() > 0).then(|| MultiValBin::new(&data, &slots));
+        let col_wise = cfg.force_col_wise;
+        let offsets = HistOffsets::new(&data, col_wise);
+        let multi_val = MultiValBin::new(&data, &offsets);
         let col_sampler = ColSampler::new(&data, cfg);
         let extra_rands = extra_rands(&data, cfg);
         let cegb = Cegb::is_enable(cfg).then(|| new_cegb(&data, cfg, num_leaves));
@@ -271,17 +250,14 @@ impl SerialTreeLearner {
             monotone_penalty: cfg.monotone_penalty,
             track_branch_features: !cfg.interaction_constraints_vector.is_empty(),
             branch_features: vec![Vec::new(); num_leaves],
-            slots,
+            offsets,
+            col_wise,
             multi_val,
+            mv_plan: None,
             forced_layout,
             team: ThreadTeam::new(resolve_num_threads(cfg.num_threads)),
             hist_built: vec![false; num_leaves],
-            subcol_buf: Vec::new(),
-            group_order: {
-                let mut order: Vec<usize> = (0..data.num_features()).collect();
-                order.sort_by_key(|&f| data.upstream_inner_index(f));
-                order
-            },
+            mv_scratch: Vec::new(),
             block_bufs: Vec::new(),
             data,
             params: split_params(cfg),
@@ -364,8 +340,17 @@ impl SerialTreeLearner {
         self.partition.reset_num_data(num_data);
         self.partition.set_used_data_indices(None);
         self.col_sampler.set_training_data(&data);
+        let offsets = HistOffsets::new(&data, self.col_wise);
+        if offsets.views != self.offsets.views || offsets.num_total_bin != self.offsets.num_total_bin {
+            return Err(LgbmError::Unsupported(
+                "training data whose feature groups lay out histograms differently (upstream keeps the \
+                 histogram pool's layout and reads the new histograms at the old offsets)"
+                    .into(),
+            ));
+        }
         log_share_state(&data, self.forced_layout);
-        self.multi_val = self.multi_val.is_some().then(|| MultiValBin::new(&data, &self.slots));
+        self.multi_val = MultiValBin::new(&data, &offsets);
+        self.offsets = offsets;
         self.view_num_data = num_data;
         self.bag_local = None;
         self.data = data;
@@ -437,6 +422,7 @@ impl SerialTreeLearner {
         // upstream: BeforeTrain
         self.hist_built.fill(false);
         self.col_sampler.reset_by_tree();
+        self.mv_plan = self.multi_val.as_ref().map(|mv| mv.plan(&self.data, self.col_sampler.is_feature_used_bytree()));
         self.partition.init();
         for b in self.branch_features.iter_mut() {
             b.clear();
@@ -561,11 +547,57 @@ impl SerialTreeLearner {
     /// The memory of slot `leaf` (upstream zero-initializes a new buffer).
     fn take_slot(&mut self, leaf: usize) -> LeafHist {
         let nf = self.data.num_features();
-        self.hist_pool[leaf].take().unwrap_or_else(|| LeafHist {
-            data: vec![0.0; self.slots.buf_len()],
-            splittable: vec![true; nf],
-            fresh: vec![false; nf],
-        })
+        self.hist_pool[leaf]
+            .take()
+            .unwrap_or_else(|| LeafHist { data: vec![0.0; self.offsets.buf_len()], splittable: vec![true; nf] })
+    }
+
+    /// upstream `Dataset::ConstructHistograms` with float gradients into `s_buf`.
+    #[allow(clippy::too_many_arguments)]
+    fn construct_float(
+        &mut self,
+        s_buf: &mut [f64],
+        leaf: usize,
+        use_indices: bool,
+        used_groups: &[usize],
+        mv_used: bool,
+        grad: &[f32],
+        hess: &[f32],
+    ) {
+        let idx = use_indices.then(|| self.partition.indices_on_leaf(leaf));
+        let data: &Dataset = &self.data;
+        let mv_region = if self.col_wise {
+            let groups = data.feature_groups();
+            if !used_groups.is_empty() {
+                // gather gradients of the smaller leaf in partition order
+                if let Some(indices) = idx {
+                    self.ordered_g.clear();
+                    self.ordered_h.clear();
+                    self.ordered_g.extend(indices.iter().map(|&i| grad[i as usize]));
+                    self.ordered_h.extend(indices.iter().map(|&i| hess[i as usize]));
+                }
+                let (og, oh): (&[f32], &[f32]) =
+                    if idx.is_some() { (&self.ordered_g, &self.ordered_h) } else { (grad, hess) };
+                let gs = &self.offsets.group_start;
+                let shared = SharedMut::new(s_buf);
+                self.team.for_each(used_groups.len(), og.len() * used_groups.len(), |k| {
+                    let g = used_groups[k];
+                    // SAFETY: group regions are disjoint and each task owns one group.
+                    let hist = unsafe { shared.slice(2 * gs[g], 2 * (gs[g + 1] - gs[g])) };
+                    hist.fill(0.0);
+                    with_bin!(&groups[g].bins[0], b => construct_histogram(b, idx, og, oh, hist));
+                });
+            }
+            mv_used.then(|| {
+                let g = data.multi_val_group().expect("multi-value group");
+                2 * self.offsets.group_start[g]..2 * self.offsets.group_start[g + 1]
+            })
+        } else {
+            Some(0..s_buf.len())
+        };
+        if let (Some(r), Some(mv), Some(plan)) = (mv_region, &self.multi_val, &self.mv_plan) {
+            mv.construct(&self.team, plan, idx, &self.gh, &mut s_buf[r], &mut self.mv_scratch, &mut self.block_bufs);
+        }
     }
 
     /// upstream `FindBestSplits`; `force` adds the forced-split features to
@@ -604,21 +636,6 @@ impl SerialTreeLearner {
             }
         }
         let l_spl_init = parent.as_ref().map(|p| p.splittable.clone());
-        let row_wise = self.multi_val.is_some();
-        // upstream MultiValBinWrapper::CopyMultiValBinSubset: a row-wise build
-        // writes every feature unless the by-tree features hold under 60% of
-        // the dense rate, when only those are written.
-        let subcol = row_wise && {
-            let (mut used, mut total) = (0.0f64, 0.0f64);
-            for &f in &self.group_order {
-                let dense_rate = 1.0 - self.data.bin_mapper_by_real(self.data.real_feature_index(f)).sparse_rate;
-                if bytree[f] {
-                    used += dense_rate;
-                }
-                total += dense_rate;
-            }
-            used < total * 0.6
-        };
         // upstream FindBestSplitsFromHistograms: smaller leaf first, then larger.
         let s_node = self.col_sampler.get_by_node(&self.branch_features[self.smaller.leaf as usize]);
         let l_node = if self.larger.leaf >= 0 {
@@ -630,38 +647,21 @@ impl SerialTreeLearner {
         let sm_leaf = self.smaller.leaf as usize;
         let use_indices = right >= 0 || self.partition.leaf_count(sm_leaf) != self.data.num_data();
         let mut s_buf = s_hist.data;
-        let indices = self.partition.indices_on_leaf(sm_leaf);
-        let idx = if use_indices { Some(indices) } else { None };
-        // Row-wise: accumulate row blocks now; blocks are merged per feature
-        // below. Col-wise: each feature's histogram is built in its own task.
-        let nblock = match &self.multi_val {
-            Some(mv) if subcol => {
-                self.subcol_buf.resize(self.slots.buf_len(), 0.0);
-                let nblock = mv.construct_blocks(&self.team, idx, &self.gh, &mut self.subcol_buf, &mut self.block_bufs);
-                for f in (0..nf).filter(|&f| bytree[f]) {
-                    let v = self.slots.views[f];
-                    let dst = &mut self.subcol_buf[v.start..v.start + v.len];
-                    merge_blocks(dst, &self.block_bufs, v.start, nblock);
-                    s_buf[v.start..v.start + v.len].copy_from_slice(dst);
+        let mut used_groups = Vec::new();
+        let mut mv_used = false;
+        if self.col_wise {
+            for (g, grp) in self.data.feature_groups().iter().enumerate() {
+                if grp.subs.iter().any(|s| is_used[s.inner]) {
+                    if grp.is_multi_val {
+                        mv_used = true;
+                    } else {
+                        used_groups.push(g);
+                    }
                 }
-                1
             }
-            Some(mv) => mv.construct_blocks(&self.team, idx, &self.gh, &mut s_buf, &mut self.block_bufs),
-            None => {
-                // gather gradients of the smaller leaf in partition order
-                if use_indices {
-                    self.ordered_g.clear();
-                    self.ordered_h.clear();
-                    self.ordered_g.extend(indices.iter().map(|&i| grad[i as usize]));
-                    self.ordered_h.extend(indices.iter().map(|&i| hess[i as usize]));
-                }
-                0
-            }
-        };
-        let (og, oh): (&[f32], &[f32]) =
-            if use_indices { (&self.ordered_g, &self.ordered_h) } else { (grad, hess) };
-        let block_bufs = &self.block_bufs;
-
+        }
+        // upstream Dataset::ConstructHistogramsInner
+        self.construct_float(&mut s_buf, sm_leaf, use_indices, &used_groups, mv_used, grad, hess);
         let data: &Dataset = &self.data;
         let metas = &self.metas;
         let params = self.params;
@@ -698,14 +698,10 @@ impl SerialTreeLearner {
         let mut l_buf = parent.map(|p| p.data);
         let s_shared = SharedMut::new(&mut s_buf);
         let l_shared = l_buf.as_mut().map(|b| SharedMut::new(b));
-        let views = &self.slots.views;
+        let views = &self.offsets.views;
         let rands = self.extra_rands.as_mut().map(|r| SharedMut::new(r));
 
-        let work = if row_wise {
-            nblock.max(1) * self.slots.buf_len()
-        } else {
-            nf * self.smaller.num_data as usize + self.slots.buf_len()
-        };
+        let work = 4 * self.offsets.buf_len();
         let results: Vec<FeatResult> = self.team.map(nf, work, |f| {
                 let meta = &metas[f];
                 let layout = HistLayout {
@@ -714,11 +710,6 @@ impl SerialTreeLearner {
                     most_freq_bin: meta.most_freq_bin,
                 };
                 if !is_used[f] {
-                    if row_wise && !subcol {
-                        let v = views[f];
-                        // SAFETY: feature views are disjoint and each task owns one feature.
-                        merge_blocks(unsafe { s_shared.slice(v.start, v.len) }, block_bufs, v.start, nblock);
-                    }
                     return FeatResult {
                         smaller_split: SplitInfo::default(),
                         smaller_splittable: false,
@@ -727,20 +718,16 @@ impl SerialTreeLearner {
                     };
                 }
                 let v = views[f];
-                // SAFETY: feature views are disjoint and each task owns one feature.
-                let hist = unsafe { s_shared.slice(v.start, v.len) };
-                let lview = l_shared.as_ref().map(|l| unsafe { l.slice(v.start, v.len) });
-                if row_wise {
-                    merge_blocks(hist, block_bufs, v.start, nblock);
-                } else {
-                    hist.fill(0.0);
-                    histogram::construct(data.feature_bins(f), idx, og, oh, &layout, hist);
-                }
-                histogram::fix(&layout, smaller.sum_gradients, smaller.sum_hessians, hist);
                 let real = data.real_feature_index(f) as i32;
                 // SAFETY: task `f` is the only one touching generator `f`.
                 let mut rand = rands.as_ref().map(|r| unsafe { r.get(f) });
                 let mut s_split = SplitInfo::default();
+                let mut l_split = SplitInfo::default();
+                let mut l_ok = false;
+                // SAFETY: feature views are disjoint and each task owns one feature.
+                let hist = unsafe { s_shared.slice(v.start, v.len) };
+                let lview = l_shared.as_ref().map(|l| unsafe { l.slice(v.start, v.len) });
+                histogram::fix(&layout, smaller.sum_gradients, smaller.sum_hessians, hist);
                 let s_ok = find_best_threshold(
                     hist,
                     meta,
@@ -754,8 +741,6 @@ impl SerialTreeLearner {
                     &mut s_split,
                 );
                 s_split.feature = real;
-                let mut l_split = SplitInfo::default();
-                let mut l_ok = false;
                 if larger.leaf >= 0 {
                     let lh = lview.expect("parent histogram present");
                     histogram::subtract(lh, hist);
@@ -811,13 +796,13 @@ impl SerialTreeLearner {
             }
         }
         self.best_split_per_leaf[sm_leaf] = s_best;
-        self.hist_pool[sm_leaf] = Some(LeafHist { data: s_buf, splittable: s_spl, fresh: is_used.clone() });
+        self.hist_pool[sm_leaf] = Some(LeafHist { data: s_buf, splittable: s_spl });
         self.hist_built[sm_leaf] = true;
         if larger.leaf >= 0 {
             let lg = larger.leaf as usize;
             self.best_split_per_leaf[lg] = l_best;
             self.hist_pool[lg] =
-                Some(LeafHist { data: l_buf.expect("parent histogram"), splittable: l_spl, fresh: is_used });
+                Some(LeafHist { data: l_buf.expect("parent histogram"), splittable: l_spl });
             self.hist_built[lg] = true;
         }
         self.hist_slots = (smaller.leaf, larger.leaf);
@@ -970,7 +955,7 @@ impl SerialTreeLearner {
             if meta.bin_type == BinType::Numerical {
                 constraints.recompute_if_needed(tree, f, leaf, meta.num_bin as u32);
             }
-            let v = self.slots.views[f];
+            let v = self.offsets.views[f];
             let mut new_split = SplitInfo::default();
             lh.splittable[f] = find_best_threshold(
                 &lh.data[v.start..v.start + v.len],

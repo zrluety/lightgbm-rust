@@ -9,7 +9,11 @@ use crate::binning::MissingType;
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::{Dataset, avoid_inf_f32, avoid_inf_f64};
 use crate::error::{LgbmError, Result};
+use crate::feature_group::FeatureCursor;
 use crate::fmt::{fmt_g6, fmt_g17};
+
+/// Rows per task when predicting on a binned dataset.
+const PREDICT_CHUNK: usize = 4096;
 
 const K_CATEGORICAL_MASK: i8 = 1;
 const K_DEFAULT_LEFT_MASK: i8 = 2;
@@ -486,17 +490,30 @@ impl Tree {
 
     /// Leaf index of row `i` of a binned dataset. Requires the tree to have
     /// been trained on a dataset sharing `data`'s bin mappers.
-    #[inline]
     pub fn get_leaf_binned(&self, data: &Dataset, i: usize) -> usize {
         if self.num_leaves <= 1 {
             return 0;
         }
+        let mut cursors = self.node_cursors();
+        self.leaf_binned_with(data, &mut cursors, i)
+    }
+
+    fn node_cursors<'a>(&self) -> Vec<Option<FeatureCursor<'a>>> {
+        (0..self.num_leaves.max(1) - 1).map(|_| None).collect()
+    }
+
+    /// Leaf of row `i`, reading each node's feature through `cursors[node]`
+    /// (opened at the first row it reads; rows must ascend between resets).
+    /// upstream: `Tree::AddPredictionToScore` keeps one iterator per node
+    /// and resets them at each block start.
+    #[inline]
+    fn leaf_binned_with<'a>(&self, data: &'a Dataset, cursors: &mut [Option<FeatureCursor<'a>>], i: usize) -> usize {
         let mut node: i32 = 0;
         while node >= 0 {
             let n = node as usize;
             let inner = self.split_feature_inner[n] as usize;
             let m = data.feature_bin_mapper(inner);
-            let b = data.feature_bins(inner).get(i);
+            let b = cursors[n].get_or_insert_with(|| data.feature_bins(inner).cursor(i)).get(i);
             if self.is_categorical(n) {
                 // upstream: Tree::CategoricalDecisionInner
                 let c = self.threshold_in_bin[n] as usize;
@@ -529,8 +546,11 @@ impl Tree {
             return;
         }
         use rayon::prelude::*;
-        score.par_iter_mut().with_min_len(4096).enumerate().for_each(|(i, s)| {
-            *s += self.leaf_value[self.get_leaf_binned(data, i)];
+        score.par_chunks_mut(PREDICT_CHUNK).enumerate().for_each(|(c, chunk)| {
+            let mut cursors = self.node_cursors();
+            for (k, s) in chunk.iter_mut().enumerate() {
+                *s += self.leaf_value[self.leaf_binned_with(data, &mut cursors, c * PREDICT_CHUNK + k)];
+            }
         });
     }
 
@@ -544,8 +564,24 @@ impl Tree {
             return;
         }
         use rayon::prelude::*;
-        let leaves: Vec<usize> =
-            rows.par_iter().with_min_len(4096).map(|&i| self.get_leaf_binned(data, i as usize)).collect();
+        let leaves: Vec<usize> = rows
+            .par_chunks(PREDICT_CHUNK)
+            .flat_map_iter(|chunk| {
+                let mut cursors = self.node_cursors();
+                let mut last = 0usize;
+                chunk
+                    .iter()
+                    .map(|&i| {
+                        let i = i as usize;
+                        if i < last {
+                            cursors = self.node_cursors();
+                        }
+                        last = i;
+                        self.leaf_binned_with(data, &mut cursors, i)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         for (&i, leaf) in rows.iter().zip(leaves) {
             score[i as usize] += self.leaf_value[leaf];
         }
