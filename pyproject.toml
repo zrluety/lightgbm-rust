@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "lightgbm-rust"
-version = "0.3.0"
+version = "0.4.0"
 description = "Pure-Rust re-implementation of LightGBM with a LightGBM-like Python API (work in progress)"
 readme = "README.md"
 license = { text = "MIT" }
