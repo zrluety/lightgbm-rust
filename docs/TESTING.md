@@ -63,14 +63,14 @@ PowerShell expands `$` inside double quotes, so put anything non-trivial in a sc
 - **Report.** Every comparison, including its max abs/rel diff and whether it was bitwise exact, goes to `tests/report/differential.json`.
 
 ### Upstream Python suite (`tests/upstream_runner`)
-- **Mechanism.** `shim_plugin.py` aliases `lightgbm`, `lightgbm.basic`, `lightgbm.callback`, and `lightgbm.engine` to `lightgbm_rust`. `lightgbm.compat` is upstream's own file. The upstream test files run unmodified from the submodule.
+- **Mechanism.** `shim_plugin.py` aliases `lightgbm`, `lightgbm.basic`, `lightgbm.callback`, `lightgbm.compat`, `lightgbm.engine`, and `lightgbm.sklearn` to the `lightgbm_rust` modules. The upstream test files run unmodified from the submodule.
 - **Classification.** Each test is classified as one of:
   - `passed`: the upstream assertions hold.
   - `failed`: any assertion or unexpected error. Each one is a behavioral difference or a bug, and is listed individually in the report.
-  - `unsupported`: the test needs a feature that lightgbm-rust reports as not implemented, i.e. it raises `LightGBMError("not supported by lightgbm-rust yet: ...")`. This category also covers tests that need an API that does not exist yet. Missing-API errors are matched narrowly: only `module 'lightgbm…' has no attribute`, a missing attribute on `Booster`/`Dataset`/etc., or an unexpected keyword to one of our functions count. Any other `AttributeError`/`TypeError` is `failed`. Also counted as `unsupported` is a `pytest.raises(match=...)` that received our "not supported" error instead of the expected message. Upstream *private* helpers that tests call directly (`_data_from_pandas`, `_np2d_to_np1d`, `Dataset._handle`, ...) fall in this category too.
+  - `unsupported`: the test needs a feature that lightgbm-rust reports as not implemented, i.e. it raises `LightGBMError("not supported by lightgbm-rust yet: ...")`. This category also covers tests that need an API that does not exist yet. Missing-API errors are matched narrowly: only `module 'lightgbm…' has no attribute`, a missing attribute on `Booster`/`Dataset`/etc., or an unexpected keyword to one of our functions count. Any other `AttributeError`/`TypeError` is `failed`. Also counted as `unsupported` is a `pytest.raises(match=...)` that received our "not supported" error instead of the expected message, and a failure whose error or an earlier warning in the same test carries the "not supported" message. scikit-learn's model selection reports failed fits that way (a `ValueError` listing their tracebacks, or a `FitFailedWarning` followed by a failed assertion on the scores); the recorded reason names both. Upstream *private* helpers that tests call directly (`_data_from_pandas`, `_np2d_to_np1d`, `Dataset._handle`, ...) fall in this category too.
   - `skipped`: skipped by upstream's own markers or conditions. The reason is kept.
   - `adapted`: listed in `ADAPTATIONS` in `shim_plugin.py`, with a reason. This list is currently empty, because no upstream test has been modified.
-- **Collection errors.** A module whose import fails (currently `test_sklearn.py`, which needs `LGBMModel`) is reported with its number of test functions from `docs/compat/upstream_tests.csv`.
+- **Collection errors.** A module whose import fails (currently none) is reported with its number of test functions from `docs/compat/upstream_tests.csv`.
 
 ## Determinism
 

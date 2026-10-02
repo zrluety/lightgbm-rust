@@ -5,7 +5,7 @@
 //! src/metric/map_metric.hpp.
 
 use crate::config::Config;
-use crate::consts::K_EPSILON;
+use crate::consts::{K_EPSILON, neg_log_epsilon};
 use crate::dataset::Metadata;
 use crate::dcg::{self, DcgCalculator};
 use crate::error::{LgbmError, Result};
@@ -151,7 +151,7 @@ fn multiclass_loss(kind: MetricKind, p: LossParams, label: f32, rec: &[f64]) -> 
             0.0
         }
         MetricKind::MultiLogloss => {
-            if rec[k] > K_EPSILON { -rec[k].ln() } else { -K_EPSILON.ln() }
+            if rec[k] > K_EPSILON { -rec[k].ln() } else { neg_log_epsilon() }
         }
         _ => unreachable!("not a multiclass metric"),
     }
@@ -420,11 +420,11 @@ impl Metric {
                 let loss = move |label: f32, prob: f64| -> f64 {
                     if kind == MetricKind::BinaryLogloss {
                         if label <= 0.0 {
-                            if 1.0 - prob > K_EPSILON { -(1.0 - prob).ln() } else { -K_EPSILON.ln() }
+                            if 1.0 - prob > K_EPSILON { -(1.0 - prob).ln() } else { neg_log_epsilon() }
                         } else if prob > K_EPSILON {
                             -prob.ln()
                         } else {
-                            -K_EPSILON.ln()
+                            neg_log_epsilon()
                         }
                     } else if prob <= 0.5 {
                         (label > 0.0) as i32 as f64
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn logloss_clamps() {
         let m = metric(MetricKind::BinaryLogloss, &meta(vec![1.0]));
-        assert_eq!(m.eval(&[0.0], None)[0], -K_EPSILON.ln());
+        assert_eq!(m.eval(&[0.0], None)[0], -(1e-15_f32.ln()) as f64);
     }
 
     #[test]

@@ -32,6 +32,17 @@ __all__ = ["Booster", "Dataset", "EvalResult", "LightGBMError", "register_logger
 _NOT_SUPPORTED = "not supported by lightgbm-rust yet"
 
 _LGBM_EvalFunctionResultType = Tuple[str, float, bool]
+# upstream's input type aliases, loosened to Any (used in annotations only)
+_LGBM_BoosterBestScoreType = Dict[str, Dict[str, float]]
+_LGBM_CategoricalFeatureConfiguration = Union[List[str], List[int], str]
+_LGBM_FeatureNameConfiguration = Union[List[str], str]
+_LGBM_GroupType = Any
+_LGBM_InitScoreType = Any
+_LGBM_LabelType = Any
+_LGBM_PredictReturnType = Any
+_LGBM_WeightType = Any
+
+_MULTICLASS_OBJECTIVES = {"multiclass", "multiclassova", "multiclass_ova", "ova", "ovr", "softmax"}
 
 
 def _unsupported(what: str) -> LightGBMError:
@@ -225,7 +236,7 @@ def _param_dict_to_pairs(data: Optional[Dict[str, Any]]) -> List[Tuple[str, str]
 
 
 def _parse_loaded_params(text: Optional[str]) -> Dict[str, Any]:
-    """upstream: ``Booster._get_loaded_param`` (``[name: value]`` lines -> typed dict)."""
+    """upstream: ``GBDT::GetLoadedParam`` + ``Booster._get_loaded_param`` (``[name: value]`` lines -> typed dict)."""
     out: Dict[str, Any] = {}
     if not text:
         return out
@@ -236,18 +247,25 @@ def _parse_loaded_params(text: Optional[str]) -> Dict[str, Any]:
         if not (line.startswith("[") and line.endswith("]")) or ": " not in line:
             continue
         key, value = line[1:-1].split(": ", 1)
-        t = types.get(key, "std::string")
+        if value == "":
+            continue
+        if key not in types:
+            _log_warning(f"Ignoring unrecognized parameter '{key}' found in model string.")
+            continue
+        t = types[key]
         try:
-            if t == "int":
+            if key == "interaction_constraints":  # upstream type: vector<vector<int>>
+                out[key] = json.loads(f"[{value}]")
+            elif t == "int":
                 out[key] = int(value)
             elif t == "double":
                 out[key] = float(value)
             elif t == "bool":
-                out[key] = value in ("1", "true")
+                out[key] = value == "1"
             elif t.startswith("std::vector<"):
                 inner = t[len("std::vector<") : -1]
                 items = [v for v in value.split(",") if v != ""]
-                if inner == "int":
+                if inner in ("int", "int8_t", "int32_t"):
                     out[key] = [int(v) for v in items]
                 elif inner == "double":
                     out[key] = [float(v) for v in items]
@@ -1453,6 +1471,9 @@ class Booster:
     def free_network(self) -> "Booster":
         return self
 
+    def _get_loaded_param(self) -> Dict[str, Any]:
+        return _parse_loaded_params(self._rs.loaded_parameters())
+
     def set_network(self, *args: Any, **kwargs: Any) -> "Booster":
         raise _unsupported("distributed training")
 
@@ -1474,7 +1495,8 @@ class Booster:
         return self
 
     def reset_parameter(self, params: Dict[str, Any]) -> "Booster":
-        """Only ``objective`` -> none is supported (used for custom objectives)."""
+        """Only ``learning_rate`` and ``objective`` -> none (used for custom objectives) are supported."""
+        original = dict(params)
         params = dict(params)
         obj = params.pop("objective", None)
         if obj is not None:
@@ -1482,9 +1504,15 @@ class Booster:
                 raise _unsupported("reset_parameter(objective=...)")
             assert self._rs is not None
             self._rs.clear_objective()
+        lr_pairs = [(k, v) for k, v in _param_dict_to_pairs(params) if k in _ConfigAliases.get("learning_rate")]
+        if lr_pairs:
+            assert self._rs is not None
+            self._rs.set_learning_rate(dict(lr_pairs).get("learning_rate", lr_pairs[0][1]))
+        for k in _ConfigAliases.get("learning_rate"):
+            params.pop(k, None)
         if params:
             raise _unsupported(f"reset_parameter({sorted(params)})")
-        self.params.update({"objective": obj} if obj is not None else {})
+        self.params.update(original)
         return self
 
     def update(self, train_set: Optional[Dataset] = None, fobj: Optional[Callable] = None) -> bool:

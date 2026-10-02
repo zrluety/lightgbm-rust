@@ -226,18 +226,36 @@ fn parse_int(key: &str, v: &str) -> Result<i32> {
     })
 }
 
-fn parse_double(key: &str, v: &str) -> Result<f64> {
+/// upstream: `Config::GetDouble` -> `Common::AtofAndCheck`, i.e. the legacy,
+/// not correctly rounded `Common::Atof` ("inf" is 1e308).
+pub(crate) fn parse_double(key: &str, v: &str) -> Result<f64> {
     let t = v.trim();
-    let lower = t.to_ascii_lowercase();
-    let parsed = match lower.as_str() {
-        "inf" | "+inf" | "infinity" => Ok(f64::INFINITY),
-        "-inf" | "-infinity" => Ok(f64::NEG_INFINITY),
-        "nan" | "na" | "null" => Ok(f64::NAN),
-        _ => t.parse::<f64>(),
-    };
-    parsed.map_err(|_| {
-        LgbmError::InvalidParameter(format!("Parameter {key} should be of type double, got \"{v}\""))
-    })
+    if let Some(x) = crate::fmt::atof_legacy(t) {
+        return Ok(x);
+    }
+    let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+    if !body.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E')) {
+        let token: String = body
+            .chars()
+            .take_while(|c| !matches!(c, ' ' | '\t' | ',' | '\n' | '\r' | ':'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !matches!(token.as_str(), "" | "na" | "nan" | "null" | "inf" | "infinity") {
+            return Err(LgbmError::InvalidParameter(format!("Unknown token {token} in data file")));
+        }
+    }
+    Err(LgbmError::InvalidParameter(format!("Parameter {key} should be of type double, got \"{v}\"")))
+}
+
+/// Parse and range-check one double parameter the way `Config::Set` does.
+pub(crate) fn parse_checked_double(key: &str, v: &str) -> Result<f64> {
+    let x = parse_double(key, v)?;
+    if let Some(spec) = param_specs().iter().find(|s| s.name == key) {
+        for c in &spec.checks {
+            check_value(key, x, c)?;
+        }
+    }
+    Ok(x)
 }
 
 fn check_value(key: &str, value: f64, check: &str) -> Result<()> {

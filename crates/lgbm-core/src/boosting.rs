@@ -670,6 +670,17 @@ impl Gbdt {
         }
     }
 
+    /// upstream: `Booster::ResetConfig` with only `learning_rate` changed
+    /// (`GBDT::ResetConfig` sets `shrinkage_rate_`); applies to later iterations.
+    pub fn set_learning_rate(&mut self, value: &str) -> Result<()> {
+        let Some(c) = self.config.as_mut() else {
+            return Err(LgbmError::Unsupported("reset_parameter on a loaded model".into()));
+        };
+        c.learning_rate = crate::config::parse_checked_double("learning_rate", value)?;
+        c.explicit.insert("learning_rate".into(), value.trim().to_string());
+        Ok(())
+    }
+
     /// Drop the training state (datasets, scores, learner) and keep the model.
     pub fn free_training_state(&mut self) {
         self.train = None;

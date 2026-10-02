@@ -590,6 +590,10 @@ impl RsBooster {
         self.inner.clear_objective();
     }
 
+    fn set_learning_rate(&mut self, value: &str) -> PyResult<()> {
+        guarded(|| self.inner.set_learning_rate(value))
+    }
+
     fn free_training_state(&mut self) {
         self.inner.free_training_state();
     }

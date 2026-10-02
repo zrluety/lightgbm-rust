@@ -5,7 +5,9 @@ This project is an independent Rust re-implementation of LightGBM. It does not
 link to, wrap, or call the upstream LightGBM C++ engine. Several algorithms are
 ported from the upstream source (pinned at v4.7.0, commit
 8f7036f03627054d5a54a6f965b13f4b9ff2cb63). Each ported routine carries an
-"upstream:" comment naming the original file and function.
+"upstream:" comment naming the original file and function. Parts of the Python
+package follow upstream's python-package; python/lightgbm_rust/sklearn.py and
+compat.py are ports of upstream sklearn.py and compat.py, as their headers state.
 
 Ported or derived portions are subject to the following notice:
 

@@ -1189,6 +1189,49 @@ def test_categorical_errors_and_warnings():
     assert "cat_feature in param dict is overridden." in out["lightgbm"]
 
 
+RESET_LR_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "bag_basic")]
+
+
+@pytest.mark.parametrize("case", RESET_LR_CASES, ids=[c.name for c in RESET_LR_CASES])
+def test_reset_learning_rate(case, recorder):
+    """reset_parameter(learning_rate=...) via the callback, Booster.reset_parameter with an alias, and cv."""
+    rec = recorder(case.name)
+    schedule = [0.3 * 0.93 ** i for i in range(case.num_boost_round)]
+    rs, up = train_both(case, callbacks_factory=lambda mod: [mod.reset_parameter(learning_rate=schedule)])
+    rec.compare("model_text[callback]", "model_text", rs.model_to_string(), up.model_to_string())
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.Booster(case.full_params, mod.Dataset(case.X, label=case.y, weight=case.weight))
+        for i in range(8):
+            if i % 3:
+                bst.reset_parameter({"eta": 0.123456789012345 + i / 7})
+            bst.update()
+        out[mod.__name__] = bst.model_to_string()
+    rec.compare("model_text[Booster.reset_parameter(eta)]", "model_text", out["lightgbm_rust"], out["lightgbm"])
+    res = {}
+    for mod in (lgb_rs, lgb_up):
+        res[mod.__name__] = mod.cv(case.full_params, mod.Dataset(case.X, label=case.y), num_boost_round=10, nfold=3,
+                                   stratified=False, seed=3,
+                                   callbacks=[mod.reset_parameter(learning_rate=lambda i: 0.05 + 0.01 * i)])
+    for k in res["lightgbm"]:
+        rec.compare(f"cv[{k}]", "metrics", res["lightgbm_rust"][k], res["lightgbm"][k])
+    rec.finish()
+
+
+def test_reset_parameter_errors():
+    case = next(c for c in CASES if c.name == "reg_basic")
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.Booster(case.full_params, mod.Dataset(case.X, label=case.y))
+        with pytest.raises(mod.basic.LightGBMError, match=r"Check failed: \(learning_rate\) > \(0.0\)"):
+            bst.reset_parameter({"learning_rate": -0.5})
+        with pytest.raises(mod.basic.LightGBMError, match="Unknown token x in data file"):
+            bst.reset_parameter({"learning_rate": "x"})
+        with pytest.raises(mod.basic.LightGBMError, match='Parameter learning_rate should be of type double, got "1.5x"'):
+            bst.reset_parameter({"learning_rate": "1.5x"})
+        with pytest.raises(mod.basic.LightGBMError, match="Unknown token abc in data file"):
+            mod.train({**case.full_params, "lambda_l2": "abc"}, mod.Dataset(case.X, label=case.y), num_boost_round=1)
+
+
 def leaf_values(b):
     return np.concatenate([np.asarray(t["leaf_value"], dtype=float) for t in _trees_of(b)])
 

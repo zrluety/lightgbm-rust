@@ -8,6 +8,7 @@ from ._lightgbm_rust import UPSTREAM_COMMIT, UPSTREAM_VERSION, __version__
 from .basic import Booster, Dataset, EvalResult, LightGBMError, Sequence, register_logger
 from .callback import EarlyStopException, early_stopping, log_evaluation, record_evaluation, reset_parameter
 from .engine import CVBooster, cv, train
+from .sklearn import LGBMClassifier, LGBMModel, LGBMRanker, LGBMRegressor
 
 __all__ = [
     "Booster",
@@ -15,6 +16,10 @@ __all__ = [
     "Dataset",
     "EarlyStopException",
     "EvalResult",
+    "LGBMClassifier",
+    "LGBMModel",
+    "LGBMRanker",
+    "LGBMRegressor",
     "LightGBMError",
     "Sequence",
     "UPSTREAM_COMMIT",

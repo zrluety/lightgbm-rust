@@ -10,7 +10,9 @@ so upstream test files run unmodified. Each test outcome is classified as:
 * ``unsupported`` - the test needs a feature lightgbm-rust reports as not
                     implemented (``LightGBMError: not supported by
                     lightgbm-rust yet``) or an API that does not exist yet
-                    (missing attribute/module/keyword);
+                    (missing attribute/module/keyword); this includes failures
+                    whose error or preceding warning carries that message
+                    (scikit-learn's model selection reports failed fits so);
 * ``skipped``     - skipped by upstream's own markers/conditions (reason kept);
 * ``adapted``     - listed in ``ADAPTATIONS`` below (none at present).
 
@@ -20,7 +22,6 @@ Results are written to ``tests/report/upstream_results.json``.
 from __future__ import annotations
 
 import csv
-import importlib.util
 import json
 import re
 import sys
@@ -33,7 +34,9 @@ import pytest
 import lightgbm_rust
 import lightgbm_rust.basic
 import lightgbm_rust.callback
+import lightgbm_rust.compat
 import lightgbm_rust.engine
+import lightgbm_rust.sklearn
 
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = ROOT / "third_party" / "LightGBM"
@@ -49,15 +52,8 @@ def _install_alias() -> None:
     if existing is not None and existing is not lightgbm_rust:
         raise RuntimeError("upstream lightgbm was imported before the shim; results would be invalid")
     sys.modules["lightgbm"] = lightgbm_rust
-    for sub in ("basic", "callback", "engine"):
+    for sub in ("basic", "callback", "compat", "engine", "sklearn"):
         sys.modules[f"lightgbm.{sub}"] = getattr(lightgbm_rust, sub)
-    # compat.py only detects optional third-party packages; reuse upstream's file.
-    spec = importlib.util.spec_from_file_location("lightgbm.compat", UPSTREAM / "python-package" / "lightgbm" / "compat.py")
-    assert spec is not None and spec.loader is not None
-    compat = importlib.util.module_from_spec(spec)
-    sys.modules["lightgbm.compat"] = compat
-    spec.loader.exec_module(compat)
-    lightgbm_rust.compat = compat  # type: ignore[attr-defined]
 
 
 _install_alias()
@@ -95,7 +91,26 @@ def _classify_exception(excinfo: Any) -> tuple[str, str]:
         return "unsupported", "LightGBMError: " + inp[0][:280]
     if isinstance(exc, (AttributeError, TypeError, ImportError)) and any(p.search(text) for p in _MISSING_API):
         return "unsupported", "missing API: " + msg
+    # e.g. scikit-learn's model selection re-raising every failed fit's traceback in a ValueError
+    marked = _marked_line(text)
+    if marked:
+        return "unsupported", f"{type(exc).__name__} wrapping {marked}"
     return "failed", msg
+
+
+def _marked_line(text: str) -> str:
+    lines = [ln.strip() for ln in text.splitlines() if _UNSUPPORTED_MARK in ln]
+    return lines[0][:280] if lines else ""
+
+
+# nodeid -> first warning line naming an unsupported feature (e.g. scikit-learn's FitFailedWarning)
+_UNSUPPORTED_WARNINGS: Dict[str, str] = {}
+
+
+def pytest_warning_recorded(warning_message: Any, when: str, nodeid: str, location: Any) -> None:
+    marked = _marked_line(str(warning_message.message))
+    if marked and nodeid:
+        _UNSUPPORTED_WARNINGS.setdefault(nodeid, f"{warning_message.category.__name__} reporting {marked}")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -162,6 +177,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     import lightgbm  # the alias
 
     assert lightgbm is lightgbm_rust, "alias was replaced during the run"
+    # a failure preceded by a warning that a fit hit an unsupported feature is attributed to that feature
+    for nodeid, marked in _UNSUPPORTED_WARNINGS.items():
+        rec = _RECORDS.get(nodeid)
+        if rec is not None and rec["category"] == "failed":
+            rec["category"] = "unsupported"
+            rec["reason"] = f"{marked} (test then failed: {rec['reason'][:120]})"
     inventory = _inventory_counts()
     for err in _COLLECTION_ERRORS + _COLLECTION_SKIPS:
         err["nodeid"] = err["nodeid"].split("third_party/LightGBM/")[-1]
