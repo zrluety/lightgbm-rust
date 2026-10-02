@@ -273,6 +273,11 @@ fn auc_mu_weights_matrix(weights: &[f64], num_class: i32) -> Result<Vec<Vec<f64>
                     )));
                 }
                 m[i][j] = weights[i * n + j];
+            } else if weights[i * n + j].abs() > K_ZERO_THRESHOLD {
+                crate::log::info(&format!(
+                    "AUC-mu matrix must have zeros on diagonal. Overwriting value in position {} of auc_mu_weights with 0.",
+                    i * n + j
+                ));
             }
         }
     }
@@ -494,8 +499,6 @@ pub struct Config {
     pub predict_disable_shape_check: bool,
     /// Canonical key -> value string as supplied (after alias resolution).
     pub explicit: BTreeMap<String, String>,
-    /// Non-fatal diagnostics (unknown keys, duplicate aliases), mirroring upstream warnings.
-    pub warnings: Vec<String>,
 }
 
 impl Default for Config {
@@ -604,7 +607,6 @@ impl Default for Config {
             precise_float_parser: false,
             predict_disable_shape_check: false,
             explicit: BTreeMap::new(),
-            warnings: Vec::new(),
         }
     }
 }
@@ -617,7 +619,8 @@ impl Config {
     /// of a repeated key wins; a canonical name wins over its aliases; among
     /// several aliases the shortest (then lexicographically smallest) wins;
     /// `seed` derives the sub-seeds unless they are given explicitly.
-    /// Warnings use upstream's wording.
+    /// As upstream, `verbosity` (or `verbose`) sets this thread's log level
+    /// ([`crate::log`]) and warnings are logged with upstream's wording.
     pub fn from_pairs<I, K, V>(pairs: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -631,14 +634,14 @@ impl Config {
 
     /// upstream `Config::Set` on an existing config (`Booster::ResetConfig`):
     /// only the given keys change, then the conflict checks run again.
-    /// Returns the canonical keys that were given. Warnings are appended.
+    /// Returns the canonical keys that were given.
     pub fn set<I, K, V>(&mut self, pairs: I) -> Result<BTreeMap<String, String>>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let explicit = self.str2map(pairs);
+        let explicit = Self::str2map(pairs)?;
         self.set_map(&explicit)?;
         Ok(explicit)
     }
@@ -650,25 +653,34 @@ impl Config {
         Ok(())
     }
 
-    /// upstream `Config::Str2Map`, with its warnings pushed to `self.warnings`.
-    fn str2map<I, K, V>(&mut self, pairs: I) -> BTreeMap<String, String>
+    /// upstream `Config::Str2Map`, including `SetVerbosity`.
+    fn str2map<I, K, V>(pairs: I) -> Result<BTreeMap<String, String>>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let cfg = self;
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let all: Vec<(String, String)> = pairs
+            .into_iter()
+            .map(|(k, v)| (unquote(k.as_ref()), unquote(v.as_ref())))
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
+
+        // SetVerbosity: `verbosity` is preferred to `verbose`; other aliases are ignored
+        let first_of = |name: &str| all.iter().find(|(k, _)| k == name);
+        if let Some((key, val)) = first_of("verbosity").or_else(|| first_of("verbose")) {
+            let v = crate::text_parser::atoi_and_check(val).ok_or_else(|| {
+                LgbmError::InvalidParameter(format!("Parameter {key} should be of type int, got \"{val}\""))
+            })?;
+            crate::log::reset_log_level(crate::log::level_for_verbosity(v));
+        }
 
         // KeepFirstValues
         let mut first: Vec<(String, String)> = Vec::new();
-        for (k, v) in pairs {
-            let (key, val) = (unquote(k.as_ref()), unquote(v.as_ref()));
-            if key.is_empty() {
-                continue;
-            }
+        for (key, val) in all {
             match first.iter().find(|(fk, _)| *fk == key) {
-                Some((_, v0)) => cfg.warnings.push(format!(
+                Some((_, v0)) => crate::log::warning(&format!(
                     "{key} is set={v0}, {key}={val} will be ignored. Current value: {key}={v0}"
                 )),
                 None => first.push((key, val)),
@@ -681,7 +693,7 @@ impl Config {
         let mut chosen_alias: BTreeMap<String, (String, String)> = BTreeMap::new();
         for (key, val) in &first {
             match canonical_name(key) {
-                None => cfg.warnings.push(format!("Unknown parameter: {key}")),
+                None => crate::log::warning(&format!("Unknown parameter: {key}")),
                 Some(name) if name == key => {
                     explicit.insert(key.clone(), val.clone());
                 }
@@ -691,11 +703,11 @@ impl Config {
                     }
                     Some((a, av)) => {
                         if sort_alias(a, key) {
-                            cfg.warnings.push(format!(
+                            crate::log::warning(&format!(
                                 "{name} is set with {a}={av}, {key}={val} will be ignored. Current value: {name}={av}"
                             ));
                         } else {
-                            cfg.warnings.push(format!(
+                            crate::log::warning(&format!(
                                 "{name} is set with {a}={av}, will be overridden by {key}={val}. Current value: {name}={val}"
                             ));
                             chosen_alias.insert(name.to_string(), (key.clone(), val.clone()));
@@ -706,7 +718,7 @@ impl Config {
         }
         for (name, (alias, av)) in chosen_alias {
             match explicit.get(&name) {
-                Some(cv) => cfg.warnings.push(format!(
+                Some(cv) => crate::log::warning(&format!(
                     "{name} is set={cv}, {alias}={av} will be ignored. Current value: {name}={cv}"
                 )),
                 None => {
@@ -714,7 +726,7 @@ impl Config {
                 }
             }
         }
-        explicit
+        Ok(explicit)
     }
 
     fn apply(&mut self, p: &BTreeMap<String, String>) -> Result<()> {
@@ -1019,7 +1031,7 @@ impl Config {
         if self.max_depth > 0 && p.get("num_leaves").is_none_or(|v| v.is_empty()) {
             let full_num_leaves = 2f64.powi(self.max_depth);
             if full_num_leaves > self.num_leaves as f64 {
-                self.warnings.push(format!(
+                crate::log::warning(&format!(
                     "Provided parameters constrain tree depth (max_depth={}) without explicitly setting 'num_leaves'. \
                      This can lead to underfitting. To resolve this warning, pass 'num_leaves' (<={full_num_leaves:.0}) in params. \
                      Alternatively, pass (max_depth=-1) and just use 'num_leaves' to constrain model complexity.",
@@ -1033,30 +1045,25 @@ impl Config {
         if self.boosting == "goss" {
             self.boosting = "gbdt".into();
             self.data_sample_strategy = "goss".into();
-            self.warnings.push(
+            crate::log::warning(
                 "Found boosting=goss. For backwards compatibility reasons, LightGBM interprets this as \
-                 boosting=gbdt, data_sample_strategy=goss.To suppress this warning, set data_sample_strategy=goss instead."
-                    .into(),
+                 boosting=gbdt, data_sample_strategy=goss.To suppress this warning, set data_sample_strategy=goss instead.",
             );
         }
         // upstream: Config::CheckParamConflict (monotone constraints)
         let precise_mc = matches!(self.monotone_constraints_method.as_str(), "intermediate" | "advanced");
         if self.feature_fraction_bynode != 1.0 && precise_mc {
-            self.warnings.push(
+            crate::log::warning(
                 "Cannot use \"intermediate\" or \"advanced\" monotone constraints with feature fraction different from 1, \
-                 auto set monotone constraints to \"basic\" method."
-                    .into(),
+                 auto set monotone constraints to \"basic\" method.",
             );
             self.monotone_constraints_method = "basic".into();
         }
         if self.max_depth > 0 && self.monotone_penalty >= self.max_depth as f64 {
-            self.warnings.push("Monotone penalty greater than tree depth. Monotone features won't be used.".into());
+            crate::log::warning("Monotone penalty greater than tree depth. Monotone features won't be used.");
         }
         if self.bagging_by_query && self.data_sample_strategy != "bagging" {
-            self.warnings.push(
-                "bagging_by_query=true is only compatible with data_sample_strategy=bagging. Setting bagging_by_query=false."
-                    .into(),
-            );
+            crate::log::warning("bagging_by_query=true is only compatible with data_sample_strategy=bagging. Setting bagging_by_query=false.");
             self.bagging_by_query = false;
         }
         Ok(())
@@ -1351,22 +1358,19 @@ mod tests {
 
     #[test]
     fn canonical_name_wins_over_alias() {
-        let c = Config::from_pairs([("eta", "0.5"), ("learning_rate", "0.2")]).unwrap();
-        assert_eq!(c.learning_rate, 0.2);
-        assert_eq!(
-            c.warnings,
-            vec!["learning_rate is set=0.2, eta=0.5 will be ignored. Current value: learning_rate=0.2"]
-        );
+        let (c, warnings) = crate::log::capture(|| Config::from_pairs([("eta", "0.5"), ("learning_rate", "0.2")]));
+        assert_eq!(c.unwrap().learning_rate, 0.2);
+        assert_eq!(warnings, vec!["learning_rate is set=0.2, eta=0.5 will be ignored. Current value: learning_rate=0.2"]);
     }
 
     #[test]
     fn max_depth_without_num_leaves_matches_check_param_conflict() {
-        let c = Config::from_pairs([("max_depth", "3")]).unwrap();
+        let (c, warnings) = crate::log::capture(|| Config::from_pairs([("max_depth", "3")]).unwrap());
         assert_eq!(c.num_leaves, 8);
-        assert!(c.warnings.is_empty());
-        let c = Config::from_pairs([("max_depth", "5")]).unwrap();
+        assert!(warnings.is_empty());
+        let (c, warnings) = crate::log::capture(|| Config::from_pairs([("max_depth", "5")]).unwrap());
         assert_eq!(c.num_leaves, 31);
-        assert!(c.warnings[0].contains("pass 'num_leaves' (<=32) in params"));
+        assert!(warnings[0].contains("pass 'num_leaves' (<=32) in params"));
         let c = Config::from_pairs([("max_depth", "3"), ("num_leaves", "31")]).unwrap();
         assert_eq!(c.num_leaves, 31);
     }
@@ -1378,9 +1382,9 @@ mod tests {
         assert_eq!(c.learning_rate, 0.5);
         let c = Config::from_pairs([("eta", "0.5"), ("shrinkage_rate", "0.3")]).unwrap();
         assert_eq!(c.learning_rate, 0.5);
-        let c = Config::from_pairs([("max_bin", "15"), ("max_bin", "31")]).unwrap();
+        let (c, warnings) = crate::log::capture(|| Config::from_pairs([("max_bin", "15"), ("max_bin", "31")]).unwrap());
         assert_eq!(c.max_bin, 15);
-        assert!(c.warnings[0].starts_with("max_bin is set=15, max_bin=31 will be ignored"));
+        assert!(warnings[0].starts_with("max_bin is set=15, max_bin=31 will be ignored"));
     }
 
     #[test]
@@ -1408,9 +1412,9 @@ mod tests {
 
     #[test]
     fn boosting_goss_is_gbdt_with_goss_sampling() {
-        let c = Config::from_pairs([("boosting", "goss")]).unwrap();
+        let (c, warnings) = crate::log::capture(|| Config::from_pairs([("boosting", "goss")]).unwrap());
         assert_eq!((c.boosting.as_str(), c.data_sample_strategy.as_str()), ("gbdt", "goss"));
-        assert!(c.warnings[0].starts_with("Found boosting=goss."));
+        assert!(warnings[0].starts_with("Found boosting=goss."));
         assert!(Config::from_pairs([("data_sample_strategy", "x")]).is_err());
     }
 

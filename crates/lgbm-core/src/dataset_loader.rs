@@ -48,18 +48,23 @@ struct Columns {
     /// Header names without the label column; empty without a header.
     feature_names: Vec<String>,
     header_bytes: usize,
+    /// The skipped header line (`None` without a header).
+    header_line: Option<String>,
+}
+
+impl Columns {
+    /// upstream: the debug line of one more `TextReader` over the data file.
+    fn reopen(&self, filename: &str) {
+        if let Some(h) = &self.header_line {
+            text_parser::log_skipped_header(filename, h);
+        }
+    }
 }
 
 fn not_a_number(what: &str) -> LgbmError {
     LgbmError::InvalidParameter(format!(
         "{what} is not a number,\nif you want to use a column name,\nplease add the prefix \"name:\" to the column name"
     ))
-}
-
-/// upstream: `Common::AtoiAndCheck`.
-fn atoi_and_check(s: &str) -> Option<i32> {
-    let (v, p) = text_parser::atoi(s.as_bytes(), 0);
-    (p == s.len()).then_some(v)
 }
 
 /// upstream: `Common::Split(str, ',')` (empty tokens dropped).
@@ -73,6 +78,7 @@ fn set_header(filename: &str, cfg: &Config) -> Result<Columns> {
     if cfg.header {
         let (first_line, skip) = text_parser::read_header(filename)?;
         c.header_bytes = skip;
+        c.header_line = Some(first_line.clone());
         // upstream: Common::Split(first_line, "\t,")
         c.feature_names = first_line.split(['\t', ',']).filter(|t| !t.is_empty()).map(str::to_string).collect();
     }
@@ -84,8 +90,10 @@ fn set_header(filename: &str, cfg: &Config) -> Result<Columns> {
                     "Could not find label column {name} in data file \nor data file doesn't contain header"
                 )));
             }
+            crate::log::info(&format!("Using column {name} as label"));
         } else {
-            c.label_idx = atoi_and_check(&cfg.label_column).ok_or_else(|| not_a_number("label_column"))?;
+            c.label_idx = text_parser::atoi_and_check(&cfg.label_column).ok_or_else(|| not_a_number("label_column"))?;
+            crate::log::info(&format!("Using column number {} as label", c.label_idx));
         }
     }
     if !c.feature_names.is_empty() {
@@ -107,25 +115,33 @@ fn set_header(filename: &str, cfg: &Config) -> Result<Columns> {
             }
         } else {
             for t in split_commas(&cfg.ignore_column) {
-                c.ignore.insert(atoi_and_check(t).ok_or_else(|| not_a_number("ignore_column"))?);
+                c.ignore.insert(text_parser::atoi_and_check(t).ok_or_else(|| not_a_number("ignore_column"))?);
             }
         }
     }
-    let mut role = |value: &str, what: &str, missing: &str| -> Result<i32> {
+    let mut role = |value: &str, what: &str, missing: &str, used_as: &str| -> Result<i32> {
         let idx = match value.strip_prefix("name:") {
-            Some(name) => *name2idx.get(name).ok_or_else(|| {
-                LgbmError::InvalidParameter(format!("Could not find {missing} column {name} in data file"))
-            })?,
-            None => atoi_and_check(value).ok_or_else(|| not_a_number(what))?,
+            Some(name) => {
+                let idx = *name2idx.get(name).ok_or_else(|| {
+                    LgbmError::InvalidParameter(format!("Could not find {missing} column {name} in data file"))
+                })?;
+                crate::log::info(&format!("Using column {name} as {used_as}"));
+                idx
+            }
+            None => {
+                let idx = text_parser::atoi_and_check(value).ok_or_else(|| not_a_number(what))?;
+                crate::log::info(&format!("Using column number {idx} as {used_as}"));
+                idx
+            }
         };
         c.ignore.insert(idx);
         Ok(idx)
     };
     if !cfg.weight_column.is_empty() {
-        c.weight_idx = role(&cfg.weight_column, "weight_column", "weight")?;
+        c.weight_idx = role(&cfg.weight_column, "weight_column", "weight", "weight")?;
     }
     if !cfg.group_column.is_empty() {
-        c.group_idx = role(&cfg.group_column, "group_column", "group/query")?;
+        c.group_idx = role(&cfg.group_column, "group_column", "group/query", "group/query id")?;
     }
     c.categorical = categorical_columns(cfg, &name2idx)?;
     Ok(c)
@@ -144,7 +160,7 @@ fn categorical_columns(cfg: &Config, name2idx: &HashMap<String, i32>) -> Result<
         }
     } else {
         for t in split_commas(&cfg.categorical_feature) {
-            out.insert(atoi_and_check(t).ok_or_else(|| not_a_number("categorical_feature"))?);
+            out.insert(text_parser::atoi_and_check(t).ok_or_else(|| not_a_number("categorical_feature"))?);
         }
     }
     Ok(out)
@@ -164,6 +180,7 @@ fn load_side_files(filename: &str) -> Result<SideFiles> {
     let mut s = SideFiles::default();
     let lines = text_parser::read_all_lines(&format!("{filename}.query"), 0)?;
     if !lines.is_empty() {
+        crate::log::info("Calculating query boundaries...");
         let mut b = Vec::with_capacity(lines.len() + 1);
         b.push(0i32);
         for l in &lines {
@@ -174,12 +191,14 @@ fn load_side_files(filename: &str) -> Result<SideFiles> {
     }
     let lines = text_parser::read_all_lines(&format!("{filename}.weight"), 0)?;
     if !lines.is_empty() {
+        crate::log::info("Loading weights...");
         s.weights = Some(
             lines.iter().map(|l| text_parser::atof(l, 0).map(|(v, _)| avoid_inf_f32(v as f32))).collect::<Result<_>>()?,
         );
     }
     let lines = text_parser::read_all_lines(&format!("{filename}.position"), 0)?;
     if !lines.is_empty() {
+        crate::log::info(&format!("Loading positions from {filename}.position ..."));
         let mut ids: HashMap<&[u8], i32> = HashMap::new();
         let mut names = Vec::new();
         let dense = lines
@@ -193,6 +212,9 @@ fn load_side_files(filename: &str) -> Result<SideFiles> {
             .collect();
         s.positions = Some((dense, names));
     }
+    if s.weights.is_some() && s.query_boundaries.is_some() {
+        crate::log::info("Calculating query weights...");
+    }
     s.init_score = load_initial_score(filename)?;
     Ok(s)
 }
@@ -203,6 +225,7 @@ fn load_initial_score(filename: &str) -> Result<Option<Vec<f64>>> {
     if lines.is_empty() {
         return Ok(None);
     }
+    crate::log::info("Loading initial scores...");
     let split_tabs = |l: &[u8]| -> Vec<Vec<u8>> {
         l.split(|&c| c == b'\t').filter(|t| !t.is_empty()).map(<[u8]>::to_vec).collect()
     };
@@ -426,13 +449,26 @@ fn boundaries_from_query_ids(q: &[i32]) -> Vec<i32> {
     b
 }
 
+/// upstream: the messages of `Metadata::Init(num_data, weight_idx, query_idx)`.
+fn log_metadata_init(c: &Columns, side: &SideFiles) {
+    if c.weight_idx >= 0 && side.weights.is_some() {
+        crate::log::info("Using weights in data file, ignoring the additional weights file");
+    }
+    if c.group_idx >= 0 && side.query_boundaries.is_some() {
+        crate::log::info("Using query id in data file, ignoring the additional query file");
+    }
+}
+
 /// Replace the metadata with the file's: labels as parsed, weight and query
 /// columns or the side files, positions and initial scores from side files.
 ///
 /// upstream: `Metadata::Init(num_data, weight_idx, query_idx)`, `FinishLoad`
 /// and `CheckOrPartition` (without partitioning).
-fn set_metadata(ds: &mut Dataset, rows: Rows, side: SideFiles) -> Result<()> {
+fn set_metadata(ds: &mut Dataset, filename: &str, rows: Rows, side: SideFiles) -> Result<()> {
     let n = ds.num_data;
+    if rows.queries.is_some() && (rows.weight.is_some() || side.weights.is_some()) {
+        crate::log::info("Calculating query weights...");
+    }
     let md = &mut ds.metadata;
     md.label = rows.label;
     md.weight = rows.weight.or(side.weights);
@@ -478,7 +514,20 @@ fn set_metadata(ds: &mut Dataset, rows: Rows, side: SideFiles) -> Result<()> {
                 .collect(),
         );
     }
+    log_num_queries(ds, filename);
     Ok(())
+}
+
+/// upstream: the end of `Metadata::CheckOrPartition` (`filename` is the
+/// metadata's data file, empty for binary files).
+fn log_num_queries(ds: &Dataset, filename: &str) {
+    let nq = ds.metadata.query_boundaries.as_ref().map_or(0, |b| b.len().saturating_sub(1));
+    if nq > 0 {
+        crate::log::debug(&format!(
+            "Number of queries in {filename}: {nq}. Average number of rows per query: {:.6}.",
+            ds.num_data as f64 / nq as f64
+        ));
+    }
 }
 
 fn csr<'a>(rows: &'a Rows, ncols: usize) -> Result<Matrix<'a>> {
@@ -507,6 +556,7 @@ impl Dataset {
         }
         // upstream: SetHeader (from the DatasetLoader constructor) for a binary file
         categorical_columns(cfg, &HashMap::new())?;
+        crate::log::info(&format!("Load from binary file {}", path.display()));
         let mut ds = Self::load_binary(filename, reference.is_none().then_some(cfg))?;
         if let Some(init) = load_initial_score(&path.to_string_lossy())? {
             if init.len() % ds.num_data != 0 {
@@ -514,6 +564,7 @@ impl Dataset {
             }
             ds.metadata.init_score = Some(init);
         }
+        log_num_queries(&ds, "");
         if reference.is_none() {
             // upstream: CheckDataset (is_load_from_binary)
             for (set, name) in [
@@ -525,7 +576,7 @@ impl Dataset {
                 (cfg.header, "header"),
             ] {
                 if set {
-                    ds.warnings.push(format!(
+                    crate::log::warning(&format!(
                         "Parameter {name} works only in case of loading data directly from text file. \
                          It will be ignored when loading from binary file."
                     ));
@@ -550,21 +601,20 @@ impl Dataset {
             return Err(LgbmError::Unsupported("parser_config_file (custom C++ parsers)".into()));
         }
         let c = set_header(filename, cfg)?;
-        let mut warnings = Vec::new();
-        let parser = Parser::create(filename, cfg.header, 0, c.label_idx, cfg.precise_float_parser, &mut warnings)?;
+        let parser = Parser::create(filename, cfg.header, 0, c.label_idx, cfg.precise_float_parser)?;
         let side = load_side_files(filename)?;
         let skip = c.header_bytes;
 
         let Some(reference) = reference else {
+            c.reopen(filename);
             let Sampled { lines, sample, num_data: n } = read_and_sample(filename, skip, cfg)?;
             if n == 0 {
                 return Err(LgbmError::InvalidData(format!("Data file {filename} is empty")));
             }
             // upstream: CheckSampleSize
             if (sample.len() as f64 / n as f64) < 0.2f32 as f64 && sample.len() < 100_000 {
-                warnings.push(
-                    "Using too small ``bin_construct_sample_cnt`` may encounter unexpected errors and poor accuracy."
-                        .into(),
+                crate::log::warning(
+                    "Using too small ``bin_construct_sample_cnt`` may encounter unexpected errors and poor accuracy.",
                 );
             }
             let mut columns = sample_columns(&sample, &parser)?;
@@ -608,23 +658,49 @@ impl Dataset {
                     "The output cannot be monotone with respect to categorical features".into(),
                 ));
             }
+            let t1 = std::time::Instant::now();
             let found = find_bin_mappers(&columns, sample.len(), n, &is_cat, &skip_col, cfg, NTF_EXPR)?;
-            warnings.extend(found.warnings);
+            let bin_time = t1.elapsed();
             let used: Vec<bool> = found.bin_mappers.iter().map(|m| !m.is_trivial).collect();
-            let rows = extract(filename, skip, lines, &parser, &c, &used)?;
+            // upstream reads the file again only after constructing the bin mappers
+            let (rows, extract_log) = crate::log::defer(|| extract(filename, skip, lines, &parser, &c, &used));
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(e) => {
+                    extract_log.emit();
+                    return Err(e);
+                }
+            };
             let mat = csr(&rows, ntf)?;
             let label = vec![0.0f32; rows.num_rows()];
             let fields = DatasetFields { label: &label, ..Default::default() };
             let mut ds = Self::assemble(&mat, fields, found.bin_mappers, feature_names)?;
             ds.forced_bin_bounds = found.forced_bin_bounds;
-            ds.finish_construct(&columns, sample.len(), cfg, warnings, replaced);
+            ds.finish_construct(&columns, sample.len(), cfg, replaced);
+            crate::log::info(&format!("Construct bin mappers from text data time {:.2} seconds", bin_time.as_secs_f64()));
+            log_metadata_init(&c, &side);
+            if cfg.two_round {
+                crate::log::info("Making second pass...");
+                c.reopen(filename);
+            }
+            extract_log.emit();
             ds.label_idx = c.label_idx;
-            set_metadata(&mut ds, rows, side)?;
+            set_metadata(&mut ds, filename, rows, side)?;
             ds.data_filename = Some(filename.to_string());
             return Ok(ds);
         };
 
-        let lines = if cfg.two_round { None } else { Some(text_parser::read_all_lines(filename, skip)?) };
+        c.reopen(filename);
+        let lines = if cfg.two_round {
+            text_parser::note_unterminated_last_line(filename, skip)?;
+            None
+        } else {
+            Some(text_parser::read_all_lines(filename, skip)?)
+        };
+        log_metadata_init(&c, &side);
+        if cfg.two_round {
+            c.reopen(filename);
+        }
         let used: Vec<bool> = reference.bin_mappers.iter().map(|m: &BinMapper| !m.is_trivial).collect();
         let rows = extract(filename, skip, lines, &parser, &c, &used)?;
         if rows.num_rows() == 0 {
@@ -634,8 +710,7 @@ impl Dataset {
         let label = vec![0.0f32; rows.num_rows()];
         let fields = DatasetFields { label: &label, ..Default::default() };
         let mut ds = Self::from_matrix_with_reference(&mat, fields, reference, cfg.num_threads)?;
-        ds.warnings = warnings;
-        set_metadata(&mut ds, rows, side)?;
+        set_metadata(&mut ds, filename, rows, side)?;
         ds.data_filename = Some(filename.to_string());
         Ok(ds)
     }
@@ -724,11 +799,12 @@ mod tests {
         let f = write(&dir, "d.svm", &s);
         let one = Config::from_pairs([("bin_construct_sample_cnt", "50")]).unwrap();
         let two = Config::from_pairs([("bin_construct_sample_cnt", "50"), ("two_round", "true")]).unwrap();
-        let a = Dataset::load_text(&f, &one, None).unwrap();
+        let (a, log) = crate::log::capture(|| Dataset::load_text(&f, &one, None));
+        let a = a.unwrap();
         let b = Dataset::load_text(&f, &two, None).unwrap();
         assert_eq!(a.num_total_features(), 4);
         assert_eq!((a.num_data(), b.num_data()), (300, 300));
-        assert!(a.warnings().iter().any(|w| w.contains("bin_construct_sample_cnt")));
+        assert!(log.iter().any(|w| w.contains("bin_construct_sample_cnt")));
         let v = Dataset::load_text(&f, &one, Some(&a)).unwrap();
         assert!(v.same_bins_as(&a));
     }

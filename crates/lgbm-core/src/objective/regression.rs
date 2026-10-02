@@ -75,7 +75,6 @@ pub struct Regression {
     weight: Option<Vec<f32>>,
     /// MAPE: `1 / max(1, |label|)` (times the weight, if any).
     label_weight: Vec<f32>,
-    warnings: Vec<String>,
 }
 
 /// Names accepted by [`Regression::new`].
@@ -103,15 +102,15 @@ impl Regression {
                 return Err(LgbmError::InvalidParameter("Check failed: alpha_ > 0 && alpha_ < 1".into()));
             }
         }
-        let mut obj = Self::with_kind(kind, cfg.reg_sqrt && kind.allows_sqrt());
+        let obj = Self::with_kind(kind, cfg.reg_sqrt && kind.allows_sqrt());
         if cfg.reg_sqrt && !kind.allows_sqrt() {
-            obj.warnings.push(format!("Cannot use sqrt transform in {} Regression, will auto disable it", kind.name()));
+            crate::log::warning(&format!("Cannot use sqrt transform in {} Regression, will auto disable it", kind.name()));
         }
         Ok(obj)
     }
 
     pub fn with_kind(kind: RegressionKind, sqrt: bool) -> Self {
-        Self { kind, sqrt, label: Vec::new(), weight: None, label_weight: Vec::new(), warnings: Vec::new() }
+        Self { kind, sqrt, label: Vec::new(), weight: None, label_weight: Vec::new() }
     }
 
     /// Prediction-time objective from a model file `objective=` line; only
@@ -181,10 +180,9 @@ impl RowObjective for Regression {
         }
         if self.kind == RegressionKind::Mape {
             if self.label.iter().any(|l| l.abs() < 1.0) {
-                self.warnings.push(
+                crate::log::warning(
                     "Some label values are < 1 in absolute value. MAPE is unstable with such values, \
-                     so LightGBM rounds them to 1.0 when calculating MAPE."
-                        .into(),
+                     so LightGBM rounds them to 1.0 when calculating MAPE.",
                 );
             }
             self.label_weight = match &self.weight {
@@ -193,10 +191,6 @@ impl RowObjective for Regression {
             };
         }
         Ok(())
-    }
-
-    fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
     }
 
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {

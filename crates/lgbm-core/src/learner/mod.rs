@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::binning::{BinType, MissingType};
 use crate::config::Config;
 use crate::consts::{K_EPSILON, K_MIN_SCORE};
+use crate::fmt::fmt_f;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
 use crate::histogram::{self, HistLayout};
@@ -93,6 +94,8 @@ pub struct SerialTreeLearner {
     block_bufs: Vec<Vec<f64>>,
     slots: HistSlots,
     multi_val: Option<MultiValBin>,
+    /// `Some(is_col_wise)` when `force_col_wise` or `force_row_wise` is set.
+    forced_layout: Option<bool>,
     team: ThreadTeam,
     best_split_per_leaf: Vec<SplitInfo>,
     smaller: LeafSplits,
@@ -171,6 +174,43 @@ fn split_params(cfg: &Config) -> SplitParams {
     }
 }
 
+/// The debug line of upstream `Dataset::GetShareStates` for a forced layout:
+/// `GetMultiBinFromSparseFeatures` (col-wise, only with a multi-value group)
+/// or `GetMultiBinFromAllFeatures` (row-wise). Upstream's automatic choice
+/// times both layouts, so nothing is logged then.
+fn log_share_state(data: &Dataset, forced_layout: Option<bool>) {
+    if !crate::log::enabled(crate::log::LogLevel::Debug) || data.num_features() == 0 {
+        return;
+    }
+    let sparse_rate = |real: usize| data.bin_mapper_by_real(real).sparse_rate;
+    match forced_layout {
+        Some(true) if !data.multi_val_group.is_empty() => {
+            let mut sum = 0.0f64;
+            for &real in &data.multi_val_group {
+                sum += sparse_rate(real);
+            }
+            let rate = sum / data.multi_val_group.len() as f64;
+            crate::log::debug(&format!("Dataset::GetMultiBinFromSparseFeatures: sparse rate {}", fmt_f(rate, 6)));
+        }
+        Some(false) => {
+            let mut order: Vec<usize> = (0..data.num_features()).collect();
+            order.sort_by_key(|&f| data.upstream_inner_index(f));
+            let mut sum_dense_ratio = 0.0f64;
+            for f in order {
+                sum_dense_ratio += 1.0f32 as f64 - sparse_rate(data.real_feature_index(f));
+            }
+            let multi = data.multi_val_group.len();
+            let ncol = if multi > 0 { data.num_feature_groups - 1 + multi } else { data.num_feature_groups };
+            sum_dense_ratio /= ncol as f64;
+            crate::log::debug(&format!(
+                "Dataset::GetMultiBinFromAllFeatures: sparse rate {}",
+                fmt_f(1.0 - sum_dense_ratio, 6)
+            ));
+        }
+        _ => {}
+    }
+}
+
 fn new_cegb(data: &Dataset, cfg: &Config, num_leaves: usize) -> Cegb {
     let upstream_inner = (0..data.num_features()).map(|f| data.upstream_inner_index(f)).collect();
     Cegb::new(cfg, num_leaves, upstream_inner, data.num_data())
@@ -194,7 +234,22 @@ impl SerialTreeLearner {
                 set_feature_config(&mut meta, data.real_feature_index(f), cfg);
                 meta
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // upstream: GetShareStates, HistogramPool::DynamicChangeSize, then SerialTreeLearner::Init
+        let forced_layout = if cfg.force_col_wise {
+            Some(true)
+        } else if cfg.force_row_wise {
+            Some(false)
+        } else {
+            None
+        };
+        log_share_state(&data, forced_layout);
+        crate::log::info(&format!("Total Bins {}", metas.iter().map(|m| m.num_bin as u64).sum::<u64>()));
+        crate::log::info(&format!(
+            "Number of data points in the train set: {}, number of used features: {}",
+            data.num_data(),
+            data.num_features()
+        ));
         let num_leaves = cfg.num_leaves.max(2) as usize;
         let constraints = leaf_constraints(cfg, num_leaves, data.num_features());
         let num_data = data.num_data();
@@ -218,6 +273,7 @@ impl SerialTreeLearner {
             branch_features: vec![Vec::new(); num_leaves],
             slots,
             multi_val,
+            forced_layout,
             team: ThreadTeam::new(resolve_num_threads(cfg.num_threads)),
             hist_built: vec![false; num_leaves],
             subcol_buf: Vec::new(),
@@ -308,6 +364,7 @@ impl SerialTreeLearner {
         self.partition.reset_num_data(num_data);
         self.partition.set_used_data_indices(None);
         self.col_sampler.set_training_data(&data);
+        log_share_state(&data, self.forced_layout);
         self.multi_val = self.multi_val.is_some().then(|| MultiValBin::new(&data, &self.slots));
         self.view_num_data = num_data;
         self.bag_local = None;
@@ -446,10 +503,21 @@ impl SerialTreeLearner {
                 self.find_best_splits(&tree, grad, hess, left_leaf, right_leaf, None)?;
             }
             let best_leaf = self.best_leaf();
-            if !(self.best_split_per_leaf[best_leaf].gain > 0.0) {
+            let gain = self.best_split_per_leaf[best_leaf].gain;
+            if !(gain > 0.0) {
+                if gain <= 0.0 {
+                    crate::log::warning(&format!("No further splits with positive gain, best gain: {}", fmt_f(gain, 6)));
+                }
                 break;
             }
             (left_leaf, right_leaf) = self.split(&mut tree, best_leaf)?;
+        }
+        if crate::log::enabled(crate::log::LogLevel::Debug) {
+            crate::log::debug(&format!(
+                "Trained a tree with leaves = {} and depth = {}",
+                tree.num_leaves,
+                tree.max_depth().max(1)
+            ));
         }
         Ok(tree)
     }

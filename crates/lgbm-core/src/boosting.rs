@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
+use crate::fmt::fmt_f;
 use crate::learner::{Cegb, SerialTreeLearner, load_forced_splits, reload_forced_splits};
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
@@ -112,7 +113,6 @@ pub struct Gbdt {
     pub(crate) is_rf: bool,
     train: Option<TrainState>,
     pool: Option<Arc<rayon::ThreadPool>>,
-    warnings: Vec<String>,
 }
 
 /// upstream: the bagging `CHECK` of `RF::Init` and `RF::ResetConfig`.
@@ -149,6 +149,15 @@ fn check_feature_sizes(config: &Config, num_total_features: usize) -> Result<()>
     Ok(())
 }
 
+/// upstream: the objective part of c_api.cpp `CreateObjectiveAndMetrics`.
+fn create_logged_objective(config: &Config) -> Result<Option<Objective>> {
+    let objective = create_objective(config)?;
+    if objective.is_none() {
+        crate::log::info("Using self-defined objective function");
+    }
+    Ok(objective)
+}
+
 fn build_pool(num_threads: i32) -> Result<Option<Arc<rayon::ThreadPool>>> {
     if num_threads <= 0 {
         return Ok(None);
@@ -180,14 +189,7 @@ impl Gbdt {
             is_rf: false,
             train: None,
             pool: None,
-            warnings: Vec::new(),
         }
-    }
-
-    /// Drain the upstream warnings raised while creating the booster
-    /// (objective construction and initialization).
-    pub fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
     }
 
     /// Create a booster for training. `objective` overrides the built-in one
@@ -201,13 +203,11 @@ impl Gbdt {
         }
         let mut objective = match objective {
             Some(o) => Some(o),
-            None => create_objective(&config)?,
+            None => create_logged_objective(&config)?,
         };
         let n = train.num_data();
-        let mut warnings = Vec::new();
         if let Some(o) = objective.as_mut() {
             o.init(&train.metadata, n)?;
-            warnings = o.take_warnings();
         }
         let is_rf = config.boosting == "rf";
         // upstream: RF::Init, before GBDT::Init
@@ -254,13 +254,14 @@ impl Gbdt {
         // metric (and so runs its checks) whether or not it is reported
         let metrics = Self::make_metrics(&config, &train)?;
         let pool = build_pool(config.num_threads)?;
-        let sampler =
-            SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
         // upstream: SerialTreeLearner::Init -> CostEfficientGradientBoosting::Init
         Cegb::check(&config, train.num_total_features())?;
         let mut learner = SerialTreeLearner::new(train.clone(), &config);
         // upstream: GBDT::Init loads the forced splits, then CheckForcedSplitFeatures
         learner.set_forced_split(load_forced_splits(&config.forcedsplits_filename, train.num_total_features() as i32 - 1)?);
+        // upstream: GBDT::Init ends with ResetSampleConfig
+        let sampler =
+            SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
         if is_rf {
             // upstream: RF::Init after GBDT::Init
             if has_init_score {
@@ -306,7 +307,6 @@ impl Gbdt {
             config: Some(config),
             loaded_parameters: None,
             pool,
-            warnings,
         };
         if is_rf {
             g.rf_boosting();
@@ -330,7 +330,7 @@ impl Gbdt {
         let view = ScoreView { scores: &tmp, num_data: n, num_outputs: ntpi };
         let mut compute = || obj.gradients(view, &mut st.grad, &mut st.hess);
         match &self.pool {
-            Some(p) => p.install(compute),
+            Some(p) => crate::log::install(p, compute),
             None => compute(),
         }
         st.rf_init_scores = Some(init);
@@ -347,7 +347,7 @@ impl Gbdt {
 
     pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
         match &self.pool {
-            Some(p) => p.install(f),
+            Some(p) => crate::log::install(p, f),
             None => f(),
         }
     }
@@ -474,8 +474,14 @@ impl Gbdt {
                                 add_const(&mut v.scores, k, n, init);
                             }
                         }
+                        crate::log::info(&format!("Start training from score {}", fmt_f(init, 6)));
                         return init;
                     }
+                } else if matches!(obj.name(), "regression_l1" | "quantile" | "mape") {
+                    crate::log::warning(&format!(
+                        "Disabling boost_from_average in {} may cause the slow convergence",
+                        obj.name()
+                    ));
                 }
             }
         }
@@ -550,7 +556,7 @@ impl Gbdt {
             }
         };
         match pool {
-            Some(p) => p.install(drop),
+            Some(p) => crate::log::install(p, drop),
             None => drop(),
         }
         let num_drop = d.drop_index.len() as f64;
@@ -598,18 +604,18 @@ impl Gbdt {
             }
         };
         match pool {
-            Some(p) => p.install(normalize),
+            Some(p) => crate::log::install(p, normalize),
             None => normalize(),
         }
     }
 
-    /// Change parameters during training. Returns upstream's warnings.
+    /// Change parameters during training.
     ///
     /// upstream: `Booster::ResetConfig` (c_api.cpp): the parameters are
     /// checked on a fresh config, merged into the current one, a given
     /// `objective` is re-created (`GBDT::ResetTrainingData` on the same
     /// data), then `GBDT::ResetConfig` (with the `RF` and `DART` variants).
-    pub fn reset_parameter<I, K, V>(&mut self, pairs: I) -> Result<Vec<String>>
+    pub fn reset_parameter<I, K, V>(&mut self, pairs: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -635,27 +641,22 @@ impl Gbdt {
         }
         crate::config::dataset_update_param_checking(old, &new_config)?;
         let mut cfg = old.clone();
-        cfg.warnings.clear();
         cfg.set_map(&param)?;
-        let mut warnings = new_config.warnings;
-        warnings.append(&mut cfg.warnings);
         if cfg.num_threads != old.num_threads {
             self.pool = build_pool(cfg.num_threads)?;
             self.train.as_mut().unwrap().sampler.set_num_threads(resolve_num_threads(cfg.num_threads));
         }
         if param.contains_key("objective") {
-            let mut objective = create_objective(&cfg)?;
+            let mut objective = create_logged_objective(&cfg)?;
             if let Some(o) = objective.as_mut() {
                 o.init(&data.metadata, data.num_data())?;
-                warnings.extend(o.take_warnings());
             }
             self.set_training_objective(objective)?;
             if self.is_rf {
                 self.rf_reset_training_data()?;
             }
         }
-        self.reset_config(cfg)?;
-        Ok(warnings)
+        self.reset_config(cfg)
     }
 
     /// The objective part of upstream `GBDT::ResetTrainingData`.
@@ -758,12 +759,12 @@ impl Gbdt {
     /// -> `GBDT::ResetTrainingData` (and `RF::ResetTrainingData`): the
     /// training scores are rebuilt from the init score and this session's
     /// trees (not those of a merged init model).
-    pub fn reset_training_data(&mut self, data: Arc<Dataset>) -> Result<Vec<String>> {
+    pub fn reset_training_data(&mut self, data: Arc<Dataset>) -> Result<()> {
         let (Some(cfg), Some(st)) = (self.config.as_ref(), self.train.as_ref()) else {
             return Err(LgbmError::Unsupported("updating the training data of a booster that is not training".into()));
         };
         if Arc::ptr_eq(&data, &st.data) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if !data.same_bins_as(&st.data) {
             return Err(LgbmError::InvalidParameter(
@@ -772,11 +773,9 @@ impl Gbdt {
         }
         let n = data.num_data();
         let ntpi = self.num_tree_per_iteration;
-        let mut warnings = Vec::new();
-        let mut objective = create_objective(cfg)?;
+        let mut objective = create_logged_objective(cfg)?;
         if let Some(o) = objective.as_mut() {
             o.init(&data.metadata, n)?;
-            warnings.extend(o.take_warnings());
         }
         let metrics = Self::make_metrics(cfg, &data)?;
         let mut scores = vec![0.0; n * ntpi];
@@ -817,7 +816,7 @@ impl Gbdt {
         if self.is_rf {
             self.rf_reset_training_data()?;
         }
-        Ok(warnings)
+        Ok(())
     }
 
     /// One random-forest iteration: a tree on the fixed gradients, then the
@@ -846,7 +845,7 @@ impl Gbdt {
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 match &self.pool {
-                    Some(p) => p.install(|| learner.train(g, h))?,
+                    Some(p) => crate::log::install(p, || learner.train(g, h))?,
                     None => learner.train(g, h)?,
                 }
             } else {
@@ -869,7 +868,7 @@ impl Gbdt {
                             .collect()
                     };
                     let outputs = match &self.pool {
-                        Some(p) => p.install(renew),
+                        Some(p) => crate::log::install(p, renew),
                         None => renew(),
                     };
                     for (leaf, v) in outputs.into_iter().enumerate() {
@@ -975,7 +974,7 @@ impl Gbdt {
                     None => obj.gradients(view, &mut st.grad, &mut st.hess),
                 };
                 match pool {
-                    Some(p) => p.install(compute),
+                    Some(p) => crate::log::install(&p, compute),
                     None => compute(),
                 }
             }
@@ -1028,7 +1027,7 @@ impl Gbdt {
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 let tree = match &self.pool {
-                    Some(p) => p.install(|| learner.train(g, h))?,
+                    Some(p) => crate::log::install(p, || learner.train(g, h))?,
                     None => learner.train(g, h)?,
                 };
                 if st.sampler.by_query_subset() {
@@ -1060,7 +1059,7 @@ impl Gbdt {
                             .collect()
                     };
                     let outputs = match &self.pool {
-                        Some(p) => p.install(renew),
+                        Some(p) => crate::log::install(p, renew),
                         None => renew(),
                     };
                     for (leaf, v) in outputs.into_iter().enumerate() {
@@ -1094,6 +1093,7 @@ impl Gbdt {
         }
 
         if !should_continue {
+            crate::log::warning("Stopped training because there are no more leaves that meet the split requirements");
             if self.models.len() > ntpi {
                 for _ in 0..ntpi {
                     self.models.pop();
@@ -1155,7 +1155,7 @@ impl Gbdt {
                 let view = ScoreView { scores, num_data: n, num_outputs: ntpi };
                 let mut compute = || obj.gradients(view, &mut st.grad, &mut st.hess);
                 match &self.pool {
-                    Some(p) => p.install(compute),
+                    Some(p) => crate::log::install(p, compute),
                     None => compute(),
                 }
             }
@@ -1368,7 +1368,7 @@ fn update_score(st: &mut TrainState, pool: &Option<Arc<rayon::ThreadPool>>, tree
         }
     };
     match pool {
-        Some(p) => p.install(update),
+        Some(p) => crate::log::install(p, update),
         None => update(),
     }
 }

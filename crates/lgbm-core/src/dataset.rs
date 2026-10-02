@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use crate::binning::{BinMapper, BinParams, BinType};
 use crate::config::Config;
 use crate::error::{LgbmError, Result};
-use crate::feature_groups::{SampleColumn, upstream_inner_order};
+use crate::feature_groups::{GroupLayout, SampleColumn, upstream_inner_order};
 use crate::matrix::Matrix;
 use crate::random::Random;
 
@@ -29,7 +29,7 @@ pub fn with_num_threads<R: Send>(num_threads: i32, f: impl FnOnce() -> R + Send)
         .num_threads(num_threads as usize)
         .build()
         .map_err(|e| LgbmError::Internal(format!("cannot build thread pool: {e}")))?;
-    Ok(pool.install(f))
+    Ok(crate::log::install(&pool, f))
 }
 
 /// Borrowed dense feature values.
@@ -243,8 +243,8 @@ impl Metadata {
         Ok(())
     }
 
-    /// upstream: `Metadata::SetPosition`. Returns upstream's warnings.
-    pub fn set_position(&mut self, num_data: usize, positions: Option<&[i32]>) -> Result<Vec<String>> {
+    /// upstream: `Metadata::SetPosition`.
+    pub fn set_position(&mut self, num_data: usize, positions: Option<&[i32]>) -> Result<()> {
         let positions = match positions {
             Some(p) if !p.is_empty() => p,
             _ => {
@@ -252,7 +252,7 @@ impl Metadata {
                 // upstream keeps the ids, which would make the ranking
                 // objectives read a missing position array
                 self.position_ids.clear();
-                return Ok(Vec::new());
+                return Ok(());
             }
         };
         if positions.len() != num_data {
@@ -261,9 +261,8 @@ impl Metadata {
                 positions.len()
             )));
         }
-        let mut warnings = Vec::new();
         if self.positions.is_some() {
-            warnings.push("Overwriting positions in dataset.".to_string());
+            crate::log::warning("Overwriting positions in dataset.");
         }
         let mut ids = std::collections::HashMap::new();
         self.position_ids.clear();
@@ -276,8 +275,9 @@ impl Metadata {
             });
             dense.push(id);
         }
+        crate::log::debug(&format!("number of unique positions found = {}", self.position_ids.len()));
         self.positions = Some(dense);
-        Ok(warnings)
+        Ok(())
     }
 
     /// upstream: `Metadata::CalculateQueryWeights`.
@@ -357,6 +357,9 @@ pub struct Dataset {
     /// upstream `num_feature_groups()`: one group per feature for datasets
     /// built from a reference (`CreateValid`).
     pub(crate) num_feature_groups: usize,
+    /// Real column indices of upstream's multi-value feature group, in group
+    /// order (empty without one).
+    pub(crate) multi_val_group: Vec<usize>,
     pub(crate) real_to_inner: Vec<Option<usize>>,
     pub(crate) bins: Vec<BinColumn>,
     pub metadata: Metadata,
@@ -370,7 +373,6 @@ pub struct Dataset {
     pub(crate) data_filename: Option<String>,
     /// upstream `label_idx_`: the label's column in the text file (0 otherwise).
     pub(crate) label_idx: i32,
-    pub(crate) warnings: Vec<String>,
 }
 
 /// Optional per-row fields supplied with the features.
@@ -447,7 +449,7 @@ impl Dataset {
         };
         let mut ds = Self::assemble(mat, fields, found.bin_mappers, feature_names)?;
         ds.forced_bin_bounds = found.forced_bin_bounds;
-        ds.finish_construct(&columns, total_sample_size, cfg, found.warnings, replaced);
+        ds.finish_construct(&columns, total_sample_size, cfg, replaced);
         Ok(ds)
     }
 
@@ -459,14 +461,12 @@ impl Dataset {
         columns: &[SampleColumn],
         total_sample_size: usize,
         cfg: &Config,
-        warnings: Vec<String>,
         names_replaced: bool,
     ) {
-        self.warnings = warnings;
         self.bin_config = BinConstructConfig::from_config(cfg);
         self.max_bin_by_feature = cfg.max_bin_by_feature.clone();
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
-        (self.upstream_inner, self.num_feature_groups) = upstream_inner_order(
+        let GroupLayout { inner, num_groups, multi_val_features } = upstream_inner_order(
             &self.bin_mappers,
             &self.used_features,
             columns,
@@ -475,22 +475,19 @@ impl Dataset {
             explicit_bool("enable_bundle").unwrap_or(true),
             explicit_bool("is_enable_sparse").unwrap_or(true),
         );
+        self.upstream_inner = inner;
+        self.num_feature_groups = num_groups;
+        self.multi_val_group = multi_val_features;
         if names_replaced {
-            self.warnings.push(FEATURE_NAME_SPACE_WARNING.into());
+            crate::log::warning(FEATURE_NAME_SPACE_WARNING);
         }
         if self.used_features.is_empty() {
-            self.warnings.push(
+            crate::log::warning(
                 "There are no meaningful features which satisfy the provided configuration. \
                  Decreasing Dataset parameters min_data_in_bin or min_data_in_leaf and re-constructing \
-                 Dataset might resolve this warning."
-                    .into(),
+                 Dataset might resolve this warning.",
             );
         }
-    }
-
-    /// Non-fatal diagnostics from construction (upstream `Log::Warning`).
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
     }
 
     /// Construct a validation dataset that reuses `reference`'s bin mappers.
@@ -574,6 +571,7 @@ impl Dataset {
             used_features: self.used_features.clone(),
             upstream_inner: self.upstream_inner.clone(),
             num_feature_groups: self.num_feature_groups,
+            multi_val_group: self.multi_val_group.clone(),
             real_to_inner: self.real_to_inner.clone(),
             bins,
             metadata: Metadata {
@@ -592,7 +590,6 @@ impl Dataset {
             forced_bin_bounds: self.forced_bin_bounds.clone(),
             data_filename: None,
             label_idx: self.label_idx,
-            warnings: Vec::new(),
         })
     }
 
@@ -659,6 +656,7 @@ impl Dataset {
             bin_mappers,
             upstream_inner: (0..used_features.len()).collect(),
             num_feature_groups: used_features.len(),
+            multi_val_group: Vec::new(),
             used_features,
             real_to_inner,
             bins,
@@ -668,7 +666,6 @@ impl Dataset {
             max_bin_by_feature: Vec::new(),
             data_filename: None,
             label_idx: 0,
-            warnings: Vec::new(),
         })
     }
 
@@ -788,7 +785,7 @@ impl Dataset {
 }
 
 /// One bin mapper per column from the sampled values; `skip` columns get a
-/// trivial mapper (upstream leaves them null). Returns upstream's warnings.
+/// trivial mapper (upstream leaves them null).
 ///
 /// upstream: dataset_loader.cpp `ConstructFromSampleData` /
 /// `ConstructBinMappersFromTextData` and `CheckCategoricalFeatureNumBin`.
@@ -802,8 +799,7 @@ pub(crate) fn find_bin_mappers(
     num_total_features_expr: &str,
 ) -> Result<FoundBins> {
     check_max_bin_by_feature(cfg, columns.len(), num_total_features_expr)?;
-    let mut warnings = Vec::new();
-    let forced_bin_bounds = get_forced_bins(&cfg.forcedbins_filename, columns.len(), is_categorical, &mut warnings)?;
+    let forced_bin_bounds = get_forced_bins(&cfg.forcedbins_filename, columns.len(), is_categorical)?;
     let filter_cnt = (cfg.min_data_in_leaf as f64 * total_sample_size as f64 / num_data as f64) as i32;
     let max_bin_of = |c: usize| if cfg.max_bin_by_feature.is_empty() { cfg.max_bin } else { cfg.max_bin_by_feature[c] };
     let found: Vec<(BinMapper, Vec<String>)> = columns
@@ -829,7 +825,7 @@ pub(crate) fn find_bin_mappers(
         .collect::<Result<_>>()?;
     let mut bin_mappers = Vec::with_capacity(found.len());
     for (m, w) in found {
-        warnings.extend(w);
+        crate::log::warnings(w);
         bin_mappers.push(m);
     }
     if bin_mappers
@@ -837,19 +833,17 @@ pub(crate) fn find_bin_mappers(
         .enumerate()
         .any(|(c, m)| m.bin_type == BinType::Categorical && m.num_bin > max_bin_of(c))
     {
-        warnings.push("Categorical features with more bins than the configured maximum bin number found.".into());
-        warnings.push(
-            "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories."
-                .into(),
+        crate::log::warning("Categorical features with more bins than the configured maximum bin number found.");
+        crate::log::warning(
+            "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories.",
         );
     }
-    Ok(FoundBins { bin_mappers, warnings, forced_bin_bounds })
+    Ok(FoundBins { bin_mappers, forced_bin_bounds })
 }
 
 /// Output of [`find_bin_mappers`].
 pub(crate) struct FoundBins {
     pub bin_mappers: Vec<BinMapper>,
-    pub warnings: Vec<String>,
     pub forced_bin_bounds: Vec<Vec<f64>>,
 }
 
@@ -881,14 +875,13 @@ pub(crate) fn get_forced_bins(
     path: &str,
     num_total_features: usize,
     is_categorical: &[bool],
-    warnings: &mut Vec<String>,
 ) -> Result<Vec<Vec<f64>>> {
     let mut forced_bins = vec![Vec::new(); num_total_features];
     if path.is_empty() {
         return Ok(forced_bins);
     }
     let Ok(text) = std::fs::read_to_string(path) else {
-        warnings.push(format!("Could not open {path}. Will ignore."));
+        crate::log::warning(&format!("Could not open {path}. Will ignore."));
         return Ok(forced_bins);
     };
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
@@ -906,7 +899,7 @@ pub(crate) fn get_forced_bins(
         }
         let f = feature_num as usize;
         if is_categorical.get(f).copied().unwrap_or(false) {
-            warnings.push(format!("Feature {feature_num} is categorical. Will ignore forced bins for this feature."));
+            crate::log::warning(&format!("Feature {feature_num} is categorical. Will ignore forced bins for this feature."));
         } else if let Some(serde_json::Value::Array(bounds)) = item.get("bin_upper_bound") {
             forced_bins[f].extend(bounds.iter().map(|b| b.as_f64().unwrap_or(0.0)));
         }

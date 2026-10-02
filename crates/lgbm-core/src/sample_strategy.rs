@@ -146,6 +146,7 @@ impl SampleStrategy {
             if cfg.bagging_freq > 0 && cfg.bagging_fraction != 1.0 {
                 return Err(LgbmError::InvalidParameter("Cannot use bagging in GOSS".into()));
             }
+            crate::log::info("Using GOSS");
             self.kind = Kind::Goss { top_rate: cfg.top_rate, other_rate: cfg.other_rate, learning_rate: cfg.learning_rate };
             self.indices.resize(n, 0);
             self.rands = reseed(cfg.bagging_seed);
@@ -198,6 +199,9 @@ impl SampleStrategy {
         // average_bag_rate <= 0.5 and num_feature_groups < 100
         let average_bag_rate = (self.bag_cnt as f64 / n as f64) / freq as f64;
         self.use_subset = average_bag_rate <= 0.5 && data.num_feature_groups() < 100;
+        if self.use_subset {
+            crate::log::debug("Use subset for bagging");
+        }
         self.by_query = cfg.bagging_by_query.then(|| ByQuery {
             // upstream has zero queries without query data: every bag is
             // empty and no tree can split
@@ -284,6 +288,7 @@ impl SampleStrategy {
                 self.note_bag();
                 if self.by_query.is_some() {
                     self.bag_queries(fraction);
+                    crate::log::debug(&format!("Re-bagging, using {} data to train", self.bag_cnt));
                     return Ok(true);
                 }
                 // Chunks of upstream's ParallelPartitionRunner are multiples of
@@ -311,6 +316,7 @@ impl SampleStrategy {
                     }
                 }
                 self.bag_cnt = left;
+                crate::log::debug(&format!("Re-bagging, using {left} data to train"));
                 Ok(true)
             }
             Kind::Goss { top_rate, other_rate, learning_rate } => {

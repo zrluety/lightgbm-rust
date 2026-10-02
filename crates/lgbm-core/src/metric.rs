@@ -201,6 +201,7 @@ fn yent_loss(p: f64) -> f64 {
 fn xent_init(kind: MetricKind, meta: &Metadata) -> Result<(f64, f64)> {
     let name = kind.name();
     crate::objective::xentropy::check_unit_interval(&meta.label, name)?;
+    crate::log::info(&format!("[{name}:Init]: (metric) labels passed interval [0, 1] check"));
     let n = meta.label.len();
     let sum_weights = match &meta.weight {
         None => n as f64,
@@ -222,6 +223,9 @@ fn xent_init(kind: MetricKind, meta: &Metadata) -> Result<(f64, f64)> {
         let (a, b) = if kind == MetricKind::CrossEntropy { ("Init", name) } else { (name, "Init") };
         return Err(LgbmError::InvalidData(format!("[{a}:{b}]: sum-of-weights = {sum_weights:.6} is non-positive")));
     }
+    if kind != MetricKind::CrossEntropyLambda {
+        crate::log::info(&format!("[{name}:Init]: sum-of-weights = {}", crate::fmt::fmt_f(sum_weights, 6)));
+    }
     let mut label_entropy = 0.0f64;
     if kind == MetricKind::KullbackLeibler {
         match &meta.weight {
@@ -229,6 +233,7 @@ fn xent_init(kind: MetricKind, meta: &Metadata) -> Result<(f64, f64)> {
             Some(w) => meta.label.iter().zip(w).for_each(|(&l, &w)| label_entropy += yent_loss(l as f64) * w as f64),
         }
         label_entropy /= sum_weights;
+        crate::log::info(&format!("{name} offset term = {}", crate::fmt::fmt_f(label_entropy, 6)));
     }
     Ok((sum_weights, label_entropy))
 }
@@ -458,6 +463,9 @@ impl Metric {
             )
         })?;
         let nq = boundaries.len() - 1;
+        if kind == MetricKind::Map {
+            crate::log::info(&format!("Total groups: {nq}, total data: {}", meta.label.len()));
+        }
         let query_weights = meta.query_weights.clone();
         let sum_query_weights = match &query_weights {
             None => nq as f64,

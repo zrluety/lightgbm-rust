@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 from collections import OrderedDict
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
@@ -49,6 +50,19 @@ _MULTICLASS_OBJECTIVES = {"multiclass", "multiclassova", "multiclass_ova", "ova"
 
 def _unsupported(what: str) -> LightGBMError:
     return LightGBMError(f"{_NOT_SUPPORTED}: {what}")
+
+
+ZERO_THRESHOLD = 1e-35
+
+
+def _is_zero(x: float) -> bool:
+    return -ZERO_THRESHOLD <= x <= ZERO_THRESHOLD
+
+
+class _MissingType(Enum):
+    NONE = "None"
+    NAN = "NaN"
+    ZERO = "Zero"
 
 
 # --------------------------------------------------------------------------- logging
@@ -95,25 +109,9 @@ def _log_native(msg: str) -> None:
     getattr(_LOGGER, _INFO_METHOD_NAME)(msg)
 
 
-# upstream: the C++ log level is process-global and only changes when a
-# parameter string contains `verbosity` (preferred) or `verbose`
-# (Config::SetVerbosity). 1 = Info is the initial level.
-_ENGINE_LOG_LEVEL = 1
-
-
-def _emit_engine_warnings(warnings: List[str], params: Optional[Dict[str, Any]]) -> None:
-    global _ENGINE_LOG_LEVEL
-    params = params or {}
-    for key in ("verbosity", "verbose"):
-        if key in params:
-            try:
-                _ENGINE_LOG_LEVEL = int(params[key])
-            except (TypeError, ValueError):
-                pass
-            break
-    if _ENGINE_LOG_LEVEL >= 0:
-        for w in warnings:
-            _log_native(f"[LightGBM] [Warning] {w}")
+# upstream: the package registers its log callback on import (on the
+# importing thread, like the engine's per-thread callback).
+_rs.register_log_callback(_log_native)
 
 
 class _TempFile:
@@ -255,7 +253,7 @@ def _parse_loaded_params(text: Optional[str]) -> Dict[str, Any]:
         t = _loaded_param_type(key)
         if t is None:
             # a C++ Log::Warning upstream
-            _emit_engine_warnings([f"Ignoring unrecognized parameter '{key}' found in model string."], None)
+            _rs.log_warning(f"Ignoring unrecognized parameter '{key}' found in model string.")
             continue
         try:
             if t == "string":
@@ -841,7 +839,6 @@ class Dataset:
             feature_names=names if ref_rs is None else None,
             reference=ref_rs,
         )
-        _emit_engine_warnings(self._rs.config_warnings(), params)
         # upstream: _lazy_init re-reads the fields, which the engine may have modified
         self.label = self.get_field("label")
         self.weight = self.get_field("weight")
@@ -889,7 +886,6 @@ class Dataset:
                 params["categorical_column"] = sorted(categorical_indices)
         ref_rs = self.reference.construct()._rs if self.reference is not None else None
         self._rs = _rs.RsDataset.load_file(str(data), _param_dict_to_pairs(params), ref_rs)
-        _emit_engine_warnings(self._rs.config_warnings(), params)
         if self.label is not None:
             self.set_label(self.label)
         if self.get_label() is None:
@@ -935,7 +931,6 @@ class Dataset:
         full = self.reference.construct()._rs
         assert full is not None
         self._rs = full.subset(np.ascontiguousarray(used_indices), _param_dict_to_pairs(self.params))
-        _emit_engine_warnings(self._rs.config_warnings(), self.params)
         if not self.free_raw_data:
             self.get_data()
         if self.group is not None:
@@ -1094,7 +1089,7 @@ class Dataset:
             values = None if data is None else _field_1d_to_numpy(data, np.int32, field_name)
         else:
             raise LightGBMError(f"Unknown field name: {field_name}")
-        _emit_engine_warnings(self._rs.set_field(field_name, values), None)
+        self._rs.set_field(field_name, values)
         self.version += 1
         return self
 
@@ -1170,7 +1165,7 @@ class Dataset:
                 raise ValueError(
                     f"Length of feature_name({len(feature_name)}) and num_feature({self.num_feature()}) don't match"
                 )
-            _emit_engine_warnings(self._rs.set_feature_names(list(feature_name)), None)
+            self._rs.set_feature_names(list(feature_name))
         return self
 
     def set_categorical_feature(self, categorical_feature: Any) -> "Dataset":
@@ -1312,7 +1307,7 @@ class Dataset:
 
     def save_binary(self, filename: Union[str, Path]) -> "Dataset":
         """Save to lightgbm-rust's binary format (not readable by upstream LightGBM, and vice versa)."""
-        _emit_engine_warnings(self.construct()._rs.save_binary(str(filename)), None)
+        self.construct()._rs.save_binary(str(filename))
         return self
 
     def add_features_from(self, other: "Dataset") -> "Dataset":
@@ -1408,16 +1403,12 @@ class Booster:
             self.train_set_version = train_set.version
             pairs = _param_dict_to_pairs(params)
             self._rs = _rs.RsBooster.for_training(train_set._rs, pairs)
-            _emit_engine_warnings(self._rs.config_warnings(), params)
             self.__num_dataset = 1
             self.__init_predictor = train_set._predictor
             if self.__init_predictor is not None:
                 assert self.__init_predictor._booster._rs is not None
                 self._rs.merge_from(self.__init_predictor._booster._rs)
             self.pandas_categorical = train_set.pandas_categorical
-            objective = _choose_param_value("objective", params, None)["objective"]
-            if objective is not None and str(objective).lower() in ("none", "null", "custom", "na"):
-                self.__set_objective_to_none = True
             self.params = params
         elif model_file is not None:
             with open(model_file, "r", encoding="utf-8") as f:
@@ -1500,7 +1491,7 @@ class Booster:
         pairs = _param_dict_to_pairs(params)
         if pairs:
             assert self._rs is not None
-            _emit_engine_warnings(self._rs.reset_parameter(pairs), params)
+            self._rs.reset_parameter(pairs)
         self.params.update(params)
         return self
 
@@ -1523,7 +1514,7 @@ class Booster:
                 raise _unsupported("changing fields of the training Dataset during training")
             self.train_set = train_set
             assert self._rs is not None
-            _emit_engine_warnings(self._rs.reset_training_data(self.train_set.construct()._rs), None)
+            self._rs.reset_training_data(self.train_set.construct()._rs)
             self.train_set_version = self.train_set.version
         assert self._rs is not None
         if fobj is None:
@@ -1607,7 +1598,8 @@ class Booster:
         for _, metric, value, _higher in builtin:
             # upstream's Python wrapper decides by name, so r2 counts as lower-is-better there
             higher = metric.startswith(("auc", "ndcg@", "map@", "average_precision"))
-            ret.append(EvalResult(data_name, metric, value, higher))
+            # upstream reads the values out of a float64 array
+            ret.append(EvalResult(data_name, metric, np.float64(value), higher))
         if feval is not None:
             fevals = feval if isinstance(feval, list) else [feval]
             cur_data = self.train_set if data_idx == 0 else self.valid_sets[data_idx - 1]
@@ -1666,7 +1658,7 @@ class Booster:
             raise TypeError("Cannot use Dataset instance for prediction, please use raw data instead")
         pred_params = _param_dict_to_pairs(kwargs)
         if kwargs:
-            _emit_engine_warnings(_rs.validate_params(pred_params), kwargs)
+            _rs.validate_params(pred_params)
         if num_iteration is None:
             num_iteration = self.best_iteration if start_iteration <= 0 else -1
         if num_iteration is None or num_iteration <= 0:
@@ -1689,12 +1681,9 @@ class Booster:
             # upstream: LGBM_BoosterPredictForFile into a temporary file, read back with np.loadtxt
             with tempfile.TemporaryDirectory() as tmp:
                 result = os.path.join(tmp, "predictions.txt")
-                _emit_engine_warnings(
-                    self._rs.predict_file(
-                        str(data), result, bool(data_has_header), kind, int(start_iteration), int(num_iteration),
-                        pred_params,
-                    ),
-                    kwargs,
+                self._rs.predict_file(
+                    str(data), result, bool(data_has_header), kind, int(start_iteration), int(num_iteration),
+                    pred_params,
                 )
                 preds = np.loadtxt(result, dtype=np.float64)
             nrow = preds.shape[0]
@@ -1743,8 +1732,6 @@ class Booster:
     ) -> str:
         if num_iteration is None:
             num_iteration = self.best_iteration
-        if importance_type not in _IMPORTANCE:
-            raise ValueError(f"Unknown importance type: {importance_type}")
         assert self._rs is not None
         ret = self._rs.model_to_string(int(start_iteration), int(num_iteration), _IMPORTANCE[importance_type])
         return ret + _dump_pandas_categorical(self.pandas_categorical)
@@ -1995,13 +1982,86 @@ class Booster:
     def feature_importance(self, importance_type: str = "split", iteration: Optional[int] = None) -> np.ndarray:
         if iteration is None:
             iteration = self.best_iteration
-        if importance_type not in _IMPORTANCE:
-            raise ValueError(f"Unknown importance type: {importance_type}")
         assert self._rs is not None
         result = self._rs.feature_importance(int(iteration), _IMPORTANCE[importance_type])
         if importance_type == "split":
             return result.astype(np.int32)
         return result
+
+    def get_split_value_histogram(
+        self,
+        feature: Union[int, str],
+        bins: Optional[Union[int, str]] = None,
+        xgboost_style: bool = False,
+    ) -> Any:
+        """Get split value histogram for the specified feature (upstream ``Booster.get_split_value_histogram``).
+
+        Parameters
+        ----------
+        feature : int or str
+            The feature name or index the histogram is calculated for.
+            If int, interpreted as index.
+            If str, interpreted as name.
+
+            .. warning::
+
+                Categorical features are not supported.
+
+        bins : int, str or None, optional (default=None)
+            The maximum number of bins.
+            If None, or int and > number of unique split values and ``xgboost_style=True``,
+            the number of bins equals number of unique split values.
+            If str, it should be one from the list of the supported values by ``numpy.histogram()`` function.
+        xgboost_style : bool, optional (default=False)
+            Whether the returned result should be in the same form as it is in XGBoost.
+            If False, the returned value is tuple of 2 numpy arrays as it is in ``numpy.histogram()`` function.
+            If True, the returned value is matrix, in which the first column is the right edges of non-empty bins
+            and the second one is the histogram values.
+
+        Returns
+        -------
+        result_tuple : tuple of 2 numpy arrays
+            If ``xgboost_style=False``, the values of the histogram of used splitting values for the specified feature
+            and the bin edges.
+        result_array_like : numpy array or pandas DataFrame (if pandas is installed)
+            If ``xgboost_style=True``, the histogram of used splitting values for the specified feature.
+        """
+        from .compat import PANDAS_INSTALLED, pd_DataFrame  # noqa: PLC0415
+
+        def add(root: Dict[str, Any]) -> None:
+            """Recursively add thresholds."""
+            if "split_index" in root:  # non-leaf
+                if feature_names is not None and isinstance(feature, str):
+                    split_feature = feature_names[root["split_feature"]]
+                else:
+                    split_feature = root["split_feature"]
+                if split_feature == feature:
+                    if isinstance(root["threshold"], str):
+                        raise LightGBMError("Cannot compute split value histogram for the categorical feature")
+                    values.append(root["threshold"])
+                add(root["left_child"])
+                add(root["right_child"])
+
+        model = self.dump_model()
+        feature_names = model.get("feature_names")
+        tree_infos = model["tree_info"]
+        values: List[float] = []
+        for tree_info in tree_infos:
+            add(tree_info["tree_structure"])
+
+        if bins is None or isinstance(bins, int) and xgboost_style:
+            n_unique = len(np.unique(values))
+            bins = max(min(n_unique, bins) if bins is not None else n_unique, 1)
+        hist, bin_edges = np.histogram(values, bins=bins)
+        if xgboost_style:
+            ret = np.column_stack((bin_edges[1:], hist))
+            ret = ret[ret[:, 1] > 0]
+            if PANDAS_INSTALLED:
+                return pd_DataFrame(ret, columns=["SplitValue", "Count"])
+            else:
+                return ret
+        else:
+            return hist, bin_edges
 
     def lower_bound(self) -> float:
         """Sum over trees of the smallest leaf value (upstream ``GBDT::GetLowerBoundValue``)."""

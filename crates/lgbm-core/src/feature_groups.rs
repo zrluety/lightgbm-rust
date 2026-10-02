@@ -61,14 +61,15 @@ fn mark_used(mark: &mut [bool], indices: &[i32]) {
     }
 }
 
-/// upstream: `FindGroups` (CPU: `is_use_gpu = false`).
+/// upstream: `FindGroups` (CPU: `is_use_gpu = false`): the groups and
+/// whether each is a multi-value group.
 fn find_groups(
     find_order: &[usize],
     sample_indices: &[&[i32]],
     total_sample_cnt: i64,
     num_data: i32,
     is_sparse: bool,
-) -> Vec<Vec<usize>> {
+) -> (Vec<Vec<usize>>, Vec<bool>) {
     const MAX_SEARCH_GROUP: i32 = 100;
     let single_val_max_conflict_cnt = total_sample_cnt / 10000;
     let mut rand = Random::new(num_data);
@@ -116,10 +117,11 @@ fn find_groups(
         }
     }
     if !is_sparse {
-        return groups;
+        let n = groups.len();
+        return (groups, vec![false; n]);
     }
-    // Second round: sparse groups are merged into one trailing group. Its
-    // multi-value flag does not affect the feature order, so it is not tracked.
+    // Second round: sparse groups are merged into one trailing group, which is
+    // a multi-value group once its features conflict too often.
     const DENSE_THRESHOLD: f64 = 0.4;
     let mut kept = Vec::new();
     let mut second_round = Vec::new();
@@ -130,15 +132,41 @@ fn find_groups(
             second_round.extend(feats);
         }
     }
+    let mut multi_val = vec![false; kept.len()];
     if !second_round.is_empty() {
+        let mut mark = vec![false; total_sample_cnt as usize];
+        let mut is_multi_val = false;
+        let mut conflict_cnt = 0i64;
+        for &fidx in &second_round {
+            if !is_multi_val {
+                let rest_max_cnt = single_val_max_conflict_cnt - conflict_cnt;
+                let cnt = conflict_count(&mark, sample_indices[fidx], rest_max_cnt);
+                conflict_cnt += cnt;
+                if cnt < 0 || conflict_cnt > single_val_max_conflict_cnt {
+                    is_multi_val = true;
+                    continue;
+                }
+                mark_used(&mut mark, sample_indices[fidx]);
+            }
+        }
         kept.push(second_round);
+        multi_val.push(is_multi_val);
     }
-    kept
+    (kept, multi_val)
 }
 
-/// Upstream inner index of every used feature, indexed like `used_features`
-/// (real column indices, ascending), and upstream's `num_feature_groups`.
-/// `columns` holds every column's sampled non-zero entries.
+/// Upstream's feature groups as far as this engine needs them.
+#[derive(Debug, Clone, Default)]
+pub struct GroupLayout {
+    /// Upstream inner index of every used feature, indexed like `used_features`.
+    pub inner: Vec<usize>,
+    pub num_groups: usize,
+    /// Real column indices of the multi-value group, in group order (empty without one).
+    pub multi_val_features: Vec<usize>,
+}
+
+/// Upstream's group layout of the used features (real column indices,
+/// ascending). `columns` holds every column's sampled non-zero entries.
 pub fn upstream_inner_order(
     bin_mappers: &[BinMapper],
     used_features: &[usize],
@@ -147,9 +175,13 @@ pub fn upstream_inner_order(
     num_data: usize,
     enable_bundle: bool,
     is_sparse: bool,
-) -> (Vec<usize>, usize) {
+) -> GroupLayout {
     if !enable_bundle || used_features.is_empty() {
-        return ((0..used_features.len()).collect(), used_features.len());
+        return GroupLayout {
+            inner: (0..used_features.len()).collect(),
+            num_groups: used_features.len(),
+            multi_val_features: Vec::new(),
+        };
     }
     let total = total_sample_cnt as i64;
     // upstream FastFeatureBundling: dense features first
@@ -167,20 +199,27 @@ pub fn upstream_inner_order(
             sample_indices[f] = fixed[k].as_slice();
         }
     }
-    let mut groups = find_groups(used_features, &sample_indices, total, num_data as i32, is_sparse);
-    let groups2 = find_groups(&by_cnt, &sample_indices, total, num_data as i32, is_sparse);
+    let (mut groups, mut multi_val) = find_groups(used_features, &sample_indices, total, num_data as i32, is_sparse);
+    let (groups2, multi_val2) = find_groups(&by_cnt, &sample_indices, total, num_data as i32, is_sparse);
     if groups.len() > groups2.len() {
         groups = groups2;
+        multi_val = multi_val2;
     }
     let num_group = groups.len() as i32;
     let mut rand = Random::new(num_data as i32);
     for i in 0..num_group - 1 {
         let j = rand.next_short(i + 1, num_group);
         groups.swap(i as usize, j as usize);
+        multi_val.swap(i as usize, j as usize);
     }
     let mut inner_of_real = vec![usize::MAX; bin_mappers.len()];
     for (inner, f) in groups.iter().flatten().enumerate() {
         inner_of_real[*f] = inner;
     }
-    (used_features.iter().map(|&f| inner_of_real[f]).collect(), groups.len())
+    let multi_val_features = groups.iter().zip(&multi_val).find(|(_, m)| **m).map(|(g, _)| g.clone()).unwrap_or_default();
+    GroupLayout {
+        inner: used_features.iter().map(|&f| inner_of_real[f]).collect(),
+        num_groups: groups.len(),
+        multi_val_features,
+    }
 }

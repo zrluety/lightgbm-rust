@@ -8,6 +8,7 @@ from ._lightgbm_rust import UPSTREAM_COMMIT, UPSTREAM_VERSION, __version__
 from .basic import Booster, Dataset, EvalResult, LightGBMError, Sequence, register_logger
 from .callback import EarlyStopException, early_stopping, log_evaluation, record_evaluation, reset_parameter
 from .engine import CVBooster, cv, train
+from .plotting import create_tree_digraph, plot_importance, plot_metric, plot_split_value_histogram, plot_tree
 from .sklearn import LGBMClassifier, LGBMModel, LGBMRanker, LGBMRegressor
 
 __all__ = [
@@ -25,9 +26,14 @@ __all__ = [
     "UPSTREAM_COMMIT",
     "UPSTREAM_VERSION",
     "__version__",
+    "create_tree_digraph",
     "cv",
     "early_stopping",
     "log_evaluation",
+    "plot_importance",
+    "plot_metric",
+    "plot_split_value_histogram",
+    "plot_tree",
     "record_evaluation",
     "register_logger",
     "reset_parameter",

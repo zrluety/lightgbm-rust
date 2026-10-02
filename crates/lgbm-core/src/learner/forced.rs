@@ -208,7 +208,12 @@ impl SerialTreeLearner {
         }
         if abort {
             let best_leaf = self.best_leaf();
-            if self.best_split_per_leaf[best_leaf].gain <= 0.0 {
+            let gain = self.best_split_per_leaf[best_leaf].gain;
+            if gain <= 0.0 {
+                crate::log::warning(&format!(
+                    "No further splits with positive gain, best gain: {}",
+                    crate::fmt::fmt_f(gain, 6)
+                ));
                 return Ok(self.num_leaves);
             }
             let (l, r) = self.split(tree, best_leaf)?;

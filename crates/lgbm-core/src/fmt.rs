@@ -43,6 +43,17 @@ pub fn fmt_g6(v: f64) -> String {
     fmt_g(v, 6)
 }
 
+/// Format like C `printf("%.{precision}f", v)` (`%f` is precision 6).
+pub fn fmt_f(v: f64, precision: usize) -> String {
+    if v.is_nan() {
+        return if v.is_sign_negative() { "-nan".into() } else { "nan".into() };
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { "-inf".into() } else { "inf".into() };
+    }
+    format!("{v:.precision$}")
+}
+
 /// Parse a number written by upstream (accepts `inf`, `-inf`, `nan`, `-nan`).
 pub fn parse_f64(s: &str) -> Option<f64> {
     let s = s.trim();

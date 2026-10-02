@@ -45,6 +45,9 @@ dev = [
     "psutil>=5",
     "pyarrow>=15",
     "polars>=1",
+    # plotting (graphviz also needs the `dot` executable)
+    "matplotlib>=3.7",
+    "graphviz>=0.20",
     # Reference engine for differential tests only. Never imported by lightgbm_rust.
     "lightgbm==4.7.0",
 ]

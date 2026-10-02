@@ -214,10 +214,6 @@ impl RowObjective for MulticlassOva {
         Ok(())
     }
 
-    fn take_warnings(&mut self) -> Vec<String> {
-        self.binary.iter_mut().flat_map(|b| b.take_warnings()).collect()
-    }
-
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {
         let n = scores.num_data;
         for (c, b) in self.binary.iter().enumerate() {

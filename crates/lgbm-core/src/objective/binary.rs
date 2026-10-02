@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Metadata;
 use crate::error::{LgbmError, Result};
-use crate::fmt::fmt_g6;
+use crate::fmt::{fmt_f, fmt_g6};
 
 pub struct BinaryLogloss {
     sigmoid: f64,
@@ -19,7 +19,6 @@ pub struct BinaryLogloss {
     weight: Option<Vec<f32>>,
     need_train: bool,
     num_pos_data: usize,
-    warnings: Vec<String>,
 }
 
 impl BinaryLogloss {
@@ -44,7 +43,6 @@ impl BinaryLogloss {
             weight: None,
             need_train: true,
             num_pos_data: 0,
-            warnings: Vec::new(),
         })
     }
 
@@ -59,7 +57,6 @@ impl BinaryLogloss {
             weight: None,
             need_train: true,
             num_pos_data: 0,
-            warnings: Vec::new(),
         }
     }
 }
@@ -84,8 +81,9 @@ impl RowObjective for BinaryLogloss {
         self.num_pos_data = cnt_positive;
         self.need_train = !(cnt_negative == 0 || cnt_positive == 0);
         if !self.need_train {
-            self.warnings.push("Contains only one class".into());
+            crate::log::warning("Contains only one class");
         }
+        crate::log::info(&format!("Number of positive: {cnt_positive}, number of negative: {cnt_negative}"));
         self.label_weights = [1.0, 1.0];
         if self.is_unbalance && cnt_positive > 0 && cnt_negative > 0 {
             if cnt_positive > cnt_negative {
@@ -98,10 +96,6 @@ impl RowObjective for BinaryLogloss {
         }
         self.label_weights[1] *= self.scale_pos_weight;
         Ok(())
-    }
-
-    fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
     }
 
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {
@@ -154,7 +148,9 @@ impl RowObjective for BinaryLogloss {
         let mut pavg = suml / sumw;
         pavg = pavg.min(1.0 - K_EPSILON);
         pavg = pavg.max(K_EPSILON);
-        (pavg / (1.0f32 as f64 - pavg)).ln() / self.sigmoid
+        let initscore = (pavg / (1.0f32 as f64 - pavg)).ln() / self.sigmoid;
+        crate::log::info(&format!("[binary:BoostFromScore]: pavg={} -> initscore={}", fmt_f(pavg, 6), fmt_f(initscore, 6)));
+        initscore
     }
 
     fn class_need_train(&self, _output: usize) -> bool {

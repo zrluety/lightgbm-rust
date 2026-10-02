@@ -5,7 +5,8 @@ All commands run from the repository root. Test reports are written to `tests/re
 ## Environment
 
 - Rust toolchain from `rust-toolchain.toml`, plus Python 3.12 managed by `uv`.
-- `uv sync --python 3.12` installs the dev group, which includes the reference engine `lightgbm==4.7.0` (PyPI wheel), pytest, pandas, scikit-learn, and scipy.
+- `uv sync --python 3.12` installs the dev group, which includes the reference engine `lightgbm==4.7.0` (PyPI wheel), pytest, pandas, scikit-learn, scipy, matplotlib, and the `graphviz` Python package.
+- The tree-plotting tests also need Graphviz's `dot` executable on `PATH` (`apt-get install graphviz` on Ubuntu). Without it, upstream's `test_plot_tree` and `test_create_tree_digraph` fail when rendering.
 - The reference engine is used **only** by `tests/differential`, `examples/train_binary.py`, and `benches/bench_vs_upstream.py`. The upstream test runner never imports it; it asserts that `lightgbm` resolves to `lightgbm_rust`.
 - `uv sync` removes the editable `lightgbm_rust` install. After it, re-run `maturin develop` and use `uv run --no-sync`.
 
@@ -63,6 +64,8 @@ PowerShell expands `$` inside double quotes, so put anything non-trivial in a sc
   - early stopping;
   - model cross-loading in both directions.
 - **Text files (`test_text_files.py`).** Both engines load the same CSV, TSV and LibSVM files (written with side files into a temporary directory) and predict from them; error cases compare upstream's message with ours after removing our `invalid data:` / `invalid parameter:` prefix and upstream's source location in `CHECK` messages.
+- **Engine log (`test_logs.py`).** 19 scenarios register a logger in each package and run at `verbosity=2`: bagging, GOSS, multiclass with `auc_mu`, OVA, L1 without `boost_from_average`, `huber` with `reg_sqrt`, both cross-entropy objectives, lambdarank with positions, a tree that cannot split, random forest, a custom objective, a learning-rate schedule, text files with a header and side files (training and validation, `two_round`, prediction from the file), a ranking file and side files without trailing newlines saved and reloaded as binary, sparse data with a multi-value group in row-wise and col-wise mode, and `save_binary`. Every Info, Warning and Debug line must match upstream's in text and order. Only elapsed times (`<elapsed> seconds`) and the temporary directory are replaced before the comparison (`[log]` in `tests/tolerances.toml`).
+- **Plotting (`test_plotting.py`).** Each package plots the same regression and multiclass models. The test compares `get_split_value_histogram` results, the graphviz source of `create_tree_digraph`, a description of every matplotlib axes (title, labels, limits, ticks, bars, lines, texts, legend, grid and image pixels, including the trees rendered by `plot_tree`), and the error messages. It runs on matplotlib's `Agg` backend; `test_plot_tree` is skipped without Graphviz's `dot`.
 - **Tolerances.** These come from `tests/tolerances.toml`; every entry has a written rationale. A comparison that exceeds its tolerance fails, and no tolerance is widened to make a test pass.
 - **Report.** Every comparison, including its max abs/rel diff and whether it was bitwise exact, goes to `tests/report/differential.json`.
 

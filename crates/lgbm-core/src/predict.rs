@@ -507,7 +507,7 @@ const FILE_BATCH: usize = 1 << 16;
 impl Gbdt {
     /// Predict the rows of a CSV, TSV or LibSVM file and write one line per
     /// row to `result_filename`: the row's outputs, tab-separated, with 17
-    /// significant digits. Returns upstream's warnings.
+    /// significant digits.
     ///
     /// upstream: `Predictor::Predict(data_filename, result_filename, ...)`.
     pub fn predict_file(
@@ -518,13 +518,12 @@ impl Gbdt {
         start_iteration: i32,
         num_iteration: i32,
         opts: PredictFileOptions,
-    ) -> Result<Vec<String>> {
+    ) -> Result<()> {
         use std::io::Write;
         let file = std::fs::File::create(result_filename).map_err(|_| {
             LgbmError::InvalidParameter(format!("Prediction results file {result_filename} cannot be created"))
         })?;
         let mut writer = std::io::BufWriter::new(file);
-        let mut warnings = Vec::new();
         if let Ok((_, crate::binary::DataFileKind::Binary)) = crate::binary::detect_data_file_exact(data_filename) {
             // upstream's format detection rejects its own binary files with this message
             return Err(LgbmError::InvalidData(
@@ -534,8 +533,7 @@ impl Gbdt {
         }
         let nf = self.num_feature();
         let label_idx = if opts.header { -1 } else { self.label_index };
-        let parser =
-            Parser::create(data_filename, opts.header, nf as i32, label_idx, opts.precise_float_parser, &mut warnings)?;
+        let parser = Parser::create(data_filename, opts.header, nf as i32, label_idx, opts.precise_float_parser)?;
         if !opts.header && !opts.disable_shape_check && parser.num_features() != nf as i32 {
             return Err(LgbmError::InvalidData(format!(
                 "The number of features in data ({}) is not the same as it was in training data ({nf}).\n\
@@ -559,7 +557,7 @@ impl Gbdt {
             for (i, name) in self.feature_names.iter().enumerate() {
                 match position.get(name.as_str()) {
                     Some(&p) => remapper[p] = i as i32,
-                    None => warnings.push(format!(
+                    None => crate::log::warning(&format!(
                         "Feature ({name}) is missed in data file. If it is weight/query/group/ignore_column, \
                          you can ignore this warning."
                     )),
@@ -629,7 +627,7 @@ impl Gbdt {
             predict_batch(&batch, &mut writer)?;
         }
         writer.flush().map_err(write_err)?;
-        Ok(warnings)
+        Ok(())
     }
 }
 

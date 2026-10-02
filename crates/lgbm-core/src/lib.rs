@@ -6,7 +6,7 @@
 //! piece follows.
 //!
 //! Layering (no module depends on a later one):
-//! `consts`, `error`, `fmt`, `random`, `arrow` -> `config` -> `binning` ->
+//! `consts`, `error`, `fmt`, `log`, `random`, `arrow` -> `config` -> `binning` ->
 //! `dataset` -> `objective`, `metric` -> `tree` -> `histogram` -> `learner` ->
 //! `boosting` -> `predict`, `io`.
 
@@ -26,6 +26,7 @@ pub mod fmt;
 pub mod histogram;
 pub mod io;
 pub mod learner;
+pub mod log;
 pub mod matrix;
 pub mod metric;
 pub mod multi_val_bin;

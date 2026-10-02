@@ -48,11 +48,6 @@ pub trait RowObjective: Send + Sync {
         1
     }
     fn init(&mut self, meta: &Metadata, num_data: usize) -> Result<()>;
-    /// Upstream `Log::Warning` messages raised while constructing or
-    /// initializing the objective; drained by the booster.
-    fn take_warnings(&mut self) -> Vec<String> {
-        Vec::new()
-    }
     /// Writes `grad[k*n+i]`, `hess[k*n+i]` (f32 like upstream `score_t`).
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]);
     /// upstream `GetGradientsWithSampledQueries` (`bagging_by_query`): ranking
@@ -340,13 +335,6 @@ impl Objective {
                 }
                 objective.init(meta, groups)
             }
-        }
-    }
-
-    pub fn take_warnings(&mut self) -> Vec<String> {
-        match self {
-            Objective::Row(o) => o.take_warnings(),
-            Objective::Grouped { .. } => Vec::new(),
         }
     }
 

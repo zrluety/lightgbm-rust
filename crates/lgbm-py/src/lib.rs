@@ -15,7 +15,7 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use lgbm_core::arrow::{ArrowArrayStream, ArrowChunkedArray};
 use lgbm_core::boosting::PredictKind;
@@ -49,9 +49,47 @@ fn core_err(e: LgbmError) -> PyErr {
     LightGBMError::new_err(e.to_string())
 }
 
-/// Run `f`, mapping core errors and panics to `LightGBMError`.
+/// The Python function engine messages go to (upstream `LGBM_RegisterLogCallback`).
+static LOG_CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+
+/// Send this thread's engine messages to `callback`, one line per call.
+///
+/// upstream: `LGBM_RegisterLogCallback` (the callback is per thread there too).
+#[pyfunction]
+fn register_log_callback(callback: Py<PyAny>) {
+    lgbm_core::log::start_capture();
+    *LOG_CALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+}
+
+/// Pass the messages logged on this thread to the registered callback.
+fn flush_log(py: Python<'_>) {
+    let lines = lgbm_core::log::drain();
+    if lines.is_empty() {
+        return;
+    }
+    let callback = LOG_CALLBACK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.clone_ref(py));
+    if let Some(callback) = callback {
+        for line in lines {
+            if let Err(e) = callback.call1(py, (line,)) {
+                e.write_unraisable(py, None);
+            }
+        }
+    }
+}
+
+/// upstream `Log::Warning` for a message produced on the Python side.
+#[pyfunction]
+fn log_warning(py: Python<'_>, msg: &str) {
+    lgbm_core::log::warning(msg);
+    flush_log(py);
+}
+
+/// Run `f`, mapping core errors and panics to `LightGBMError`; what it
+/// logged goes to the registered callback first.
 fn guarded<R>(f: impl FnOnce() -> lgbm_core::Result<R>) -> PyResult<R> {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    let r = catch_unwind(AssertUnwindSafe(f));
+    Python::attach(flush_log);
+    match r {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(core_err(e)),
         Err(p) => Err(LightGBMError::new_err(format!(
@@ -173,7 +211,6 @@ fn config_from(params: Vec<(String, String)>) -> PyResult<Config> {
 #[pyclass(name = "RsDataset", module = "lightgbm_rust._lightgbm_rust")]
 struct RsDataset {
     inner: Arc<Dataset>,
-    warnings: Vec<String>,
 }
 
 #[pymethods]
@@ -209,9 +246,7 @@ impl RsDataset {
             Some(r) => Dataset::from_matrix_with_reference(&view, fields, r, cfg.num_threads),
             None => Dataset::from_matrix(&view, fields, &cfg),
         })?;
-        let mut warnings = cfg.warnings;
-        warnings.extend(ds.warnings().iter().cloned());
-        Ok(Self { inner: Arc::new(ds), warnings })
+        Ok(Self { inner: Arc::new(ds) })
     }
 
     /// upstream: `LGBM_DatasetGetSubset`.
@@ -220,7 +255,7 @@ impl RsDataset {
         let used = slice_of(&used, "used_indices")?;
         let full = &self.inner;
         let ds = detached(py, || lgbm_core::dataset::with_num_threads(cfg.num_threads, || full.subset(used))?)?;
-        Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings })
+        Ok(Self { inner: Arc::new(ds) })
     }
 
     /// upstream: `LGBM_DatasetCreateFromFile` (binary or text file). With a
@@ -237,19 +272,13 @@ impl RsDataset {
         let cfg = config_from(params)?;
         let reference = reference.map(|r| r.inner.clone());
         let ds = detached(py, || Dataset::load_file(&filename, &cfg, reference.as_deref()))?;
-        let mut warnings = cfg.warnings;
-        warnings.extend(ds.warnings().iter().cloned());
-        Ok(Self { inner: Arc::new(ds), warnings })
+        Ok(Self { inner: Arc::new(ds) })
     }
 
-    /// upstream: `LGBM_DatasetSaveBinary`. Returns upstream's warnings.
-    fn save_binary(&self, py: Python<'_>, filename: String) -> PyResult<Vec<String>> {
+    /// upstream: `LGBM_DatasetSaveBinary`.
+    fn save_binary(&self, py: Python<'_>, filename: String) -> PyResult<()> {
         let ds = &self.inner;
         detached(py, || ds.save_binary(&filename))
-    }
-
-    fn config_warnings(&self) -> Vec<String> {
-        self.warnings.clone()
     }
 
     fn num_data(&self) -> usize {
@@ -270,10 +299,13 @@ impl RsDataset {
         self.inner.feature_names().to_vec()
     }
 
-    /// Returns warnings (e.g. spaces replaced), like upstream's log output.
-    fn set_feature_names(&mut self, names: Vec<String>) -> PyResult<Vec<String>> {
-        let replaced = guarded(|| Arc::make_mut(&mut self.inner).set_feature_names(names))?;
-        Ok(if replaced { vec![lgbm_core::dataset::FEATURE_NAME_SPACE_WARNING.to_string()] } else { Vec::new() })
+    fn set_feature_names(&mut self, names: Vec<String>) -> PyResult<()> {
+        guarded(|| {
+            if Arc::make_mut(&mut self.inner).set_feature_names(names)? {
+                lgbm_core::log::warning(lgbm_core::dataset::FEATURE_NAME_SPACE_WARNING);
+            }
+            Ok(())
+        })
     }
 
     fn feature_infos(&self) -> Vec<String> {
@@ -342,13 +374,20 @@ impl RsDataset {
         self.inner.metadata.positions.as_ref().map(|p| p.clone().into_pyarray(py))
     }
 
-    /// Replace a metadata field and return upstream's warnings. Boosters
-    /// already created from this dataset keep the previous values.
+    /// Replace a metadata field. Boosters already created from this dataset
+    /// keep the previous values.
     #[pyo3(signature = (name, values=None))]
-    fn set_field(&mut self, name: &str, values: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+    fn set_field(&mut self, py: Python<'_>, name: &str, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let r = self.set_field_impl(name, values);
+        flush_log(py);
+        r
+    }
+}
+
+impl RsDataset {
+    fn set_field_impl(&mut self, name: &str, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let n = self.inner.num_data();
         let ds = Arc::make_mut(&mut self.inner);
-        let mut warnings = Vec::new();
         match name {
             "group" => {
                 let a: Option<PyReadonlyArray1<'_, i32>> = values.map(|o| o.extract()).transpose()?;
@@ -358,7 +397,7 @@ impl RsDataset {
             "position" => {
                 let a: Option<PyReadonlyArray1<'_, i32>> = values.map(|o| o.extract()).transpose()?;
                 let v = a.as_ref().map(|a| slice_of(a, "position")).transpose()?;
-                warnings = ds.metadata.set_position(n, v).map_err(core_err)?;
+                ds.metadata.set_position(n, v).map_err(core_err)?;
             }
             "label" => {
                 let a: PyReadonlyArray1<'_, f32> = values
@@ -383,7 +422,7 @@ impl RsDataset {
                 )));
             }
         }
-        Ok(warnings)
+        Ok(())
     }
 }
 
@@ -391,7 +430,6 @@ impl RsDataset {
 #[pyclass(name = "RsBooster", module = "lightgbm_rust._lightgbm_rust")]
 struct RsBooster {
     inner: Gbdt,
-    warnings: Vec<String>,
 }
 
 fn predict_kind(kind: &str) -> PyResult<PredictKind> {
@@ -410,21 +448,15 @@ impl RsBooster {
     #[staticmethod]
     fn for_training(py: Python<'_>, train: PyRef<'_, RsDataset>, params: Vec<(String, String)>) -> PyResult<Self> {
         let cfg = config_from(params)?;
-        let mut warnings = cfg.warnings.clone();
         let data = train.inner.clone();
-        let mut inner = detached(py, || Gbdt::new(cfg, data, None))?;
-        warnings.extend(inner.take_warnings());
-        Ok(Self { inner, warnings })
+        let inner = detached(py, || Gbdt::new(cfg, data, None))?;
+        Ok(Self { inner })
     }
 
     #[staticmethod]
     fn from_model_string(py: Python<'_>, text: String) -> PyResult<Self> {
         let inner = detached(py, || Gbdt::load_model_from_string(&text))?;
-        Ok(Self { inner, warnings: Vec::new() })
-    }
-
-    fn config_warnings(&self) -> Vec<String> {
-        self.warnings.clone()
+        Ok(Self { inner })
     }
 
     /// upstream: `LGBM_BoosterMerge`.
@@ -541,7 +573,7 @@ impl RsBooster {
         out.into_pyarray(py).reshape([nrows, width])
     }
 
-    /// Predict a text data file into `result_filename`; returns upstream's warnings.
+    /// Predict a text data file into `result_filename`.
     ///
     /// upstream: `LGBM_BoosterPredictForFile`.
     #[pyo3(signature = (data_filename, result_filename, data_has_header, kind="normal", start_iteration=0, num_iteration=-1, params=Vec::new()))]
@@ -556,9 +588,10 @@ impl RsBooster {
         start_iteration: i32,
         num_iteration: i32,
         params: Vec<(String, String)>,
-    ) -> PyResult<Vec<String>> {
+    ) -> PyResult<()> {
         let kind = predict_kind(kind)?;
-        let cfg = config_from(params)?;
+        // the Python side has logged this parse already (`validate_params`)
+        let cfg = guarded(|| lgbm_core::log::capture(|| Config::from_pairs(params)).0)?;
         let g = &self.inner;
         let early_stop = guarded(|| {
             g.prediction_early_stop(cfg.pred_early_stop, cfg.pred_early_stop_freq, cfg.pred_early_stop_margin)
@@ -569,11 +602,7 @@ impl RsBooster {
             precise_float_parser: cfg.precise_float_parser,
             early_stop,
         };
-        let mut warnings = cfg.warnings.clone();
-        warnings.extend(detached(py, || {
-            g.predict_file(&data_filename, &result_filename, kind, start_iteration, num_iteration, opts)
-        })?);
-        Ok(warnings)
+        detached(py, || g.predict_file(&data_filename, &result_filename, kind, start_iteration, num_iteration, opts))
     }
 
     /// SHAP values of a CSR/CSC matrix as one `(indptr, indices, data)` per
@@ -647,14 +676,14 @@ impl RsBooster {
         self.inner.loaded_parameters().map(str::to_string)
     }
 
-    /// upstream: `LGBM_BoosterResetParameter`. Returns upstream's warnings.
-    fn reset_parameter(&mut self, py: Python<'_>, params: Vec<(String, String)>) -> PyResult<Vec<String>> {
+    /// upstream: `LGBM_BoosterResetParameter`.
+    fn reset_parameter(&mut self, py: Python<'_>, params: Vec<(String, String)>) -> PyResult<()> {
         let g = &mut self.inner;
         detached(py, || g.reset_parameter(params))
     }
 
-    /// upstream: `LGBM_BoosterResetTrainingData`. Returns upstream's warnings.
-    fn reset_training_data(&mut self, py: Python<'_>, train: PyRef<'_, RsDataset>) -> PyResult<Vec<String>> {
+    /// upstream: `LGBM_BoosterResetTrainingData`.
+    fn reset_training_data(&mut self, py: Python<'_>, train: PyRef<'_, RsDataset>) -> PyResult<()> {
         let data = train.inner.clone();
         let g = &mut self.inner;
         detached(py, || g.reset_training_data(data))
@@ -722,10 +751,10 @@ fn param_specs() -> Vec<(String, String, Vec<String>)> {
         .collect()
 }
 
-/// Parse and validate parameters; returns the non-fatal warnings.
+/// Parse and validate parameters (logging upstream's warnings).
 #[pyfunction]
-fn validate_params(params: Vec<(String, String)>) -> PyResult<Vec<String>> {
-    Ok(config_from(params)?.warnings)
+fn validate_params(params: Vec<(String, String)>) -> PyResult<()> {
+    config_from(params).map(drop)
 }
 
 /// upstream: `LGBM_DatasetUpdateParamChecking`.
@@ -791,6 +820,8 @@ fn _lightgbm_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<RsDataset>()?;
     m.add_class::<RsBooster>()?;
+    m.add_function(wrap_pyfunction!(register_log_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(log_warning, m)?)?;
     m.add_function(wrap_pyfunction!(param_specs, m)?)?;
     m.add_function(wrap_pyfunction!(validate_params, m)?)?;
     m.add_function(wrap_pyfunction!(dataset_update_param_checking, m)?)?;

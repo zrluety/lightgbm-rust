@@ -5,7 +5,7 @@ use super::{RowObjective, ScoreView};
 use crate::consts::K_EPSILON;
 use crate::dataset::{check_elements_interval_closed, Metadata};
 use crate::error::{LgbmError, Result};
-use crate::fmt::fmt_g6;
+use crate::fmt::{fmt_f, fmt_g6};
 
 /// upstream: utils/common.h `ObtainMinMaxSum`: one pass in pairs, the sum
 /// accumulated in the element type (`float` for weights).
@@ -98,6 +98,7 @@ impl RowObjective for CrossEntropy {
 
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         check_unit_interval(&meta.label, "cross_entropy")?;
+        crate::log::info("[cross_entropy:Init]: (objective) labels passed interval [0, 1] check");
         if let Some(w) = &meta.weight {
             let (minw, _, sumw) = obtain_min_max_sum(w);
             if minw < 0.0 {
@@ -141,7 +142,13 @@ impl RowObjective for CrossEntropy {
     fn boost_from_score(&self, _output: usize) -> f64 {
         // clamp keeps a NaN mean, as std::min / std::max do
         let pavg = label_mean(&self.label, self.weight.as_deref()).clamp(K_EPSILON, 1.0 - K_EPSILON);
-        (pavg / (1.0f32 as f64 - pavg)).ln()
+        let initscore = (pavg / (1.0f32 as f64 - pavg)).ln();
+        crate::log::info(&format!(
+            "[cross_entropy:BoostFromScore]: pavg = {} -> initscore = {}",
+            fmt_f(pavg, 6),
+            fmt_f(initscore, 6)
+        ));
+        initscore
     }
 
     fn convert_output(&self, raw: &[f64], out: &mut [f64]) {
@@ -179,13 +186,20 @@ impl RowObjective for CrossEntropyLambda {
 
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         check_unit_interval(&meta.label, "cross_entropy_lambda")?;
+        crate::log::info("[cross_entropy_lambda:Init]: (objective) labels passed interval [0, 1] check");
         if let Some(w) = &meta.weight {
-            let (minw, _, _) = obtain_min_max_sum(w);
+            let (minw, maxw, _) = obtain_min_max_sum(w);
             if minw <= 0.0 {
                 return Err(LgbmError::InvalidData(
                     "[cross_entropy_lambda]: at least one weight is non-positive".into(),
                 ));
             }
+            crate::log::info(&format!(
+                "[cross_entropy_lambda:Init]: min, max weights = {}, {}; ratio = {}",
+                fmt_f(minw as f64, 6),
+                fmt_f(maxw as f64, 6),
+                fmt_f((maxw / minw) as f64, 6)
+            ));
         }
         self.label = meta.label.clone();
         self.weight = meta.weight.clone();
@@ -223,7 +237,14 @@ impl RowObjective for CrossEntropyLambda {
     }
 
     fn boost_from_score(&self, _output: usize) -> f64 {
-        label_mean(&self.label, self.weight.as_deref()).exp_m1().ln()
+        let havg = label_mean(&self.label, self.weight.as_deref());
+        let initscore = havg.exp_m1().ln();
+        crate::log::info(&format!(
+            "[cross_entropy_lambda:BoostFromScore]: havg = {} -> initscore = {}",
+            fmt_f(havg, 6),
+            fmt_f(initscore, 6)
+        ));
+        initscore
     }
 
     fn convert_output(&self, raw: &[f64], out: &mut [f64]) {

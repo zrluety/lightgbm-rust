@@ -55,7 +55,14 @@ pub fn read_header(filename: &str) -> Result<(String, usize)> {
     if last == Some(b'\n') {
         skip += 1;
     }
-    Ok((String::from_utf8_lossy(&line).into_owned(), skip))
+    let first_line = String::from_utf8_lossy(&line).into_owned();
+    log_skipped_header(filename, &first_line);
+    Ok((first_line, skip))
+}
+
+/// The debug line every upstream `TextReader` that skips a header writes.
+pub fn log_skipped_header(filename: &str, first_line: &str) {
+    crate::log::debug(&format!("Skipped header \"{first_line}\" in file {filename}"));
 }
 
 /// Splits blocks into lines like upstream's `TextReader::ReadAllAndProcess`:
@@ -127,7 +134,35 @@ pub fn for_each_line(filename: &str, skip_bytes: usize, mut f: impl FnMut(&[u8])
             break;
         }
     }
+    if !splitter.pending.is_empty() {
+        log_unterminated(filename);
+    }
     splitter.finish(&mut f)
+}
+
+fn log_unterminated(filename: &str) {
+    crate::log::info(&format!("Warning: last line of {filename} has no end of line, still using this line"));
+}
+
+/// The note of a full read of `filename` (after `skip_bytes`) whose last
+/// line has no terminator, without reading the lines.
+///
+/// upstream: the end of `TextReader::ReadAllAndProcess`, here for `CountLine`.
+pub fn note_unterminated_last_line(filename: &str, skip_bytes: usize) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut r) = File::open(filename) else { return Ok(()) };
+    let io = |e: std::io::Error| LgbmError::InvalidData(format!("Could not read data file: {e}"));
+    let len = r.seek(SeekFrom::End(0)).map_err(io)?;
+    if len <= skip_bytes as u64 {
+        return Ok(());
+    }
+    r.seek(SeekFrom::End(-1)).map_err(io)?;
+    let mut last = [0u8; 1];
+    r.read_exact(&mut last).map_err(io)?;
+    if last[0] != b'\n' && last[0] != b'\r' {
+        log_unterminated(filename);
+    }
+    Ok(())
 }
 
 /// All lines of a text file (upstream `TextReader::ReadAllLines`).
@@ -181,8 +216,8 @@ impl GetLines {
     }
 }
 
-/// upstream: parser.cpp `ReadKLineFromFile`. Returns the lines and warnings.
-fn read_k_lines(filename: &str, header: bool, k: usize, warnings: &mut Vec<String>) -> Result<Vec<Vec<u8>>> {
+/// upstream: parser.cpp `ReadKLineFromFile`.
+fn read_k_lines(filename: &str, header: bool, k: usize) -> Result<Vec<Vec<u8>>> {
     let mut lines = GetLines::new(filename)?;
     if header {
         lines.next_line()?;
@@ -202,7 +237,7 @@ fn read_k_lines(filename: &str, header: bool, k: usize, warnings: &mut Vec<Strin
     if ret.is_empty() {
         return Err(LgbmError::InvalidData(format!("Data file {filename} should have at least one line.")));
     } else if ret.len() == 1 {
-        warnings.push(format!("Data file {filename} only has one line."));
+        crate::log::warning(&format!("Data file {filename} only has one line."));
     }
     Ok(ret)
 }
@@ -322,9 +357,8 @@ impl Parser {
         num_features: i32,
         label_idx: i32,
         precise_float_parser: bool,
-        warnings: &mut Vec<String>,
     ) -> Result<Self> {
-        let lines = read_k_lines(filename, header, 32, warnings)?;
+        let lines = read_k_lines(filename, header, 32)?;
         let Some((data_type, total_columns)) = data_type(filename, header, &lines)? else {
             return Err(LgbmError::InvalidData(
                 "Unknown format of training data. Only CSV, TSV, and LibSVM (zero-based) formatted text files are supported."
@@ -332,7 +366,7 @@ impl Parser {
             ));
         };
         let first = &lines[0];
-        let label_idx = if num_features <= 0 {
+        let output_label_idx = if num_features <= 0 {
             label_idx
         } else if data_type == DataType::Libsvm {
             let space = first.iter().position(|c| matches!(c, b' ' | b'\x0c' | b'\n' | b'\r' | b'\t' | b'\x0b'));
@@ -348,10 +382,13 @@ impl Parser {
             let tokens = first.split(|&c| c == sep).filter(|t| !t.is_empty()).count();
             if tokens as i32 == num_features { -1 } else { label_idx }
         };
-        if data_type == DataType::Libsvm && label_idx > 0 {
+        if data_type == DataType::Libsvm && output_label_idx > 0 {
             return Err(LgbmError::InvalidData("Label should be the first column in a LibSVM file".into()));
         }
-        Ok(Self { data_type, label_idx, total_columns, precise: precise_float_parser })
+        if output_label_idx < 0 && label_idx >= 0 {
+            crate::log::info(&format!("Data file {filename} doesn't contain a label column."));
+        }
+        Ok(Self { data_type, label_idx: output_label_idx, total_columns, precise: precise_float_parser })
     }
 
     /// upstream: `Parser::NumFeatures`.
@@ -452,6 +489,12 @@ pub fn atoi(s: &[u8], mut p: usize) -> (i32, usize) {
         p += 1;
     }
     (sign.wrapping_mul(value), p)
+}
+
+/// upstream: `Common::AtoiAndCheck`.
+pub(crate) fn atoi_and_check(s: &str) -> Option<i32> {
+    let (v, p) = atoi(s.as_bytes(), 0);
+    (p == s.len()).then_some(v)
 }
 
 /// upstream: `Common::Pow`.

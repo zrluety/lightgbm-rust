@@ -23,6 +23,7 @@ struct RankingBase {
     weight: Option<Vec<f32>>,
     positions: Option<Vec<i32>>,
     num_position_ids: usize,
+    position_ids: Vec<String>,
     boundaries: Vec<i32>,
     /// upstream `pos_biases_` (`label_t`), updated after every gradient pass.
     pos_biases: Mutex<Vec<f32>>,
@@ -43,6 +44,7 @@ impl RankingBase {
         self.weight = meta.weight.clone();
         self.positions = meta.positions.clone();
         self.num_position_ids = if self.positions.is_some() { meta.position_ids.len() } else { 0 };
+        self.position_ids = if self.positions.is_some() { meta.position_ids.clone() } else { Vec::new() };
         self.boundaries = meta
             .query_boundaries
             .clone()
@@ -288,6 +290,13 @@ impl LambdarankNdcg {
             d1 -= biases[i] as f64 * reg * count[i] as f64;
             d2 -= reg * count[i] as f64;
             biases[i] = (biases[i] as f64 + self.base.learning_rate * d1 / (d2.abs() + 0.001)) as f32;
+        }
+        // upstream: LogDebugPositionBiasFactors (std::setw(15) columns, default float output)
+        if crate::log::enabled(crate::log::LogLevel::Debug) {
+            crate::log::debug(&format!("{:>15}{:>15}\n", "position", "bias_factor"));
+            for (id, b) in self.base.position_ids.iter().zip(biases.iter()) {
+                crate::log::debug(&format!("{id:>15}{:>15}", crate::fmt::fmt_g6(*b as f64)));
+            }
         }
     }
 }

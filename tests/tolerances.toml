@@ -72,6 +72,21 @@ mode = "exact"
 rationale = """The text format is deterministic given identical trees and
 parameters; exact equality is the model-format compatibility criterion."""
 
+[log]
+# Engine log lines ([LightGBM] [Info]/[Warning]/[Debug]) received by a
+# registered logger at verbosity=2.
+mode = "exact"
+rationale = """Messages, values and order are deterministic; elapsed times and
+the per-engine temporary directory in messages are replaced by placeholders on
+both sides before comparing."""
+
+[plotting]
+# Booster.get_split_value_histogram, the graphviz source of create_tree_digraph,
+# and the matplotlib artists drawn by the plot_* functions.
+mode = "exact"
+rationale = """Both packages run the same plotting code on models that are
+identical bit for bit, so every value, label and rendered pixel must agree."""
+
 [multithread]
 # num_threads=4, deterministic=true, force_row_wise=true on both sides.
 mode = "rtol"

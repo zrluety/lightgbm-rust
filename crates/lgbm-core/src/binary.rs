@@ -22,9 +22,10 @@ use crate::error::{LgbmError, Result};
 
 /// First bytes of a lightgbm-rust binary dataset file.
 pub const MAGIC: &[u8; 16] = b"\x89LGBMRS-DATASET\n";
-/// Version written by this build. Versions 1 (without `label_idx`) and 2
-/// (without `max_bin_by_feature` and forced bin bounds) are also read.
-pub const FORMAT_VERSION: u32 = 3;
+/// Version written by this build. Versions 1 (without `label_idx`), 2
+/// (without `max_bin_by_feature` and forced bin bounds) and 3 (without the
+/// multi-value feature group) are also read.
+pub const FORMAT_VERSION: u32 = 4;
 /// upstream `Dataset::binary_file_token`.
 pub const UPSTREAM_TOKEN: &[u8] = b"______LightGBM_Binary_File_Token______\n";
 
@@ -368,31 +369,31 @@ impl Dataset {
         for b in &self.forced_bin_bounds {
             w.f64_vec(b);
         }
+        w.usize_vec(&self.multi_val_group);
         w.0
     }
 
-    /// upstream `Dataset::SaveBinaryFile`. Returns upstream's warnings; an
-    /// existing file is left untouched (with a warning), as upstream does.
-    pub fn save_binary(&self, filename: &str) -> Result<Vec<String>> {
-        let mut warnings = Vec::new();
+    /// upstream `Dataset::SaveBinaryFile`. An existing file is left
+    /// untouched (with a warning), as upstream does.
+    pub fn save_binary(&self, filename: &str) -> Result<()> {
         if self.data_filename.as_deref() == Some(filename) {
-            warnings.push(format!("Binary file {filename} already exists"));
-            return Ok(warnings);
+            crate::log::warning(&format!("Binary file {filename} already exists"));
+            return Ok(());
         }
         let path = Path::new(filename);
         if path.exists() {
-            warnings.push(format!("File {filename} exists, cannot save binary to it"));
-            return Ok(warnings);
+            crate::log::warning(&format!("File {filename} exists, cannot save binary to it"));
+            return Ok(());
         }
+        crate::log::info(&format!("Saving data to binary file {filename}"));
         write_file(path, &self.to_binary_bytes())?;
         if self.metadata.init_score.is_some() {
-            warnings.push(
+            crate::log::warning(
                 "Please note that `init_score` is not saved in binary file.\n\
-                 If you need it, please set it again after loading Dataset."
-                    .into(),
+                 If you need it, please set it again after loading Dataset.",
             );
         }
-        Ok(warnings)
+        Ok(())
     }
 
     /// Parse lightgbm-rust's binary format; `path` is used in messages.
@@ -480,6 +481,10 @@ impl Dataset {
         } else {
             (Vec::new(), vec![Vec::new(); ncol])
         };
+        let multi_val_group = if version >= 4 { r.usize_vec("feature groups")? } else { Vec::new() };
+        if multi_val_group.iter().any(|&c| real_to_inner.get(c).is_none_or(Option::is_none)) {
+            return Err(r.corrupt("feature groups"));
+        }
         if r.pos != bytes.len() {
             return Err(r.corrupt("unexpected trailing bytes"));
         }
@@ -498,6 +503,7 @@ impl Dataset {
             used_features,
             upstream_inner,
             num_feature_groups,
+            multi_val_group,
             real_to_inner,
             bins,
             metadata,
@@ -507,7 +513,6 @@ impl Dataset {
             forced_bin_bounds,
             data_filename: None,
             label_idx,
-            warnings: Vec::new(),
         })
     }
 
@@ -549,6 +554,10 @@ impl Dataset {
                     "Parameter max_bin_by_feature cannot be changed when loading from binary file.".into(),
                 ));
             }
+        }
+        // upstream: Metadata::LoadFromMemory recomputes the query weights
+        if ds.metadata.weight.is_some() && ds.metadata.query_boundaries.is_some() {
+            crate::log::info("Calculating query weights...");
         }
         Ok(ds)
     }
@@ -646,10 +655,16 @@ mod tests {
         next[MAGIC.len()] = FORMAT_VERSION as u8 + 1;
         let err = Dataset::from_binary_bytes(&next, Path::new("t")).unwrap_err();
         assert!(matches!(err, LgbmError::Unsupported(_)), "{err}");
-        // version 2 has no bin-parameter section (an empty max_bin_by_feature
-        // and an empty bound list per column)
+        // version 3 has no multi-value group (empty in the sample)
+        assert!(sample().multi_val_group.is_empty());
+        let mut v3 = bytes[..bytes.len() - 8].to_vec();
+        v3[MAGIC.len()] = 3;
+        let back = Dataset::from_binary_bytes(&v3, Path::new("t")).unwrap();
+        assert_eq!(back.to_binary_bytes(), bytes);
+        // version 2 has no bin-parameter section either (an empty
+        // max_bin_by_feature and an empty bound list per column)
         let tail = 8 + 8 * sample().num_total_features();
-        let mut v2 = bytes[..bytes.len() - tail].to_vec();
+        let mut v2 = v3[..v3.len() - tail].to_vec();
         v2[MAGIC.len()] = 2;
         let back = Dataset::from_binary_bytes(&v2, Path::new("t")).unwrap();
         assert_eq!(back.to_binary_bytes(), bytes);
@@ -710,8 +725,11 @@ mod tests {
         let path = dir.join("d.bin");
         let _ = std::fs::remove_file(&path);
         let p = path.to_str().unwrap();
-        assert!(sample().save_binary(p).unwrap().is_empty());
-        let w = sample().save_binary(p).unwrap();
+        let (r, w) = crate::log::capture(|| sample().save_binary(p));
+        r.unwrap();
+        assert_eq!(w, vec![format!("Saving data to binary file {p}")]);
+        let (r, w) = crate::log::capture(|| sample().save_binary(p));
+        r.unwrap();
         assert_eq!(w, vec![format!("File {p} exists, cannot save binary to it")]);
         let ok = Config::from_pairs([("max_bin", "63")]).unwrap();
         assert!(Dataset::load_binary(p, Some(&ok)).is_ok());
