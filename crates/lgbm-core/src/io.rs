@@ -27,7 +27,13 @@ impl Gbdt {
         if let Some(o) = &self.objective {
             s.push_str(&format!("objective={}\n", o.to_model_string()));
         }
+        if self.average_output {
+            s.push_str("average_output\n");
+        }
         s.push_str(&format!("feature_names={}\n", self.feature_names.join(" ")));
+        if !self.monotone_constraints.is_empty() {
+            s.push_str(&format!("monotone_constraints={}\n", join_i8(&self.monotone_constraints, " ")));
+        }
         s.push_str(&format!("feature_infos={}\n", self.feature_infos.join(" ")));
 
         let mut num_used = self.models.len();
@@ -88,9 +94,9 @@ impl Gbdt {
         if let Some(o) = &self.objective {
             s.push_str(&format!("\"objective\":\"{}\",\n", o.to_model_string()));
         }
-        s.push_str("\"average_output\":false,\n");
+        s.push_str(&format!("\"average_output\":{},\n", self.average_output));
         s.push_str(&format!("\"feature_names\":[\"{}\"],\n", self.feature_names.join("\",\"")));
-        s.push_str("\"monotone_constraints\":[],\n");
+        s.push_str(&format!("\"monotone_constraints\":[{}],\n", join_i8(&self.monotone_constraints, ",")));
         let mut infos = Vec::new();
         for (name, info) in self.feature_names.iter().zip(&self.feature_infos) {
             let Some(range) = info.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
@@ -207,9 +213,7 @@ impl Gbdt {
         }
         let label_index = get_int("label_index")?;
         let max_feature_idx = get_int("max_feature_idx")?;
-        if kv.contains_key("average_output") {
-            return Err(LgbmError::Unsupported("average_output (random forest) models".into()));
-        }
+        let average_output = kv.contains_key("average_output");
         let feature_names: Vec<String> = kv
             .get("feature_names")
             .ok_or_else(|| LgbmError::ModelFormat("Model file doesn't contain feature_names".into()))?
@@ -228,6 +232,17 @@ impl Gbdt {
         if feature_infos.len() != (max_feature_idx + 1) as usize {
             return Err(LgbmError::ModelFormat("Wrong size of feature_infos".into()));
         }
+        // upstream: CommonC::StringToArray<int8_t>(..., ' ')
+        let monotone_constraints: Vec<i8> = match kv.get("monotone_constraints") {
+            Some(v) => {
+                let m: Vec<i8> = v.split(' ').filter(|t| !t.is_empty()).map(crate::config::atoi_i8).collect();
+                if m.len() != (max_feature_idx + 1) as usize {
+                    return Err(LgbmError::ModelFormat("Wrong size of monotone_constraints".into()));
+                }
+                m
+            }
+            None => Vec::new(),
+        };
         let objective = match kv.get("objective") {
             Some(o) => crate::objective::objective_from_model_string(o)?,
             None => None,
@@ -309,6 +324,13 @@ impl Gbdt {
         g.max_feature_idx = max_feature_idx;
         g.feature_names = feature_names;
         g.feature_infos = feature_infos;
+        g.monotone_constraints = monotone_constraints;
+        g.average_output = average_output;
         Ok(g)
     }
+}
+
+/// upstream `Common::Join<int8_t>` (values printed as integers).
+fn join_i8(v: &[i8], sep: &str) -> String {
+    v.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(sep)
 }

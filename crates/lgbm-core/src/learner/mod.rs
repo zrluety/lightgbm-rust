@@ -11,6 +11,7 @@
 //! one thread both modes give identical sums).
 
 pub mod col_sampler;
+pub mod constraints;
 pub mod partition;
 pub mod split;
 
@@ -18,7 +19,7 @@ use std::sync::Arc;
 
 use crate::binning::{BinType, MissingType};
 use crate::config::Config;
-use crate::consts::K_MIN_SCORE;
+use crate::consts::{K_EPSILON, K_MIN_SCORE};
 use crate::dataset::Dataset;
 use crate::histogram::{self, HistLayout};
 use crate::multi_val_bin::{HistSlots, MultiValBin, merge_blocks};
@@ -26,6 +27,7 @@ use crate::random::Random;
 use crate::threading::{SharedMut, ThreadTeam, resolve_num_threads};
 use crate::tree::{SplitArgs, Tree, construct_bitset, find_in_bitset};
 use col_sampler::ColSampler;
+use constraints::{LeafConstraints, Method, monotone_split_gain_penalty};
 use partition::DataPartition;
 use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_output};
 
@@ -81,6 +83,13 @@ pub struct SerialTreeLearner {
     col_sampler: ColSampler,
     /// Per-feature extra-trees generators (upstream `FeatureMetainfo::rand`).
     extra_rands: Option<Vec<Random>>,
+    /// Present iff `monotone_constraints` is set (upstream `USE_MC`).
+    constraints: Option<LeafConstraints>,
+    monotone_penalty: f64,
+    /// Whether `interaction_constraints` is set.
+    track_branch_features: bool,
+    /// Real split features on each leaf's path (empty unless tracked).
+    branch_features: Vec<Vec<i32>>,
     pub trace: Option<TreeTrace>,
 }
 
@@ -96,10 +105,19 @@ impl SerialTreeLearner {
                     default_bin: m.default_bin,
                     most_freq_bin: m.most_freq_bin,
                     bin_type: m.bin_type,
+                    monotone_type: cfg.monotone_constraints.get(data.real_feature_index(f)).copied().unwrap_or(0),
                 }
             })
             .collect();
         let num_leaves = cfg.num_leaves.max(2) as usize;
+        let constraints = (!cfg.monotone_constraints.is_empty()).then(|| {
+            LeafConstraints::new(
+                Method::parse(&cfg.monotone_constraints_method),
+                cfg.monotone_constraints.clone(),
+                num_leaves,
+                data.num_features(),
+            )
+        });
         let num_data = data.num_data();
         let slots = HistSlots::new(&data);
         let multi_val =
@@ -115,6 +133,10 @@ impl SerialTreeLearner {
         Self {
             col_sampler,
             extra_rands,
+            constraints,
+            monotone_penalty: cfg.monotone_penalty,
+            track_branch_features: !cfg.interaction_constraints_vector.is_empty(),
+            branch_features: vec![Vec::new(); num_leaves],
             slots,
             multi_val,
             team: ThreadTeam::new(resolve_num_threads(cfg.num_threads)),
@@ -154,6 +176,35 @@ impl SerialTreeLearner {
         &self.partition
     }
 
+    /// New leaf outputs for `old` from the rows assigned to each leaf by
+    /// `leaf_pred`: `decay * old + (1 - decay) * shrinkage * output`.
+    ///
+    /// upstream: `SerialTreeLearner::FitByExistingTree` after
+    /// `DataPartition::ResetByLeafPred` (rows of a leaf in row order). With
+    /// path smoothing upstream passes the leaf's parent node index as the
+    /// parent output, and so does this.
+    pub fn fit_by_existing_tree(&self, old: &Tree, leaf_pred: &[i32], grad: &[f32], hess: &[f32], decay: f64) -> Tree {
+        let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); old.num_leaves];
+        for (i, &l) in leaf_pred.iter().enumerate() {
+            rows_of[l as usize].push(i as u32);
+        }
+        let mut tree = old.clone();
+        for (leaf, rows) in rows_of.iter().enumerate() {
+            let mut sum_grad = 0.0f64;
+            let mut sum_hess = K_EPSILON;
+            for &r in rows {
+                sum_grad += grad[r as usize] as f64;
+                sum_hess += hess[r as usize] as f64;
+            }
+            let smooth = self.params.path_smooth > K_EPSILON && leaf > 0;
+            let parent = if smooth { old.leaf_parent[leaf] as f64 } else { 0.0 };
+            let output = split::refit_leaf_output(sum_grad, sum_hess, &self.params, smooth, rows.len() as i32, parent);
+            let new_output = output * old.shrinkage;
+            tree.set_leaf_output(leaf, decay * old.leaf_value[leaf] + (1.0 - decay) * new_output);
+        }
+        tree
+    }
+
     /// Add the last tree's leaf outputs to the training scores.
     pub fn add_leaf_outputs(&self, leaf_values: &[f64], score: &mut [f64]) {
         self.partition.add_leaf_outputs(&self.team, leaf_values, score);
@@ -176,6 +227,12 @@ impl SerialTreeLearner {
         }
         self.col_sampler.reset_by_tree();
         self.partition.init();
+        for b in self.branch_features.iter_mut() {
+            b.clear();
+        }
+        if let Some(c) = self.constraints.as_mut() {
+            c.reset();
+        }
         let root_cnt = self.partition.leaf_count(0);
         if self.multi_val.is_some() {
             self.gh.resize(n, [0.0; 2]);
@@ -279,8 +336,12 @@ impl SerialTreeLearner {
             None => bytree.to_vec(),
         };
         // upstream FindBestSplitsFromHistograms: smaller leaf first, then larger.
-        let s_node = self.col_sampler.get_by_node();
-        let l_node = if self.larger.leaf >= 0 { self.col_sampler.get_by_node() } else { Vec::new() };
+        let s_node = self.col_sampler.get_by_node(&self.branch_features[self.smaller.leaf as usize]);
+        let l_node = if self.larger.leaf >= 0 {
+            self.col_sampler.get_by_node(&self.branch_features[self.larger.leaf as usize])
+        } else {
+            Vec::new()
+        };
 
         let sm_leaf = self.smaller.leaf as usize;
         let use_indices = right >= 0 || self.partition.leaf_count(sm_leaf) != self.data.num_data();
@@ -316,6 +377,23 @@ impl SerialTreeLearner {
         let smaller_parent_output = parent_output(tree, &smaller, &params);
         let larger_parent_output =
             if larger.leaf >= 0 { parent_output(tree, &larger, &params) } else { 0.0 };
+        // upstream ComputeBestSplitForFeature: RecomputeConstraintsIfNeeded
+        // only touches the (leaf, feature) entry, so it can run up front.
+        if let Some(c) = self.constraints.as_mut() {
+            for f in 0..nf {
+                if is_used[f] && metas[f].bin_type == BinType::Numerical {
+                    c.recompute_if_needed(tree, f, sm_leaf, metas[f].num_bin as u32);
+                    if larger.leaf >= 0 {
+                        c.recompute_if_needed(tree, f, larger.leaf as usize, metas[f].num_bin as u32);
+                    }
+                }
+            }
+        }
+        let constraints = self.constraints.as_ref();
+        let penalty = |leaf: i32| {
+            if leaf >= 0 { monotone_split_gain_penalty(tree.leaf_depth[leaf as usize], self.monotone_penalty) } else { 0.0 }
+        };
+        let (s_penalty, l_penalty) = (penalty(smaller.leaf), penalty(larger.leaf));
 
         struct FeatResult {
             smaller_split: SplitInfo,
@@ -373,10 +451,14 @@ impl SerialTreeLearner {
                     smaller.sum_hessians,
                     smaller.num_data,
                     smaller_parent_output,
+                    constraints.map(|c| c.feature_constraint(smaller.leaf as usize, f)),
                     rand.as_deref_mut(),
                     &mut s_split,
                 );
                 s_split.feature = real;
+                if s_split.monotone_type != 0 {
+                    s_split.gain *= s_penalty;
+                }
                 let mut l_split = SplitInfo::default();
                 let mut l_ok = false;
                 if larger.leaf >= 0 {
@@ -390,10 +472,14 @@ impl SerialTreeLearner {
                         larger.sum_hessians,
                         larger.num_data,
                         larger_parent_output,
+                        constraints.map(|c| c.feature_constraint(larger.leaf as usize, f)),
                         rand.as_deref_mut(),
                         &mut l_split,
                     );
                     l_split.feature = real;
+                    if l_split.monotone_type != 0 {
+                        l_split.gain *= l_penalty;
+                    }
                 }
                 FeatResult {
                     smaller_split: s_split,
@@ -444,6 +530,9 @@ impl SerialTreeLearner {
         let meta = self.metas[inner];
         let num_bin = meta.num_bin.max(1) as u32;
         let numerical = meta.bin_type == BinType::Numerical;
+        if let Some(c) = self.constraints.as_mut() {
+            c.before_split(tree, best_leaf, next_leaf, info.monotone_type);
+        }
         // upstream: SerialTreeLearner::SplitInner (Common::ConstructBitset of
         // the bins, and of their categories via RealThreshold)
         let (lut, cat_bitset_inner, cat_bitset) = if numerical {
@@ -480,6 +569,13 @@ impl SerialTreeLearner {
         } else {
             tree.split_categorical(&args, &cat_bitset_inner, &cat_bitset)
         };
+        if self.track_branch_features {
+            // upstream: Tree::Split with track_branch_features_
+            let mut b = self.branch_features[best_leaf].clone();
+            b.push(info.feature);
+            self.branch_features[right] = b;
+            self.branch_features[best_leaf].push(info.feature);
+        }
         if let Some(t) = self.trace.as_mut() {
             t.splits.push((best_leaf, info.feature, info.threshold, info.gain));
         }
@@ -504,7 +600,71 @@ impl SerialTreeLearner {
             self.smaller = right_s;
             self.larger = left_s;
         }
+        if let Some(c) = self.constraints.as_mut() {
+            let leaves = c.update(
+                tree,
+                numerical,
+                best_leaf,
+                right,
+                info.monotone_type,
+                inner as i32,
+                &info,
+                &self.best_split_per_leaf,
+            );
+            for leaf in leaves {
+                self.recompute_best_split_for_leaf(tree, leaf);
+            }
+        }
         (best_leaf as i32, right as i32)
+    }
+
+    /// upstream: `SerialTreeLearner::RecomputeBestSplitForLeaf` (after a
+    /// monotone split tightened the constraints of `leaf`).
+    fn recompute_best_split_for_leaf(&mut self, tree: &Tree, leaf: usize) {
+        let Some(mut lh) = self.hist_pool[leaf].take() else { return };
+        let split = &self.best_split_per_leaf[leaf];
+        let sum_gradients = split.left_sum_gradient + split.right_sum_gradient;
+        let sum_hessians = split.left_sum_hessian + split.right_sum_hessian;
+        let num_data = split.left_count + split.right_count;
+        let params = self.params;
+        let parent_output =
+            if params.path_smooth > K_EPSILON { root_output(sum_gradients, sum_hessians, &params, num_data) } else { 0.0 };
+        let node_used = self.col_sampler.get_by_node(&self.branch_features[leaf]);
+        let penalty = monotone_split_gain_penalty(tree.leaf_depth[leaf], self.monotone_penalty);
+        let mut best = SplitInfo::default();
+        for f in 0..self.data.num_features() {
+            if !self.col_sampler.is_feature_used_bytree()[f] || !lh.splittable[f] {
+                continue;
+            }
+            let meta = self.metas[f];
+            let constraints = self.constraints.as_mut().expect("monotone constraints");
+            if meta.bin_type == BinType::Numerical {
+                constraints.recompute_if_needed(tree, f, leaf, meta.num_bin as u32);
+            }
+            let v = self.slots.views[f];
+            let mut new_split = SplitInfo::default();
+            lh.splittable[f] = find_best_threshold(
+                &lh.data[v.start..v.start + v.len],
+                &meta,
+                &params,
+                sum_gradients,
+                sum_hessians,
+                num_data,
+                parent_output,
+                Some(constraints.feature_constraint(leaf, f)),
+                self.extra_rands.as_mut().map(|r| &mut r[f]),
+                &mut new_split,
+            );
+            new_split.feature = self.data.real_feature_index(f) as i32;
+            if new_split.monotone_type != 0 {
+                new_split.gain *= penalty;
+            }
+            if new_split.better_than(&best) && node_used[f] {
+                best = new_split;
+            }
+        }
+        self.hist_pool[leaf] = Some(lh);
+        self.best_split_per_leaf[leaf] = best;
     }
 }
 

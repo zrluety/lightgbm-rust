@@ -5,12 +5,13 @@
 //! src/metric/map_metric.hpp.
 
 use crate::config::Config;
-use crate::consts::{K_EPSILON, neg_log_epsilon};
+use crate::consts::{K_EPSILON, K_ZERO_THRESHOLD, neg_log_epsilon};
 use crate::dataset::Metadata;
 use crate::dcg::{self, DcgCalculator};
 use crate::error::{LgbmError, Result};
 use crate::objective::Objective;
 use crate::objective::regression::safe_log;
+use crate::stdsort;
 use crate::threading::resolve_num_threads;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,8 +30,11 @@ pub enum MetricKind {
     BinaryLogloss,
     BinaryError,
     Auc,
+    AveragePrecision,
+    R2,
     MultiLogloss,
     MultiError,
+    AucMu,
     Ndcg,
     Map,
 }
@@ -52,8 +56,11 @@ impl MetricKind {
             "binary_logloss" => MetricKind::BinaryLogloss,
             "binary_error" => MetricKind::BinaryError,
             "auc" => MetricKind::Auc,
+            "average_precision" => MetricKind::AveragePrecision,
+            "r2" => MetricKind::R2,
             "multi_logloss" => MetricKind::MultiLogloss,
             "multi_error" => MetricKind::MultiError,
+            "auc_mu" => MetricKind::AucMu,
             "ndcg" => MetricKind::Ndcg,
             "map" => MetricKind::Map,
             other => return Err(LgbmError::Unsupported(format!("metric={other}"))),
@@ -76,15 +83,26 @@ impl MetricKind {
             MetricKind::BinaryLogloss => "binary_logloss",
             MetricKind::BinaryError => "binary_error",
             MetricKind::Auc => "auc",
+            MetricKind::AveragePrecision => "average_precision",
+            MetricKind::R2 => "r2",
             MetricKind::MultiLogloss => "multi_logloss",
             MetricKind::MultiError => "multi_error",
+            MetricKind::AucMu => "auc_mu",
             MetricKind::Ndcg => "ndcg",
             MetricKind::Map => "map",
         }
     }
 
     pub fn higher_better(&self) -> bool {
-        matches!(self, MetricKind::Auc | MetricKind::Ndcg | MetricKind::Map)
+        matches!(
+            self,
+            MetricKind::Auc
+                | MetricKind::AveragePrecision
+                | MetricKind::R2
+                | MetricKind::AucMu
+                | MetricKind::Ndcg
+                | MetricKind::Map
+        )
     }
 }
 
@@ -132,6 +150,20 @@ pub struct Metric {
     sum_weights: f64,
     params: LossParams,
     rank: Option<RankEval>,
+    /// R2: total sum of squares around the (weighted) label mean.
+    total_sum_squares: f64,
+    auc_mu: Option<AucMuState>,
+    num_threads: usize,
+}
+
+/// upstream `AucMuMetric` members set in the constructor / `Init`.
+#[derive(Debug, Clone)]
+struct AucMuState {
+    class_weights: Vec<Vec<f64>>,
+    /// Row indices sorted by class.
+    sorted_idx: Vec<usize>,
+    class_sizes: Vec<usize>,
+    class_data_weights: Vec<f64>,
 }
 
 /// upstream `MultiErrorMetric::LossOnPoint` / `MultiSoftmaxLoglossMetric::LossOnPoint`.
@@ -262,7 +294,62 @@ impl Metric {
             }
             _ => (vec![kind.name().to_string()], None),
         };
-        Ok(Self { kind, names, label: meta.label.clone(), weight: meta.weight.clone(), sum_weights, params, rank })
+        let total_sum_squares = if kind == MetricKind::R2 { Self::r2_init(meta, sum_weights) } else { 0.0 };
+        let auc_mu = if kind == MetricKind::AucMu { Some(Self::auc_mu_init(meta, cfg)?) } else { None };
+        Ok(Self {
+            kind,
+            names,
+            label: meta.label.clone(),
+            weight: meta.weight.clone(),
+            sum_weights,
+            params,
+            rank,
+            total_sum_squares,
+            auc_mu,
+            num_threads: resolve_num_threads(cfg.num_threads),
+        })
+    }
+
+    /// upstream `R2Metric::Init`.
+    fn r2_init(meta: &Metadata, sum_weights: f64) -> f64 {
+        let mut sum_label = 0.0f64;
+        match &meta.weight {
+            None => meta.label.iter().for_each(|&l| sum_label += l as f64),
+            // label * weight is a float product upstream
+            Some(w) => meta.label.iter().zip(w).for_each(|(&l, &w)| sum_label += (l * w) as f64),
+        }
+        let mean = sum_label / sum_weights;
+        let mut tss = 0.0f64;
+        for (i, &l) in meta.label.iter().enumerate() {
+            let diff = l as f64 - mean;
+            tss += match &meta.weight {
+                None => diff * diff,
+                Some(w) => diff * diff * w[i] as f64,
+            };
+        }
+        tss
+    }
+
+    /// upstream `AucMuMetric` constructor and `Init`.
+    fn auc_mu_init(meta: &Metadata, cfg: &Config) -> Result<AucMuState> {
+        let num_class = cfg.num_class.max(0) as usize;
+        if let Some(&l) = meta.label.iter().find(|&&l| !(l >= 0.0 && (l as usize) < num_class)) {
+            return Err(LgbmError::InvalidData(format!("Label must be in [0, {num_class}), but found {l} in label")));
+        }
+        let mut sorted_idx: Vec<usize> = (0..meta.label.len()).collect();
+        let label = &meta.label;
+        stdsort::parallel_sort_by(&mut sorted_idx, |&a, &b| label[a] < label[b], resolve_num_threads(cfg.num_threads));
+        let mut class_sizes = vec![0usize; num_class];
+        for &l in &meta.label {
+            class_sizes[l as usize] += 1;
+        }
+        let mut class_data_weights = vec![0.0f64; num_class];
+        if let Some(w) = &meta.weight {
+            for (&l, &w) in meta.label.iter().zip(w) {
+                class_data_weights[l as usize] += w as f64;
+            }
+        }
+        Ok(AucMuState { class_weights: cfg.auc_mu_weights_matrix.clone(), sorted_idx, class_sizes, class_data_weights })
     }
 
     /// upstream `NDCGMetric` / `MapMetric` constructor and `Init`.
@@ -343,6 +430,9 @@ impl Metric {
         let v = match self.kind {
             MetricKind::Ndcg | MetricKind::Map => return self.rank_eval(score),
             MetricKind::Auc => self.auc(score),
+            MetricKind::AveragePrecision => self.average_precision(score),
+            MetricKind::R2 => self.r2(score, objective),
+            MetricKind::AucMu => self.auc_mu_eval(score),
             MetricKind::BinaryLogloss | MetricKind::BinaryError => self.binary(score, objective),
             MetricKind::MultiLogloss | MetricKind::MultiError => self.multiclass(score, objective),
             kind => {
@@ -486,10 +576,15 @@ impl Metric {
         sum
     }
 
+    /// Row indices by descending score, in upstream's (unstable) tie order.
+    fn sorted_by_score_desc(&self, score: &[f64]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.label.len()).collect();
+        stdsort::parallel_sort_by(&mut idx, |&a, &b| score[a] > score[b], self.num_threads);
+        idx
+    }
+
     fn auc(&self, score: &[f64]) -> f64 {
-        let n = self.label.len();
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = self.sorted_by_score_desc(score);
         let mut cur_pos = 0.0f64;
         let mut sum_pos = 0.0f64;
         let mut accum = 0.0f64;
@@ -516,6 +611,127 @@ impl Metric {
         } else {
             1.0
         }
+    }
+
+    /// upstream `AveragePrecisionMetric::Eval`.
+    fn average_precision(&self, score: &[f64]) -> f64 {
+        let idx = self.sorted_by_score_desc(score);
+        let mut cur_actual_pos = 0.0f64;
+        let mut sum_actual_pos = 0.0f64;
+        let mut sum_pred_pos = 0.0f64;
+        let mut accum = 0.0f64;
+        let mut cur_neg = 0.0f64;
+        let mut threshold = score[idx[0]];
+        for &i in &idx {
+            let s = score[i];
+            if s != threshold {
+                threshold = s;
+                sum_actual_pos += cur_actual_pos;
+                sum_pred_pos += cur_actual_pos + cur_neg;
+                accum += cur_actual_pos * (sum_actual_pos / sum_pred_pos);
+                cur_neg = 0.0;
+                cur_actual_pos = 0.0;
+            }
+            let lbl = self.label[i];
+            match &self.weight {
+                // (label > 0) * weight is evaluated in float upstream
+                Some(w) => {
+                    cur_neg += ((lbl <= 0.0) as i32 as f32 * w[i]) as f64;
+                    cur_actual_pos += ((lbl > 0.0) as i32 as f32 * w[i]) as f64;
+                }
+                None => {
+                    cur_neg += (lbl <= 0.0) as i32 as f64;
+                    cur_actual_pos += (lbl > 0.0) as i32 as f64;
+                }
+            }
+        }
+        sum_actual_pos += cur_actual_pos;
+        sum_pred_pos += cur_actual_pos + cur_neg;
+        accum += cur_actual_pos * (sum_actual_pos / sum_pred_pos);
+        if sum_actual_pos > 0.0 && sum_actual_pos != self.sum_weights { accum / sum_actual_pos } else { 1.0 }
+    }
+
+    /// upstream `R2Metric::Eval`.
+    fn r2(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
+        let rss = self.weighted_sum(score, objective, |label, s| {
+            let diff = label as f64 - s;
+            diff * diff
+        });
+        if self.total_sum_squares.abs() < K_ZERO_THRESHOLD {
+            return if rss.abs() < K_ZERO_THRESHOLD { 1.0 } else { 0.0 };
+        }
+        1.0 - rss / self.total_sum_squares
+    }
+
+    /// upstream `AucMuMetric::Eval` (notation of Kleiman & Page, 2019).
+    fn auc_mu_eval(&self, score: &[f64]) -> f64 {
+        let st = self.auc_mu.as_ref().expect("auc_mu state");
+        let n = self.label.len();
+        let nc = st.class_sizes.len();
+        let mut s_mat = vec![vec![0.0f64; nc]; nc];
+        let mut dist: Vec<(usize, f64)> = Vec::new();
+        let mut i_start = 0usize;
+        for i in 0..nc {
+            let mut j_start = i_start + st.class_sizes[i];
+            for j in i + 1..nc {
+                let curr_v: Vec<f64> = (0..nc).map(|k| st.class_weights[i][k] - st.class_weights[j][k]).collect();
+                let t1 = curr_v[i] - curr_v[j];
+                dist.clear();
+                let rows_i = &st.sorted_idx[i_start..i_start + st.class_sizes[i]];
+                let rows_j = &st.sorted_idx[j_start..j_start + st.class_sizes[j]];
+                for &a in rows_i.iter().chain(rows_j) {
+                    let mut v_a = 0.0f64;
+                    for (m, &cv) in curr_v.iter().enumerate() {
+                        v_a += cv * score[n * m + a];
+                    }
+                    dist.push((a, t1 * v_a));
+                }
+                let label = &self.label;
+                stdsort::parallel_sort_by(
+                    &mut dist,
+                    |a, b| {
+                        if (a.1 - b.1).abs() < K_EPSILON { label[a.0] > label[b.0] } else { a.1 < b.1 }
+                    },
+                    self.num_threads,
+                );
+                let (mut num_j, mut last_j_dist, mut num_current_j) = (0.0f64, 0.0f64, 0.0f64);
+                for &(a, curr_dist) in &dist {
+                    let w = self.weight.as_ref().map(|w| w[a] as f64);
+                    if self.label[a] as usize == i {
+                        let c = if (curr_dist - last_j_dist).abs() < K_EPSILON {
+                            num_j - 0.5 * num_current_j
+                        } else {
+                            num_j
+                        };
+                        s_mat[i][j] += match w {
+                            Some(w) => w * c,
+                            None => c,
+                        };
+                    } else {
+                        let w = w.unwrap_or(1.0);
+                        num_j += w;
+                        if (curr_dist - last_j_dist).abs() < K_EPSILON {
+                            num_current_j += w;
+                        } else {
+                            last_j_dist = curr_dist;
+                            num_current_j = w;
+                        }
+                    }
+                }
+                j_start += st.class_sizes[j];
+            }
+            i_start += st.class_sizes[i];
+        }
+        let mut ans = 0.0f64;
+        for (i, row) in s_mat.iter().enumerate() {
+            for (j, &s) in row.iter().enumerate().skip(i + 1) {
+                ans += match self.weight {
+                    None => (s / st.class_sizes[i] as f64) / st.class_sizes[j] as f64,
+                    Some(_) => (s / st.class_data_weights[i]) / st.class_data_weights[j],
+                };
+            }
+        }
+        (2.0 * ans / nc as f64) / (nc as f64 - 1.0)
     }
 }
 

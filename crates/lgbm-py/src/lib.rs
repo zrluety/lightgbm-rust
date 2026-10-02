@@ -223,15 +223,23 @@ impl RsDataset {
         Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings })
     }
 
-    /// upstream: `LGBM_DatasetCreateFromFile` for binary files. With a
-    /// reference the file is loaded as is, without parameter checks.
+    /// upstream: `LGBM_DatasetCreateFromFile` (binary or text file). With a
+    /// reference, text files are binned with its mappers and binary files
+    /// are loaded without parameter checks.
     #[staticmethod]
-    #[pyo3(signature = (filename, params, has_reference=false))]
-    fn load_binary(py: Python<'_>, filename: String, params: Vec<(String, String)>, has_reference: bool) -> PyResult<Self> {
+    #[pyo3(signature = (filename, params, reference=None))]
+    fn load_file(
+        py: Python<'_>,
+        filename: String,
+        params: Vec<(String, String)>,
+        reference: Option<PyRef<'_, RsDataset>>,
+    ) -> PyResult<Self> {
         let cfg = config_from(params)?;
-        let check = (!has_reference).then_some(&cfg);
-        let ds = detached(py, || Dataset::load_binary(&filename, check))?;
-        Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings.clone() })
+        let reference = reference.map(|r| r.inner.clone());
+        let ds = detached(py, || Dataset::load_file(&filename, &cfg, reference.as_deref()))?;
+        let mut warnings = cfg.warnings;
+        warnings.extend(ds.warnings().iter().cloned());
+        Ok(Self { inner: Arc::new(ds), warnings })
     }
 
     /// upstream: `LGBM_DatasetSaveBinary`. Returns upstream's warnings.
@@ -441,6 +449,13 @@ impl RsBooster {
         detached(py, || b.train_one_iter(Some((g, h))))
     }
 
+    /// Refit the leaf outputs from row-major leaf indices (`nrow x ncol`).
+    fn refit(&mut self, py: Python<'_>, leaf_preds: PyReadonlyArray1<'_, i32>, nrow: usize, ncol: usize) -> PyResult<()> {
+        let lp = slice_of(&leaf_preds, "leaf_preds")?;
+        let b = &mut self.inner;
+        detached(py, || b.refit_tree(lp, nrow, ncol))
+    }
+
     fn rollback_one_iter(&mut self) -> PyResult<()> {
         guarded(|| self.inner.rollback_one_iter())
     }
@@ -462,7 +477,10 @@ impl RsBooster {
     /// Current scores of training data (`data_idx == 0`) or validation set
     /// `data_idx - 1`, class-major. With `transform`, the objective's output
     /// transformation is applied (upstream `__inner_predict`).
-    fn inner_predict<'py>(&self, py: Python<'py>, data_idx: usize, transform: bool) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn inner_predict<'py>(&mut self, py: Python<'py>, data_idx: usize, transform: bool) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        if data_idx == 0 {
+            self.inner.training_score();
+        }
         let scores = if data_idx == 0 {
             self.inner.train_scores()
         } else {
@@ -513,6 +531,41 @@ impl RsBooster {
             detached(py, || g.predict_matrix_early_stop(&view, kind, start_iteration, num_iteration, early_stop))?;
         let width = if nrows == 0 { 0 } else { out.len() / nrows };
         out.into_pyarray(py).reshape([nrows, width])
+    }
+
+    /// Predict a text data file into `result_filename`; returns upstream's warnings.
+    ///
+    /// upstream: `LGBM_BoosterPredictForFile`.
+    #[pyo3(signature = (data_filename, result_filename, data_has_header, kind="normal", start_iteration=0, num_iteration=-1, params=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn predict_file(
+        &self,
+        py: Python<'_>,
+        data_filename: String,
+        result_filename: String,
+        data_has_header: bool,
+        kind: &str,
+        start_iteration: i32,
+        num_iteration: i32,
+        params: Vec<(String, String)>,
+    ) -> PyResult<Vec<String>> {
+        let kind = predict_kind(kind)?;
+        let cfg = config_from(params)?;
+        let g = &self.inner;
+        let early_stop = guarded(|| {
+            g.prediction_early_stop(cfg.pred_early_stop, cfg.pred_early_stop_freq, cfg.pred_early_stop_margin)
+        })?;
+        let opts = lgbm_core::predict::PredictFileOptions {
+            header: data_has_header,
+            disable_shape_check: cfg.predict_disable_shape_check,
+            precise_float_parser: cfg.precise_float_parser,
+            early_stop,
+        };
+        let mut warnings = cfg.warnings.clone();
+        warnings.extend(detached(py, || {
+            g.predict_file(&data_filename, &result_filename, kind, start_iteration, num_iteration, opts)
+        })?);
+        Ok(warnings)
     }
 
     /// SHAP values of a CSR/CSC matrix as one `(indptr, indices, data)` per

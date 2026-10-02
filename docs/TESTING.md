@@ -59,6 +59,7 @@ PowerShell expands `$` inside double quotes, so put anything non-trivial in a sc
   - feature importance and metrics;
   - early stopping;
   - model cross-loading in both directions.
+- **Text files (`test_text_files.py`).** Both engines load the same CSV, TSV and LibSVM files (written with side files into a temporary directory) and predict from them; error cases compare upstream's message with ours after removing our `invalid data:` / `invalid parameter:` prefix and upstream's source location in `CHECK` messages.
 - **Tolerances.** These come from `tests/tolerances.toml`; every entry has a written rationale. A comparison that exceeds its tolerance fails, and no tolerance is widened to make a test pass.
 - **Report.** Every comparison, including its max abs/rel diff and whether it was bitwise exact, goes to `tests/report/differential.json`.
 

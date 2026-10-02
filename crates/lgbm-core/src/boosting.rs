@@ -2,7 +2,7 @@
 //!
 //! upstream: src/boosting/gbdt.cpp (`GBDT::Init`, `TrainOneIter`,
 //! `BoostFromAverage`, `UpdateScore`, `GetEvalAt`, `InitPredict`,
-//! `PredictRaw`, `FeatureImportance`).
+//! `PredictRaw`, `FeatureImportance`) and src/boosting/dart.hpp.
 
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ use crate::error::{LgbmError, Result};
 use crate::learner::SerialTreeLearner;
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
+use crate::random::Random;
 use crate::sample_strategy::SampleStrategy;
 use crate::threading::resolve_num_threads;
 use crate::tree::Tree;
@@ -52,6 +53,40 @@ struct TrainState {
     metrics: Vec<Metric>,
     valid: Vec<ValidSet>,
     iter: usize,
+    /// upstream `shrinkage_rate_`.
+    shrinkage_rate: f64,
+    dart: Option<Dart>,
+    /// Random forest: the constant scores the gradients were computed at
+    /// (upstream `RF::init_scores_`).
+    rf_init_scores: Option<Vec<f64>>,
+}
+
+/// upstream: src/boosting/dart.hpp (`DART` members).
+struct Dart {
+    tree_weight: Vec<f64>,
+    sum_weight: f64,
+    /// Iteration indices (including merged init iterations).
+    drop_index: Vec<usize>,
+    random_for_drop: Random,
+    is_update_score_cur_iter: bool,
+}
+
+impl Dart {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            tree_weight: Vec::new(),
+            sum_weight: 0.0,
+            drop_index: Vec::new(),
+            random_for_drop: Random::new(cfg.drop_seed),
+            // upstream leaves this uninitialized until the first TrainOneIter
+            is_update_score_cur_iter: false,
+        }
+    }
+}
+
+/// `std::min` (returns `a` when either is NaN).
+fn cpp_min(a: f64, b: f64) -> f64 {
+    if b < a { b } else { a }
 }
 
 pub struct Gbdt {
@@ -65,8 +100,16 @@ pub struct Gbdt {
     pub(crate) max_feature_idx: i32,
     pub(crate) feature_names: Vec<String>,
     pub(crate) feature_infos: Vec<String>,
+    /// By real feature index; empty when unconstrained.
+    pub(crate) monotone_constraints: Vec<i8>,
     /// Iterations merged from an init model (upstream `num_init_iteration_`).
     num_init_iteration: usize,
+    /// Normal predictions are divided by the number of iterations (random
+    /// forest models; upstream `average_output_`).
+    pub(crate) average_output: bool,
+    /// Trained with `boosting=rf` (upstream `RF`, which never uses
+    /// prediction early stopping); models loaded from text are plain GBDT.
+    pub(crate) is_rf: bool,
     train: Option<TrainState>,
     pool: Option<Arc<rayon::ThreadPool>>,
     warnings: Vec<String>,
@@ -97,7 +140,10 @@ impl Gbdt {
             max_feature_idx: -1,
             feature_names: Vec::new(),
             feature_infos: Vec::new(),
+            monotone_constraints: Vec::new(),
             num_init_iteration: 0,
+            average_output: false,
+            is_rf: false,
             train: None,
             pool: None,
             warnings: Vec::new(),
@@ -129,6 +175,41 @@ impl Gbdt {
             o.init(&train.metadata, n)?;
             warnings = o.take_warnings();
         }
+        let is_rf = config.boosting == "rf";
+        // upstream: RF::Init, before GBDT::Init
+        if is_rf
+            && config.data_sample_strategy == "bagging"
+            && !((config.bagging_freq > 0 && config.bagging_fraction < 1.0 && config.bagging_fraction > 0.0)
+                || (config.feature_fraction < 1.0 && config.feature_fraction > 0.0))
+        {
+            return Err(LgbmError::InvalidParameter(
+                "Check failed: (config->bagging_freq > 0 && config->bagging_fraction < 1.0f && \
+                 config->bagging_fraction > 0.0f) || (config->feature_fraction < 1.0f && \
+                 config->feature_fraction > 0.0f)"
+                    .into(),
+            ));
+        }
+        if is_rf && config.bagging_by_query {
+            return Err(LgbmError::Unsupported(
+                "boosting=rf with bagging_by_query (upstream RF bags in TrainOneIter, outside GBDT::Boosting)".into(),
+            ));
+        }
+        // upstream: GBDT::Init
+        if !config.monotone_constraints.is_empty() {
+            if train.num_total_features() != config.monotone_constraints.len() {
+                return Err(LgbmError::InvalidParameter(
+                    "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
+                     (config->monotone_constraints.size())"
+                        .into(),
+                ));
+            }
+            if let Some(o) = objective.as_ref().filter(|o| o.is_renew_tree_output()) {
+                return Err(LgbmError::InvalidParameter(format!(
+                    "Cannot use ``monotone_constraints`` in {} objective, please disable it.",
+                    o.name()
+                )));
+            }
+        }
         // upstream GBDT::Init: num_class trees per iteration unless the objective says otherwise
         let num_class = config.num_class.max(1) as usize;
         let ntpi = objective.as_ref().map_or(num_class, |o| o.num_outputs());
@@ -159,16 +240,32 @@ impl Gbdt {
         let sampler =
             SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
         let learner = SerialTreeLearner::new(train.clone(), &config);
-        Ok(Self {
+        if is_rf {
+            // upstream: RF::Init after GBDT::Init
+            if has_init_score {
+                return Err(LgbmError::InvalidParameter(
+                    "Check failed: (train_data->metadata().init_score()) == (nullptr)".into(),
+                ));
+            }
+            if objective.is_none() {
+                return Err(LgbmError::InvalidParameter(
+                    "RF mode do not support custom objective function, please use built-in objectives.".into(),
+                ));
+            }
+        }
+        let mut g = Self {
             num_tree_per_iteration: ntpi,
             num_class,
-            label_index: 0,
+            label_index: train.label_idx,
             max_feature_idx: train.num_total_features() as i32 - 1,
             feature_names: train.feature_names().to_vec(),
             feature_infos: train.feature_infos(),
+            monotone_constraints: config.monotone_constraints.clone(),
             objective,
             models: Vec::new(),
             num_init_iteration: 0,
+            average_output: is_rf,
+            is_rf,
             train: Some(TrainState {
                 data: train,
                 learner,
@@ -181,12 +278,41 @@ impl Gbdt {
                 metrics,
                 valid: Vec::new(),
                 iter: 0,
+                shrinkage_rate: if is_rf { 1.0 } else { config.learning_rate },
+                dart: (config.boosting == "dart").then(|| Dart::new(&config)),
+                rf_init_scores: None,
             }),
             config: Some(config),
             loaded_parameters: None,
             pool,
             warnings,
-        })
+        };
+        if is_rf {
+            g.rf_boosting();
+        }
+        Ok(g)
+    }
+
+    /// Gradients at the constant initial scores, computed once.
+    ///
+    /// upstream: `RF::Boosting`.
+    fn rf_boosting(&mut self) {
+        let ntpi = self.num_tree_per_iteration;
+        let init: Vec<f64> = (0..ntpi).map(|k| self.boost_from_average_impl(k, false)).collect();
+        let st = self.train.as_mut().expect("training state");
+        let obj = self.objective.as_ref().expect("RF objective");
+        let n = st.data.num_data();
+        let mut tmp = vec![0.0; n * ntpi];
+        for (k, &v) in init.iter().enumerate() {
+            tmp[k * n..(k + 1) * n].fill(v);
+        }
+        let view = ScoreView { scores: &tmp, num_data: n, num_outputs: ntpi };
+        let mut compute = || obj.gradients(view, &mut st.grad, &mut st.hess);
+        match &self.pool {
+            Some(p) => p.install(compute),
+            None => compute(),
+        }
+        st.rf_init_scores = Some(init);
     }
 
     fn make_metrics(config: &Config, data: &Dataset) -> Result<Vec<Metric>> {
@@ -230,6 +356,14 @@ impl Gbdt {
         for (i, t) in self.models.iter().enumerate().skip(start) {
             let k = i % ntpi;
             t.add_prediction_to_score(&data, &mut scores[k * n..(k + 1) * n]);
+        }
+        // upstream: RF::AddValidDataset (1.0f / iterations, a float division)
+        let iters = st.iter + self.num_init_iteration;
+        if self.is_rf && iters > 0 {
+            let f = (1.0f32 / iters as f32) as f64;
+            for s in scores.iter_mut() {
+                *s *= f;
+            }
         }
         st.valid.push(ValidSet { name: name.to_string(), data, scores, metrics });
         Ok(())
@@ -301,6 +435,10 @@ impl Gbdt {
 
     /// upstream: `GBDT::BoostFromAverage`.
     fn boost_from_average(&mut self, k: usize) -> f64 {
+        self.boost_from_average_impl(k, true)
+    }
+
+    fn boost_from_average_impl(&mut self, k: usize, update_scorer: bool) -> f64 {
         let cfg = self.config.as_ref().expect("training config");
         let st = self.train.as_mut().expect("training state");
         if self.models.is_empty() && !st.has_init_score {
@@ -308,10 +446,12 @@ impl Gbdt {
                 if cfg.boost_from_average || st.data.num_features() == 0 {
                     let init = obj.boost_from_score(k);
                     if init.abs() > K_EPSILON {
-                        add_const(&mut st.scores, k, st.data.num_data(), init);
-                        for v in st.valid.iter_mut() {
-                            let n = v.data.num_data();
-                            add_const(&mut v.scores, k, n, init);
+                        if update_scorer {
+                            add_const(&mut st.scores, k, st.data.num_data(), init);
+                            for v in st.valid.iter_mut() {
+                                let n = v.data.num_data();
+                                add_const(&mut v.scores, k, n, init);
+                            }
                         }
                         return init;
                     }
@@ -321,6 +461,251 @@ impl Gbdt {
         0.0
     }
 
+    /// Training scores as the objective sees them; for DART this drops the
+    /// iteration's trees first (once per iteration).
+    ///
+    /// upstream: `GBDT::GetTrainingScore` / `DART::GetTrainingScore`.
+    pub fn training_score(&mut self) -> Option<&[f64]> {
+        let pending = self
+            .train
+            .as_ref()
+            .and_then(|s| s.dart.as_ref())
+            .is_some_and(|d| !d.is_update_score_cur_iter);
+        if pending {
+            self.dart_dropping_trees();
+            self.train.as_mut().unwrap().dart.as_mut().unwrap().is_update_score_cur_iter = true;
+        }
+        self.train_scores()
+    }
+
+    /// upstream: `DART::DroppingTrees`.
+    fn dart_dropping_trees(&mut self) {
+        let Gbdt { config, models, train, pool, num_tree_per_iteration, num_init_iteration, .. } = self;
+        let cfg = config.as_ref().expect("training config");
+        let st = train.as_mut().expect("training state");
+        let d = st.dart.as_mut().expect("dart state");
+        let (ntpi, init) = (*num_tree_per_iteration, *num_init_iteration);
+        d.drop_index.clear();
+        // static_cast<size_t>(max_drop): a negative limit never stops the draw
+        let max_drop = cfg.max_drop as usize;
+        let is_skip = (d.random_for_drop.next_float() as f64) < cfg.skip_drop;
+        if !is_skip {
+            let mut drop_rate = cfg.drop_rate;
+            if !cfg.uniform_drop {
+                let inv_average_weight = d.tree_weight.len() as f64 / d.sum_weight;
+                if cfg.max_drop > 0 {
+                    drop_rate = cpp_min(drop_rate, cfg.max_drop as f64 * inv_average_weight / d.sum_weight);
+                }
+                for i in 0..st.iter {
+                    if (d.random_for_drop.next_float() as f64) < drop_rate * d.tree_weight[i] * inv_average_weight {
+                        d.drop_index.push(init + i);
+                        if d.drop_index.len() >= max_drop {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if cfg.max_drop > 0 {
+                    drop_rate = cpp_min(drop_rate, cfg.max_drop as f64 / st.iter as f64);
+                }
+                for i in 0..st.iter {
+                    if (d.random_for_drop.next_float() as f64) < drop_rate {
+                        d.drop_index.push(init + i);
+                        if d.drop_index.len() >= max_drop {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let n = st.data.num_data();
+        let mut drop = || {
+            for &i in &d.drop_index {
+                for k in 0..ntpi {
+                    let t = &mut models[i * ntpi + k];
+                    t.shrink(-1.0);
+                    t.add_prediction_to_score(&st.data, &mut st.scores[k * n..(k + 1) * n]);
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.install(drop),
+            None => drop(),
+        }
+        let num_drop = d.drop_index.len() as f64;
+        st.shrinkage_rate = if !cfg.xgboost_dart_mode {
+            cfg.learning_rate / (1.0 + num_drop)
+        } else if d.drop_index.is_empty() {
+            cfg.learning_rate
+        } else {
+            cfg.learning_rate / (cfg.learning_rate + num_drop)
+        };
+    }
+
+    /// upstream: `DART::Normalize` (dropped trees end at `k / (k + 1)` of
+    /// their weight, or `k / (k + learning_rate)` in xgboost mode).
+    fn dart_normalize(&mut self) {
+        let Gbdt { config, models, train, pool, num_tree_per_iteration, num_init_iteration, .. } = self;
+        let cfg = config.as_ref().expect("training config");
+        let st = train.as_mut().expect("training state");
+        let d = st.dart.as_mut().expect("dart state");
+        let (ntpi, init) = (*num_tree_per_iteration, *num_init_iteration);
+        let k = d.drop_index.len() as f64;
+        let lr = cfg.learning_rate;
+        let (valid_rate, train_rate, weight_den) = if !cfg.xgboost_dart_mode {
+            (1.0 / (k + 1.0), -k, k + 1.0)
+        } else {
+            (st.shrinkage_rate, -k / lr, k + lr)
+        };
+        let n = st.data.num_data();
+        let mut normalize = || {
+            for &i in &d.drop_index {
+                for c in 0..ntpi {
+                    let t = &mut models[i * ntpi + c];
+                    t.shrink(valid_rate);
+                    for v in st.valid.iter_mut() {
+                        let vn = v.data.num_data();
+                        t.add_prediction_to_score(&v.data, &mut v.scores[c * vn..(c + 1) * vn]);
+                    }
+                    t.shrink(train_rate);
+                    t.add_prediction_to_score(&st.data, &mut st.scores[c * n..(c + 1) * n]);
+                }
+                if !cfg.uniform_drop {
+                    d.sum_weight -= d.tree_weight[i - init] * (1.0 / weight_den);
+                    d.tree_weight[i - init] *= k / weight_den;
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.install(normalize),
+            None => normalize(),
+        }
+    }
+
+    /// upstream: `Booster::ResetConfig` -> `GBDT::ResetConfig` (and
+    /// `DART::ResetConfig`, which reseeds the drop generator).
+    fn reset_config(&mut self) {
+        let Some(cfg) = self.config.as_ref() else { return };
+        if let Some(st) = self.train.as_mut() {
+            st.shrinkage_rate = cfg.learning_rate;
+            if let Some(d) = st.dart.as_mut() {
+                d.random_for_drop = Random::new(cfg.drop_seed);
+                d.sum_weight = 0.0;
+            }
+        }
+    }
+
+    /// One random-forest iteration: a tree on the fixed gradients, then the
+    /// scores are kept as the average over iterations.
+    ///
+    /// upstream: `RF::TrainOneIter`.
+    fn rf_train_one_iter(&mut self, custom: Option<(&[f32], &[f32])>) -> Result<bool> {
+        if custom.is_some() {
+            return Err(LgbmError::InvalidParameter("Check failed: (gradients) == (nullptr)".into()));
+        }
+        let ntpi = self.num_tree_per_iteration;
+        let init_iter = self.num_init_iteration;
+        {
+            let st = self.train.as_mut().unwrap();
+            if let Some(s) = st.sampler.as_mut() {
+                if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
+                    st.learner.set_bagging_data(Some(s.in_bag()));
+                }
+            }
+        }
+        for k in 0..ntpi {
+            let st = self.train.as_mut().unwrap();
+            let n = st.data.num_data();
+            let offset = k * n;
+            let init_score = st.rf_init_scores.as_ref().expect("RF init scores")[k];
+            let mut tree = if st.class_need_train[k] && st.data.num_features() > 0 {
+                let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
+                let learner = &mut st.learner;
+                match &self.pool {
+                    Some(p) => p.install(|| learner.train(g, h)),
+                    None => learner.train(g, h),
+                }
+            } else {
+                Tree::new(2)
+            };
+            let iters = (st.iter + init_iter) as f64;
+            if tree.num_leaves > 1 {
+                if let Some(obj) = self.objective.as_ref().filter(|o| o.is_renew_tree_output()) {
+                    // residuals against the constant initial score
+                    let part = st.learner.partition();
+                    let scores = vec![init_score; n];
+                    let renew = || -> Vec<Option<f64>> {
+                        use rayon::prelude::*;
+                        (0..tree.num_leaves)
+                            .into_par_iter()
+                            .map(|leaf| {
+                                let idx = part.indices_on_leaf(leaf);
+                                (!idx.is_empty()).then(|| obj.renew_leaf_output(idx, &scores))
+                            })
+                            .collect()
+                    };
+                    let outputs = match &self.pool {
+                        Some(p) => p.install(renew),
+                        None => renew(),
+                    };
+                    for (leaf, v) in outputs.into_iter().enumerate() {
+                        if let Some(v) = v {
+                            tree.set_leaf_output(leaf, v);
+                        }
+                    }
+                }
+                if init_score.abs() > K_EPSILON {
+                    tree.add_bias(init_score);
+                }
+                multiply_score(st, k, iters);
+                update_score(st, &self.pool, &tree, k);
+                multiply_score(st, k, 1.0 / (iters + 1.0));
+            } else if self.models.len() < ntpi {
+                let output = if !st.class_need_train[k] {
+                    match self.objective.as_ref() {
+                        Some(o) => o.boost_from_score(k),
+                        None => init_score,
+                    }
+                } else {
+                    0.0
+                };
+                tree.as_constant(output, n as i32);
+                multiply_score(st, k, iters);
+                update_score(st, &self.pool, &tree, k);
+                multiply_score(st, k, 1.0 / (iters + 1.0));
+            }
+            self.models.push(tree);
+        }
+        self.train.as_mut().unwrap().iter += 1;
+        Ok(false)
+    }
+
+    /// upstream: `RF::RollbackOneIter`.
+    fn rf_rollback_one_iter(&mut self) {
+        let ntpi = self.num_tree_per_iteration;
+        let st = self.train.as_mut().expect("training state");
+        if st.iter == 0 {
+            return;
+        }
+        let iters = st.iter + self.num_init_iteration;
+        let cur_iter = iters - 1;
+        let n = st.data.num_data();
+        for k in 0..ntpi {
+            let t = &mut self.models[cur_iter * ntpi + k];
+            t.shrink(-1.0);
+            multiply_score(st, k, iters as f64);
+            t.add_prediction_to_score(&st.data, &mut st.scores[k * n..(k + 1) * n]);
+            for v in st.valid.iter_mut() {
+                let vn = v.data.num_data();
+                t.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
+            }
+            // upstream: 1.0f / (iter_ + num_init_iteration_ - 1), a float division
+            multiply_score(st, k, (1.0f32 / cur_iter as f32) as f64);
+        }
+        self.models.truncate(self.models.len() - ntpi);
+        st.iter -= 1;
+    }
+
     /// One boosting iteration. With `custom = Some((grad, hess))` the given
     /// gradients are used instead of the objective's. Returns `true` when
     /// training cannot continue (no tree could split).
@@ -328,9 +713,15 @@ impl Gbdt {
         if self.train.is_none() {
             return Err(LgbmError::InvalidData("booster has no training data".into()));
         }
+        if self.is_rf {
+            return self.rf_train_one_iter(custom);
+        }
         let ntpi = self.num_tree_per_iteration;
         let n = self.train.as_ref().unwrap().data.num_data();
         let by_query = self.config.as_ref().is_some_and(|c| c.bagging_by_query);
+        if let Some(d) = self.train.as_mut().unwrap().dart.as_mut() {
+            d.is_update_score_cur_iter = false;
+        }
         let mut init_scores = vec![0.0; ntpi];
         match custom {
             None => {
@@ -342,16 +733,17 @@ impl Gbdt {
                 for (k, s) in init_scores.iter_mut().enumerate() {
                     *s = self.boost_from_average(k);
                 }
-                let st = self.train.as_mut().unwrap();
-                let obj = self.objective.as_ref().unwrap();
-                // upstream GBDT::Boosting: query bagging precedes the gradients
                 if by_query {
+                    let st = self.train.as_mut().unwrap();
                     if let Some(s) = st.sampler.as_mut() {
                         if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
                             st.learner.set_bagging_data(Some(s.in_bag()));
                         }
                     }
                 }
+                self.training_score();
+                let st = self.train.as_mut().unwrap();
+                let obj = self.objective.as_ref().unwrap();
                 let sampled = st.sampler.as_ref().and_then(|s| s.sampled_queries());
                 let view = ScoreView { scores: &st.scores, num_data: n, num_outputs: ntpi };
                 let pool = self.pool.clone();
@@ -455,23 +847,9 @@ impl Gbdt {
                         }
                     }
                 }
-                tree.shrink(cfg.learning_rate);
                 let st = self.train.as_mut().unwrap();
-                let mut update = || {
-                    st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
-                    // upstream GBDT::UpdateScore: out-of-bag rows are predicted
-                    if let Some(s) = st.sampler.as_ref().filter(|s| s.bag_cnt() < n) {
-                        tree.add_prediction_to_score_rows(&st.data, s.out_of_bag(), &mut st.scores[offset..offset + n]);
-                    }
-                    for v in st.valid.iter_mut() {
-                        let vn = v.data.num_data();
-                        tree.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
-                    }
-                };
-                match &self.pool {
-                    Some(p) => p.install(update),
-                    None => update(),
-                }
+                tree.shrink(st.shrinkage_rate);
+                update_score(st, &self.pool, &tree, k);
                 if init_scores[k].abs() > K_EPSILON {
                     tree.add_bias(init_scores[k]);
                 }
@@ -502,12 +880,98 @@ impl Gbdt {
             return Ok(true);
         }
         self.train.as_mut().unwrap().iter += 1;
+        if self.train.as_ref().unwrap().dart.is_some() {
+            self.dart_normalize();
+            let st = self.train.as_mut().unwrap();
+            let rate = st.shrinkage_rate;
+            let d = st.dart.as_mut().unwrap();
+            if !cfg.uniform_drop {
+                d.tree_weight.push(rate);
+                d.sum_weight += rate;
+            }
+        }
         Ok(false)
+    }
+
+    /// Refit every tree's leaf outputs on the training data, keeping the
+    /// structure. `leaf_preds` is row-major `nrow x ncol`: the leaf of every
+    /// training row in every tree (as from `predict(pred_leaf=True)`).
+    ///
+    /// upstream: `GBDT::RefitTree`.
+    pub fn refit_tree(&mut self, leaf_preds: &[i32], nrow: usize, ncol: usize) -> Result<()> {
+        let check = |ok: bool, what: &str| {
+            if ok { Ok(()) } else { Err(LgbmError::InvalidData(format!("Check failed: {what}"))) }
+        };
+        check(nrow * ncol > 0, "(nrow * ncol) > (0)")?;
+        let st = self.train.as_ref().ok_or_else(|| LgbmError::InvalidData("booster has no training data".into()))?;
+        let n = st.data.num_data();
+        check(n == nrow, "(static_cast<size_t>(num_data_)) == (nrow)")?;
+        check(self.models.len() == ncol, "(models_.size()) == (ncol)")?;
+        check(leaf_preds.len() == nrow * ncol, "(leaf_preds.size()) == (nrow * ncol)")?;
+        if self.objective.is_none() {
+            return Err(LgbmError::InvalidParameter("No objective function provided".into()));
+        }
+        let cfg = self.config.clone().expect("training config");
+        if cfg.bagging_by_query {
+            return Err(LgbmError::Unsupported("Booster.refit() with bagging_by_query".into()));
+        }
+        let ntpi = self.num_tree_per_iteration;
+        let num_iterations = self.models.len() / ntpi;
+        let mut leaf_pred = vec![0i32; n];
+        for iter in 0..num_iterations {
+            // upstream GBDT::Boosting; RF::Boosting with trees present starts from zero scores
+            {
+                let st = self.train.as_mut().unwrap();
+                let obj = self.objective.as_ref().unwrap();
+                let zeros;
+                let scores = if self.is_rf {
+                    zeros = vec![0.0; n * ntpi];
+                    &zeros
+                } else {
+                    &st.scores
+                };
+                let view = ScoreView { scores, num_data: n, num_outputs: ntpi };
+                let mut compute = || obj.gradients(view, &mut st.grad, &mut st.hess);
+                match &self.pool {
+                    Some(p) => p.install(compute),
+                    None => compute(),
+                }
+            }
+            for k in 0..ntpi {
+                let mi = iter * ntpi + k;
+                let num_leaves = self.models[mi].num_leaves;
+                for (i, l) in leaf_pred.iter_mut().enumerate() {
+                    *l = leaf_preds[i * ncol + mi];
+                    check(
+                        *l >= 0 && (*l as usize) < num_leaves,
+                        "(leaf_pred[i]) < (models_[model_index]->num_leaves())",
+                    )?;
+                }
+                let st = self.train.as_mut().unwrap();
+                let offset = k * n;
+                let tree = st.learner.fit_by_existing_tree(
+                    &self.models[mi],
+                    &leaf_pred,
+                    &st.grad[offset..offset + n],
+                    &st.hess[offset..offset + n],
+                    cfg.refit_decay_rate,
+                );
+                for (s, &l) in st.scores[offset..offset + n].iter_mut().zip(&leaf_pred) {
+                    *s += tree.leaf_value[l as usize];
+                }
+                self.models[mi] = tree;
+            }
+        }
+        Ok(())
     }
 
     /// Remove the last iteration's trees and their score contributions.
     pub fn rollback_one_iter(&mut self) -> Result<()> {
         let ntpi = self.num_tree_per_iteration;
+        if self.is_rf && self.train.is_some() {
+            self.rf_rollback_one_iter();
+            return Ok(());
+        }
         let st = self.train.as_mut().ok_or_else(|| LgbmError::InvalidData("not training".into()))?;
         if st.iter == 0 || self.models.len() < ntpi {
             return Ok(());
@@ -587,7 +1051,8 @@ impl Gbdt {
     /// early stopping triggered, else 0.
     pub fn train(&mut self) -> Result<usize> {
         let cfg = self.config.clone().ok_or_else(|| LgbmError::Internal("no config".into()))?;
-        let rounds = cfg.early_stopping_round.max(0) as usize;
+        // upstream: DART::EvalAndCheckEarlyStopping never stops
+        let rounds = if cfg.boosting == "dart" { 0 } else { cfg.early_stopping_round.max(0) as usize };
         let mut best: Vec<f64> = Vec::new();
         let mut best_iter: Vec<usize> = Vec::new();
         for _ in 0..cfg.num_iterations.max(0) {
@@ -668,6 +1133,7 @@ impl Gbdt {
         if let Some(c) = self.config.as_mut() {
             c.objective = "custom".into();
         }
+        self.reset_config();
     }
 
     /// upstream: `Booster::ResetConfig` with only `learning_rate` changed
@@ -678,6 +1144,7 @@ impl Gbdt {
         };
         c.learning_rate = crate::config::parse_checked_double("learning_rate", value)?;
         c.explicit.insert("learning_rate".into(), value.trim().to_string());
+        self.reset_config();
         Ok(())
     }
 
@@ -690,6 +1157,41 @@ impl Gbdt {
     pub fn set_num_threads(&mut self, n: i32) -> Result<()> {
         self.pool = build_pool(n)?;
         Ok(())
+    }
+}
+
+/// upstream: `GBDT::UpdateScore` (in-bag rows from the learner's partition,
+/// out-of-bag rows and validation sets by prediction).
+fn update_score(st: &mut TrainState, pool: &Option<Arc<rayon::ThreadPool>>, tree: &Tree, k: usize) {
+    let n = st.data.num_data();
+    let offset = k * n;
+    let mut update = || {
+        st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
+        if let Some(s) = st.sampler.as_ref().filter(|s| s.bag_cnt() < n) {
+            tree.add_prediction_to_score_rows(&st.data, s.out_of_bag(), &mut st.scores[offset..offset + n]);
+        }
+        for v in st.valid.iter_mut() {
+            let vn = v.data.num_data();
+            tree.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
+        }
+    };
+    match pool {
+        Some(p) => p.install(update),
+        None => update(),
+    }
+}
+
+/// upstream: `RF::MultiplyScore` (training and validation scores of class `k`).
+fn multiply_score(st: &mut TrainState, k: usize, val: f64) {
+    let n = st.data.num_data();
+    for s in &mut st.scores[k * n..(k + 1) * n] {
+        *s *= val;
+    }
+    for v in st.valid.iter_mut() {
+        let vn = v.data.num_data();
+        for s in &mut v.scores[k * vn..(k + 1) * vn] {
+            *s *= val;
+        }
     }
 }
 

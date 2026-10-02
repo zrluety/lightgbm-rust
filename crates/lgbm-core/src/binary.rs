@@ -22,8 +22,8 @@ use crate::error::{LgbmError, Result};
 
 /// First bytes of a lightgbm-rust binary dataset file.
 pub const MAGIC: &[u8; 16] = b"\x89LGBMRS-DATASET\n";
-/// Version written by this build; the only version it reads.
-pub const FORMAT_VERSION: u32 = 1;
+/// Version written by this build. Version 1 (without `label_idx`) is also read.
+pub const FORMAT_VERSION: u32 = 2;
 /// upstream `Dataset::binary_file_token`.
 pub const UPSTREAM_TOKEN: &[u8] = b"______LightGBM_Binary_File_Token______\n";
 
@@ -42,13 +42,24 @@ pub enum DataFileKind {
 /// before `filename`. Returns the file to read and its kind.
 pub fn detect_data_file(filename: &str) -> Result<(PathBuf, DataFileKind)> {
     let with_bin = PathBuf::from(format!("{filename}.bin"));
-    let (path, mut file) = match std::fs::File::open(&with_bin) {
+    let (path, file) = match std::fs::File::open(&with_bin) {
         Ok(f) => (with_bin, f),
         Err(_) => match std::fs::File::open(filename) {
             Ok(f) => (PathBuf::from(filename), f),
             Err(_) => return Err(LgbmError::InvalidData(format!("Cannot open data file {filename}"))),
         },
     };
+    file_kind(path, file)
+}
+
+/// Like [`detect_data_file`], for `filename` only (no `.bin` lookup).
+pub fn detect_data_file_exact(filename: &str) -> Result<(PathBuf, DataFileKind)> {
+    let file = std::fs::File::open(filename)
+        .map_err(|_| LgbmError::InvalidData(format!("Cannot open data file {filename}")))?;
+    file_kind(PathBuf::from(filename), file)
+}
+
+fn file_kind(path: PathBuf, mut file: std::fs::File) -> Result<(PathBuf, DataFileKind)> {
     let mut head = vec![0u8; UPSTREAM_TOKEN.len()];
     let mut got = 0;
     while got < head.len() {
@@ -310,6 +321,7 @@ impl Dataset {
         w.i32(c.bin_construct_sample_cnt);
         w.bool(c.use_missing);
         w.bool(c.zero_as_missing);
+        w.i32(self.label_idx);
         for name in &self.feature_names {
             w.str(name);
         }
@@ -388,9 +400,9 @@ impl Dataset {
             )));
         }
         let version = r.u32("header")?;
-        if version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&version) {
             return Err(LgbmError::Unsupported(format!(
-                "binary dataset format version {version} in {} (this build reads version {FORMAT_VERSION})",
+                "binary dataset format version {version} in {} (this build reads versions 1 to {FORMAT_VERSION})",
                 path.display()
             )));
         }
@@ -403,6 +415,7 @@ impl Dataset {
             use_missing: r.bool("header")?,
             zero_as_missing: r.bool("header")?,
         };
+        let label_idx = if version >= 2 { r.i32("header")? } else { 0 };
         let feature_names = (0..ncol).map(|_| r.str("feature names")).collect::<Result<Vec<_>>>()?;
         let bin_mappers = (0..ncol).map(|_| read_bin_mapper(&mut r)).collect::<Result<Vec<_>>>()?;
         let used_features = r.usize_vec("feature map")?;
@@ -476,6 +489,7 @@ impl Dataset {
             feature_names,
             bin_config,
             data_filename: None,
+            label_idx,
             warnings: Vec::new(),
         })
     }
@@ -596,10 +610,18 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(Dataset::from_binary_bytes(&extra, Path::new("t")).is_err());
-        let mut v2 = bytes.clone();
-        v2[MAGIC.len()] = 2;
-        let err = Dataset::from_binary_bytes(&v2, Path::new("t")).unwrap_err();
+        let mut next = bytes.clone();
+        next[MAGIC.len()] = FORMAT_VERSION as u8 + 1;
+        let err = Dataset::from_binary_bytes(&next, Path::new("t")).unwrap_err();
         assert!(matches!(err, LgbmError::Unsupported(_)), "{err}");
+        // version 1 has no label_idx (after magic, version, 2 sizes, 3 i32 and 2 bool fields)
+        let at = MAGIC.len() + 4 + 8 + 8 + 12 + 2;
+        let mut v1 = bytes.clone();
+        v1[MAGIC.len()] = 1;
+        v1.drain(at..at + 4);
+        let back = Dataset::from_binary_bytes(&v1, Path::new("t")).unwrap();
+        assert_eq!(back.label_idx, 0);
+        assert_eq!(back.metadata.label, sample().metadata.label);
     }
 
     #[test]

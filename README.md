@@ -2,7 +2,15 @@
 
 A pure-Rust implementation of [LightGBM](https://github.com/lightgbm-org/LightGBM) gradient boosting, with a LightGBM-like Python API.
 
-**Status: pre-alpha (milestones 1–3 of 7).** The implemented subset is CPU-only, takes dense numerical features, and supports L2 regression and binary classification. Within that subset, on every differential test case run so far, results are bitwise identical to upstream LightGBM 4.7.0:
+**Status: pre-alpha.** The implemented subset is CPU-only. It covers:
+- GBDT, DART and random forest
+- the regression, binary, multiclass and ranking objectives
+- numerical and categorical features
+- monotone and interaction constraints
+- `refit`, `cv` and the scikit-learn estimators
+- input from arrays, pandas, pyarrow, polars, scipy.sparse, and binary or CSV/TSV/LibSVM files
+
+Within that subset, on every single-threaded differential test case run so far, results are bitwise identical to upstream LightGBM 4.7.0:
 - bins
 - gradients
 - trees
@@ -20,7 +28,7 @@ The engine does not wrap, link to, or call the upstream C++ library. Upstream Li
 |---|---|
 | `crates/lgbm-core` | the engine: pure Rust, no Python dependency, usable as a Rust library |
 | `crates/lgbm-py` | PyO3 bindings (`lightgbm_rust._lightgbm_rust`, abi3, Python ≥ 3.11) |
-| `python/lightgbm_rust` | the Python API: `Dataset`, `Booster`, `train`, callbacks, `register_logger` |
+| `python/lightgbm_rust` | the Python API: `Dataset`, `Booster`, `train`, `cv`, callbacks, the scikit-learn estimators, `register_logger` |
 | `tests/differential` | comparisons against LightGBM 4.7.0 (tolerances in `tests/tolerances.toml`) |
 | `tests/upstream_runner` | runs upstream's Python test suite, unmodified, against `lightgbm_rust` |
 | `tests/report/summary.md` | latest generated test and benchmark report |

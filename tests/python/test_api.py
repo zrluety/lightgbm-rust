@@ -47,13 +47,25 @@ def test_pandas_input_uses_column_names():
 
 def test_unsupported_features_raise_lightgbm_error(tmp_path):
     X, y = _data()
-    for params in ({"objective": "cross_entropy"}, {"cegb_tradeoff": 0.5}, {"boosting": "dart"}):
+    for params in ({"objective": "cross_entropy"}, {"cegb_tradeoff": 0.5}, {"use_quantized_grad": True}):
         with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet"):
             lgb.train({**BASE, **params}, lgb.Dataset(X, label=y), 2)
     text = tmp_path / "train.csv"
     text.write_text("1,0.5,0.25\n0,0.1,0.2\n")
-    with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet: training from files"):
-        lgb.Dataset(text).construct()
+    with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet: parameter `parser_config_file"):
+        lgb.Dataset(text, params={"parser_config_file": "parser.json"}).construct()
+
+
+def test_text_file_matches_in_memory(tmp_path):
+    X, y = _data()
+    path = tmp_path / "train.tsv"
+    np.savetxt(path, np.column_stack([y, X]), delimiter="\t", fmt="%.17g")
+    # the default (legacy) parser is not correctly rounded, so only the precise one reads back the same doubles
+    params = {**BASE, "objective": "binary", "precise_float_parser": True}
+    from_file = lgb.train(params, lgb.Dataset(path), 5)
+    in_memory = lgb.train(params, lgb.Dataset(X, label=y), 5)
+    assert from_file.model_to_string() == in_memory.model_to_string()
+    np.testing.assert_array_equal(from_file.predict(path), in_memory.predict(X))
 
 
 def test_invalid_parameter_message_matches_upstream_check():

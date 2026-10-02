@@ -7,9 +7,11 @@ use rayon::prelude::*;
 use crate::binning::MissingType;
 use crate::boosting::{Gbdt, PredictKind};
 use crate::consts::K_ZERO_THRESHOLD;
-use crate::dataset::DenseMatrix;
-use crate::matrix::Matrix;
+use crate::dataset::{DenseMatrix, DenseValues};
+use crate::fmt::fmt_g17;
+use crate::matrix::{Matrix, SparseIndptr, SparseMatrix};
 use crate::error::{LgbmError, Result};
+use crate::text_parser::{self, Parser};
 use crate::tree::{Tree, find_in_bitset};
 
 /// Rows walked through each tree together, so that their (independent)
@@ -174,7 +176,8 @@ impl Gbdt {
     /// only when requested and the objective does not need accurate
     /// predictions (binary, multiclass, ranking).
     pub fn prediction_early_stop(&self, enabled: bool, freq: i32, margin: f64) -> Result<Option<PredictEarlyStop>> {
-        if !enabled || self.objective.as_ref().is_none_or(|o| o.need_accurate_prediction()) {
+        // upstream: RF::NeedAccuratePrediction is always true
+        if !enabled || self.is_rf || self.objective.as_ref().is_none_or(|o| o.need_accurate_prediction()) {
             return Ok(None);
         }
         if freq <= 0 {
@@ -246,6 +249,7 @@ impl Gbdt {
         let flat: Vec<FlatTree> = models.iter().map(|t| FlatTree::new(t, ncol)).collect();
         let mut out = vec![0.0; mat.nrows() * width];
         let objective = self.objective.as_ref();
+        let average_output = self.average_output;
         let reader = mat.rows();
         self.install(|| {
             out.par_chunks_mut((width * BLOCK).max(1)).enumerate().for_each_init(
@@ -302,6 +306,12 @@ impl Gbdt {
                                     if active == 0 {
                                         break;
                                     }
+                                }
+                            }
+                            // upstream GBDT::Predict: average_output divides by the window size
+                            if kind == PredictKind::Normal && average_output {
+                                for v in raw.iter_mut() {
+                                    *v /= num as f64;
                                 }
                             }
                             for r in 0..nb {
@@ -479,6 +489,152 @@ impl Gbdt {
             );
         });
     }
+}
+
+/// Options of [`Gbdt::predict_file`] besides the prediction kind and window.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredictFileOptions {
+    /// The data file has a header line; its names select the model's features.
+    pub header: bool,
+    pub disable_shape_check: bool,
+    pub precise_float_parser: bool,
+    pub early_stop: Option<PredictEarlyStop>,
+}
+
+/// Lines predicted per batch in [`Gbdt::predict_file`].
+const FILE_BATCH: usize = 1 << 16;
+
+impl Gbdt {
+    /// Predict the rows of a CSV, TSV or LibSVM file and write one line per
+    /// row to `result_filename`: the row's outputs, tab-separated, with 17
+    /// significant digits. Returns upstream's warnings.
+    ///
+    /// upstream: `Predictor::Predict(data_filename, result_filename, ...)`.
+    pub fn predict_file(
+        &self,
+        data_filename: &str,
+        result_filename: &str,
+        kind: PredictKind,
+        start_iteration: i32,
+        num_iteration: i32,
+        opts: PredictFileOptions,
+    ) -> Result<Vec<String>> {
+        use std::io::Write;
+        let file = std::fs::File::create(result_filename).map_err(|_| {
+            LgbmError::InvalidParameter(format!("Prediction results file {result_filename} cannot be created"))
+        })?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut warnings = Vec::new();
+        if let Ok((_, crate::binary::DataFileKind::Binary)) = crate::binary::detect_data_file_exact(data_filename) {
+            // upstream's format detection rejects its own binary files with this message
+            return Err(LgbmError::InvalidData(
+                "Unknown format of training data. Only CSV, TSV, and LibSVM (zero-based) formatted text files are supported."
+                    .into(),
+            ));
+        }
+        let nf = self.num_feature();
+        let label_idx = if opts.header { -1 } else { self.label_index };
+        let parser =
+            Parser::create(data_filename, opts.header, nf as i32, label_idx, opts.precise_float_parser, &mut warnings)?;
+        if !opts.header && !opts.disable_shape_check && parser.num_features() != nf as i32 {
+            return Err(LgbmError::InvalidData(format!(
+                "The number of features in data ({}) is not the same as it was in training data ({nf}).\n\
+                 You can set ``predict_disable_shape_check=true`` to discard this error, but please be aware what you are doing.",
+                parser.num_features()
+            )));
+        }
+        let mut skip = 0;
+        let mut remap: Option<Vec<i32>> = None;
+        if opts.header {
+            let (first_line, bytes) = text_parser::read_header(data_filename)?;
+            skip = bytes;
+            let words: Vec<&str> = first_line.split(['\t', ',']).filter(|t| !t.is_empty()).collect();
+            let mut position = std::collections::HashMap::new();
+            for (i, w) in words.iter().enumerate() {
+                if position.insert(*w, i).is_some() {
+                    return Err(LgbmError::InvalidData(format!("Feature ({w}) appears more than one time.")));
+                }
+            }
+            let mut remapper = vec![-1i32; (parser.num_features().max(0) as usize).max(words.len())];
+            for (i, name) in self.feature_names.iter().enumerate() {
+                match position.get(name.as_str()) {
+                    Some(&p) => remapper[p] = i as i32,
+                    None => warnings.push(format!(
+                        "Feature ({name}) is missed in data file. If it is weight/query/group/ignore_column, \
+                         you can ignore this warning."
+                    )),
+                }
+            }
+            if remapper.iter().enumerate().any(|(i, &r)| r >= 0 && r != i as i32) {
+                remap = Some(remapper);
+            }
+        }
+        let predict_batch = |lines: &[Vec<u8>], writer: &mut std::io::BufWriter<std::fs::File>| -> Result<()> {
+            let rows: Vec<Vec<(i32, f64)>> = lines
+                .par_iter()
+                .map(|l| {
+                    let mut f = Vec::new();
+                    parser.parse_line(l, &mut f)?;
+                    if let Some(r) = &remap {
+                        f = f
+                            .into_iter()
+                            .filter_map(|(i, v)| {
+                                r.get(i as usize).copied().filter(|&j| i >= 0 && j >= 0).map(|j| (j, v))
+                            })
+                            .collect();
+                    }
+                    Ok(f)
+                })
+                .collect::<Result<_>>()?;
+            let mut indptr = vec![0i64];
+            let (mut indices, mut values) = (Vec::new(), Vec::new());
+            for row in &rows {
+                for &(i, v) in row {
+                    if i >= 0 && (i as usize) < nf {
+                        indices.push(i);
+                        values.push(v);
+                    }
+                }
+                indptr.push(indices.len() as i64);
+            }
+            let mat = Matrix::Sparse(SparseMatrix::new(
+                SparseIndptr::I64(&indptr),
+                &indices,
+                DenseValues::F64(&values),
+                rows.len(),
+                nf,
+                true,
+            )?);
+            let out = self.predict_matrix_early_stop(&mat, kind, start_iteration, num_iteration, opts.early_stop)?;
+            let width = if rows.is_empty() { 0 } else { out.len() / rows.len() };
+            let text: Vec<String> = out
+                .par_chunks(width.max(1))
+                .map(|r| r.iter().map(|&v| fmt_g17(v)).collect::<Vec<_>>().join("\t"))
+                .collect();
+            for t in text {
+                writer.write_all(t.as_bytes()).and_then(|_| writer.write_all(b"\n")).map_err(write_err)?;
+            }
+            Ok(())
+        };
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        text_parser::for_each_line(data_filename, skip, |l| {
+            batch.push(l.to_vec());
+            if batch.len() == FILE_BATCH {
+                predict_batch(&batch, &mut writer)?;
+                batch.clear();
+            }
+            Ok(())
+        })?;
+        if !batch.is_empty() {
+            predict_batch(&batch, &mut writer)?;
+        }
+        writer.flush().map_err(write_err)?;
+        Ok(warnings)
+    }
+}
+
+fn write_err(e: std::io::Error) -> LgbmError {
+    LgbmError::InvalidData(format!("Could not write prediction results: {e}"))
 }
 
 /// One class's SHAP values from [`Gbdt::predict_contrib_sparse`].

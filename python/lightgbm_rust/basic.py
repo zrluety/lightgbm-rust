@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
@@ -215,6 +217,9 @@ def _is_numeric(obj: Any) -> bool:
 
 
 def _to_string(x: Any) -> str:
+    if isinstance(x, list):
+        val_list = ",".join(str(val) for val in x)
+        return f"[{val_list}]"
     if isinstance(x, (float, np.floating)) and float(x).is_integer():
         return str(int(x))
     return str(x)
@@ -240,42 +245,48 @@ def _parse_loaded_params(text: Optional[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if not text:
         return out
-    _ConfigAliases._load()
-    types = _ConfigAliases.types or {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not (line.startswith("[") and line.endswith("]")) or ": " not in line:
+    for line in (s for s in text.split("\n") if s):
+        # upstream splits on every ':' and drops empty pieces
+        pair = [s for s in line.split(":") if s]
+        if len(pair) < 2 or pair[1] == " ]":
             continue
-        key, value = line[1:-1].split(": ", 1)
-        if value == "":
-            continue
-        if key not in types:
+        key = pair[0][1:]
+        value = pair[1][1:-1]
+        t = _loaded_param_type(key)
+        if t is None:
             _log_warning(f"Ignoring unrecognized parameter '{key}' found in model string.")
             continue
-        t = types[key]
         try:
-            if key == "interaction_constraints":  # upstream type: vector<vector<int>>
-                out[key] = json.loads(f"[{value}]")
+            if t == "string":
+                out[key] = value
             elif t == "int":
                 out[key] = int(value)
             elif t == "double":
-                out[key] = float(value)
+                # upstream streams the double with the default precision (6 significant digits)
+                out[key] = json.loads("%g" % float(value))
             elif t == "bool":
                 out[key] = value == "1"
-            elif t.startswith("std::vector<"):
-                inner = t[len("std::vector<") : -1]
-                items = [v for v in value.split(",") if v != ""]
-                if inner in ("int", "int8_t", "int32_t"):
-                    out[key] = [int(v) for v in items]
-                elif inner == "double":
-                    out[key] = [float(v) for v in items]
-                else:
-                    out[key] = items
+            elif t == "vector<string>":
+                out[key] = [s for s in value.split(",") if s]
             else:
-                out[key] = value
+                out[key] = json.loads(f"[{value}]")
         except ValueError:
             out[key] = value
     return out
+
+
+def _loaded_param_type(key: str) -> Optional[str]:
+    """upstream: ``Config::ParameterTypes`` (differs from the C++ member types for a few keys)."""
+    if key in ("categorical_feature", "ignore_column"):
+        return "vector<int>"
+    if key == "interaction_constraints":
+        return "vector<vector<int>>"
+    _ConfigAliases._load()
+    t = (_ConfigAliases.types or {}).get(key)
+    if t is None:
+        return None
+    t = t.replace("std::", "").replace("int8_t", "int").replace("int32_t", "int")
+    return t
 
 
 # --------------------------------------------------------------------------- inputs
@@ -420,19 +431,6 @@ def _matrix_nrows(mat: Union[np.ndarray, _SparseParts]) -> int:
     return mat[4] if isinstance(mat, tuple) else mat.shape[0]
 
 
-# first bytes of lightgbm-rust (crates/lgbm-core/src/binary.rs) and upstream binary dataset files
-_BINARY_DATASET_PREFIXES = (b"\x89LGBMRS-DATASET\n", b"______LightGBM_Binary_File_Token______\n")
-
-
-def _is_binary_dataset_file(path: Union[str, Path]) -> bool:
-    try:
-        with open(path, "rb") as f:
-            head = f.read(64)
-    except OSError:
-        return False
-    return any(head.startswith(p) for p in _BINARY_DATASET_PREFIXES)
-
-
 def _to_float_matrix(
     data: Any,
     feature_name: Any = "auto",
@@ -447,13 +445,6 @@ def _to_float_matrix(
     go through ``_data_from_pandas`` with ``pandas_categorical``.
     """
     names: Optional[List[str]] = None
-    if isinstance(data, (str, Path)):
-        if predict and _is_binary_dataset_file(data):
-            # upstream's text parser rejects binary dataset files
-            raise LightGBMError(
-                "Unknown format of training data. Only CSV, TSV, and LibSVM (zero-based) formatted text files are supported."
-            )
-        raise _unsupported("training from files" if not predict else "predicting from files")
     if _is_scipy_sparse(data):
         return _sparse_input(data, predict), None
     if isinstance(data, Sequence) or (isinstance(data, list) and data and isinstance(data[0], Sequence)):
@@ -708,6 +699,7 @@ class _InnerPredictor:
             raw_score=raw_score,
             pred_leaf=pred_leaf,
             pred_contrib=pred_contrib,
+            data_has_header=data_has_header,
             validate_features=validate_features,
             **early_stop,
         )
@@ -866,8 +858,7 @@ class Dataset:
         return self
 
     def _construct_from_file(self, data: Union[str, Path], feature_name: Any, categorical_feature: Any) -> "Dataset":
-        # upstream: Dataset._lazy_init with a file path (LGBM_DatasetCreateFromFile); only
-        # lightgbm-rust binary files can be read
+        # upstream: Dataset._lazy_init with a file path (LGBM_DatasetCreateFromFile)
         self._has_non_default_feature_names = feature_name != "auto"
         params = self.params
         for key in params.keys():
@@ -895,10 +886,8 @@ class Dataset:
                             _log_warning(f"{cat_alias} in param dict is overridden.")
                         params.pop(cat_alias, None)
                 params["categorical_column"] = sorted(categorical_indices)
-        has_reference = self.reference is not None
-        if has_reference:
-            self.reference.construct()
-        self._rs = _rs.RsDataset.load_binary(str(data), _param_dict_to_pairs(params), has_reference)
+        ref_rs = self.reference.construct()._rs if self.reference is not None else None
+        self._rs = _rs.RsDataset.load_file(str(data), _param_dict_to_pairs(params), ref_rs)
         _emit_engine_warnings(self._rs.config_warnings(), params)
         if self.label is not None:
             self.set_label(self.label)
@@ -1012,10 +1001,15 @@ class Dataset:
     def _set_init_score_by_predictor(
         self, predictor: Optional[_InnerPredictor], data: Any, used_indices: Optional[Union[List[int], np.ndarray]]
     ) -> "Dataset":
-        # upstream: Dataset._set_init_score_by_predictor (file inputs are not supported)
+        # upstream: Dataset._set_init_score_by_predictor
+        data_has_header = False
+        if isinstance(data, (str, Path)) and self.params is not None:
+            data_has_header = any(self.params.get(alias, False) for alias in _ConfigAliases.get("header"))
         num_data = self.num_data()
         if predictor is not None:
-            init_score = np.asarray(predictor.predict(data=data, raw_score=True), dtype=np.float64).ravel()
+            init_score = np.asarray(
+                predictor.predict(data=data, raw_score=True, data_has_header=data_has_header), dtype=np.float64
+            ).ravel()
             if used_indices is not None:
                 assert not self._need_slice
             if predictor.num_class > 1:
@@ -1600,7 +1594,9 @@ class Booster:
             all_valid = self._rs.eval_valid()
             per_set = len(all_valid) // max(self._rs.num_valid(), 1)
             builtin = all_valid[(data_idx - 1) * per_set : data_idx * per_set]
-        for _, metric, value, higher in builtin:
+        for _, metric, value, _higher in builtin:
+            # upstream's Python wrapper decides by name, so r2 counts as lower-is-better there
+            higher = metric.startswith(("auc", "ndcg@", "map@", "average_precision"))
             ret.append(EvalResult(data_name, metric, value, higher))
         if feval is not None:
             fevals = feval if isinstance(feval, list) else [feval]
@@ -1676,15 +1672,35 @@ class Booster:
             for i, (e, got) in enumerate(zip(expected, names)):
                 if e != got:
                     raise LightGBMError(f"Expected '{e}' at position {i} but found '{got}'")
-        mat, _ = _to_float_matrix(data, predict=True, pandas_categorical=self.pandas_categorical)
+        # upstream: _InnerPredictor.predict (contrib overrides leaf, which overrides raw)
+        kind = "contrib" if pred_contrib else ("leaf" if pred_leaf else ("raw" if raw_score else "normal"))
         assert self._rs is not None
+        if isinstance(data, (str, Path)):
+            # upstream: LGBM_BoosterPredictForFile into a temporary file, read back with np.loadtxt
+            with tempfile.TemporaryDirectory() as tmp:
+                result = os.path.join(tmp, "predictions.txt")
+                _emit_engine_warnings(
+                    self._rs.predict_file(
+                        str(data), result, bool(data_has_header), kind, int(start_iteration), int(num_iteration),
+                        pred_params,
+                    ),
+                    kwargs,
+                )
+                preds = np.loadtxt(result, dtype=np.float64)
+            nrow = preds.shape[0]
+            if pred_leaf:
+                preds = preds.astype(np.int32)
+            if preds.size != nrow or pred_leaf or pred_contrib:
+                if preds.size % nrow == 0:
+                    return preds.reshape(nrow, -1)
+                raise ValueError(f"Length of predict result ({preds.size}) cannot be divide nrow ({nrow})")
+            return preds
+        mat, _ = _to_float_matrix(data, predict=True, pandas_categorical=self.pandas_categorical)
         if pred_contrib and isinstance(mat, tuple):
             sparse = self._predict_contrib_sparse(mat, int(start_iteration), int(num_iteration))
             if pred_leaf:
                 return [m.astype(np.int32) for m in sparse] if isinstance(sparse, list) else sparse.astype(np.int32)
             return sparse
-        # upstream: _InnerPredictor.predict (contrib overrides leaf, which overrides raw)
-        kind = "contrib" if pred_contrib else ("leaf" if pred_leaf else ("raw" if raw_score else "normal"))
         preds = self._rs.predict(mat, kind, int(start_iteration), int(num_iteration), pred_params)
         nrow = _matrix_nrows(mat)
         flat = preds.ravel()
@@ -1737,7 +1753,6 @@ class Booster:
 
     def model_from_string(self, model_str: str) -> "Booster":
         self._load_model_str(model_str)
-        self.__set_objective_to_none = False
         return self
 
     def dump_model(
@@ -1877,8 +1892,88 @@ class Booster:
 
         return pd_DataFrame(model_list, columns=model_list[0].keys())
 
-    def refit(self, *args: Any, **kwargs: Any) -> "Booster":
-        raise _unsupported("Booster.refit()")
+    def refit(
+        self,
+        data: Any,
+        label: Any,
+        decay_rate: float = 0.9,
+        reference: Optional[Dataset] = None,
+        weight: Any = None,
+        group: Any = None,
+        init_score: Any = None,
+        feature_name: Any = "auto",
+        categorical_feature: Any = "auto",
+        dataset_params: Optional[Dict[str, Any]] = None,
+        free_raw_data: bool = True,
+        validate_features: bool = False,
+        **kwargs: Any,
+    ) -> "Booster":
+        """Refit the existing Booster by new data (port of upstream ``Booster.refit``)."""
+        if self.__set_objective_to_none:
+            raise LightGBMError("Cannot refit due to null objective function.")
+        if dataset_params is None:
+            dataset_params = {}
+        predictor = _InnerPredictor.from_booster(booster=self, pred_parameter=copy.deepcopy(kwargs))
+        leaf_preds: np.ndarray = predictor.predict(
+            data=data,
+            start_iteration=-1,
+            pred_leaf=True,
+            validate_features=validate_features,
+        )
+        nrow, ncol = leaf_preds.shape
+        new_params = _choose_param_value(
+            main_param_name="linear_tree",
+            params=self.params,
+            default_value=None,
+        )
+        # linear trees are not implemented, so no model here is linear
+        new_params["linear_tree"] = False
+        new_params.update(dataset_params)
+
+        # 'categorical_feature' can end up in self.params when a Booster
+        # is created from a model string or file... pre-process to ensure it's passed
+        # via a keyword argument to the Dataset constructor instead of 'params'.
+        new_params = _choose_param_value(
+            main_param_name="categorical_feature",
+            params=new_params,
+            default_value=None,
+        )
+        cat_features_from_params = new_params.pop("categorical_feature")
+
+        # reconcile params and keyword argument
+        if cat_features_from_params:
+            if categorical_feature == "auto":
+                categorical_feature = cat_features_from_params
+            elif cat_features_from_params != categorical_feature:
+                error_msg = (
+                    "'categorical_feature' value passed to Booster.refit() is different from  "
+                    "'categorical_feature' value found in Booster.params. "
+                    "Preferring the value passed via keyword argument. "
+                    "Using refit() to change which columns are treated as categorical is not supported. "
+                    "If you have a valid use case for this, please open an issue at https://github.com/lightgbm-org/LightGBM/issues."
+                )
+                raise LightGBMError(error_msg)
+
+        train_set = Dataset(
+            data=data,
+            label=label,
+            reference=reference,
+            weight=weight,
+            group=group,
+            init_score=init_score,
+            feature_name=feature_name,
+            categorical_feature=categorical_feature,
+            params=new_params,
+            free_raw_data=free_raw_data,
+        )
+        new_params["refit_decay_rate"] = decay_rate
+        new_booster = Booster(new_params, train_set)
+        assert new_booster._rs is not None and predictor._booster._rs is not None
+        new_booster._rs.merge_from(predictor._booster._rs)
+        leaf_preds = np.ascontiguousarray(leaf_preds.reshape(-1), dtype=np.int32)
+        new_booster._rs.refit(leaf_preds, nrow, ncol)
+        new_booster._network = self._network
+        return new_booster
 
     def shuffle_models(self, *args: Any, **kwargs: Any) -> "Booster":
         raise _unsupported("Booster.shuffle_models()")

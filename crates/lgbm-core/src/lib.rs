@@ -18,6 +18,7 @@ pub mod boosting;
 pub mod config;
 pub mod consts;
 pub mod dataset;
+pub mod dataset_loader;
 pub mod dcg;
 pub mod error;
 pub mod feature_groups;
@@ -32,6 +33,8 @@ pub mod objective;
 pub mod predict;
 pub mod random;
 pub mod sample_strategy;
+pub mod stdsort;
+pub mod text_parser;
 pub mod threading;
 pub mod tree;
 

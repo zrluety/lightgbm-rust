@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::consts::K_ZERO_THRESHOLD;
 use crate::error::{LgbmError, Result};
 use crate::random::Random;
 
@@ -100,6 +101,10 @@ const HONORED: &[&str] = &[
     "lambdarank_position_bias_regularization", "eval_at", "categorical_feature",
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
     "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin", "bagging_by_query",
+    "auc_mu_weights", "refit_decay_rate", "monotone_constraints", "monotone_constraints_method",
+    "monotone_penalty", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
+    "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
+    "group_column", "ignore_column", "precise_float_parser", "two_round",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -108,23 +113,16 @@ const NO_EFFECT: &[&str] = &[
     "num_threads", "deterministic", "histogram_pool_size",
     "verbosity", "is_enable_sparse", "enable_bundle", "metric_freq", "snapshot_freq",
     "output_model", "input_model", "output_result", "data", "valid", "config", "task",
-    "header", "label_column", "weight_column", "group_column", "ignore_column",
-    "save_binary", "precise_float_parser", "two_round", "pre_partition",
-    // Seeds only matter when the corresponding sampler is enabled (gated separately).
-    "drop_seed",
+    "save_binary", "pre_partition",
     // Only read by non-CPU devices / multi-machine learners, which are gated via
     // device_type / num_machines / tree_learner.
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
     "local_listen_port", "time_out", "machine_list_filename", "machines",
-    // Only read by the auc_mu metric, which is gated via `metric`.
-    "auc_mu_weights",
-    // DART knobs are inert unless boosting selects it (gated).
-    "drop_rate", "max_drop", "skip_drop", "xgboost_dart_mode", "uniform_drop",
     // Quantization sub-options are inert unless use_quantized_grad (gated).
     "num_grad_quant_bins", "quant_train_renew_leaf", "stochastic_rounding",
-    "monotone_constraints_method", "monotone_penalty", "top_k", "refit_decay_rate",
+    "top_k",
     "linear_lambda",
-    "convert_model_language", "convert_model", "parser_config_file",
+    "convert_model_language", "convert_model",
 ];
 
 pub const SUPPORTED_OBJECTIVES: &[&str] = &[
@@ -133,7 +131,8 @@ pub const SUPPORTED_OBJECTIVES: &[&str] = &[
 ];
 pub const SUPPORTED_METRICS: &[&str] = &[
     "l2", "rmse", "l1", "quantile", "huber", "fair", "poisson", "mape", "gamma", "gamma_deviance",
-    "tweedie", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error", "ndcg", "map",
+    "tweedie", "binary_logloss", "binary_error", "auc", "average_precision", "r2", "multi_logloss",
+    "multi_error", "auc_mu", "ndcg", "map",
 ];
 
 /// upstream: include/LightGBM/config.h `ParseObjectiveAlias`.
@@ -181,6 +180,25 @@ fn split_tokens(s: &str) -> impl Iterator<Item = &str> {
     s.split(',').filter(|t| !t.is_empty())
 }
 
+/// upstream: utils/common.h `SplitBrackets` (contents of each `[...]`; empty
+/// brackets and text outside brackets are dropped).
+fn split_brackets(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (pos, c) in s.char_indices() {
+        if c == '[' {
+            start = Some(pos + 1);
+        } else if c == ']' {
+            if let Some(i) = start.take() {
+                if i < pos {
+                    out.push(&s[i..pos]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// upstream: utils/common.h `Atoi` (leading spaces, sign, digits; stops at
 /// the first other character).
 fn atoi(s: &str) -> i32 {
@@ -197,6 +215,21 @@ fn atoi(s: &str) -> i32 {
     if neg { v.wrapping_neg() } else { v }
 }
 
+/// upstream: utils/common.h `Atoi<int8_t>` (the accumulator is `int8_t`).
+pub(crate) fn atoi_i8(s: &str) -> i8 {
+    let b = s.trim_start_matches(' ').as_bytes();
+    let (neg, digits) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    let mut v: i8 = 0;
+    for &c in digits.iter().take_while(|c| c.is_ascii_digit()) {
+        v = (v as i32 * 10 + (c - b'0') as i32) as i8;
+    }
+    if neg { (-(v as i32)) as i8 } else { v }
+}
+
 /// upstream: src/io/config.cpp `ParseMetrics` (split on ',', alias, dedupe in order).
 fn parse_metrics(value: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -207,6 +240,40 @@ fn parse_metrics(value: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// upstream: src/io/config.cpp `Config::GetAucMuWeights`.
+fn auc_mu_weights_matrix(weights: &[f64], num_class: i32) -> Result<Vec<Vec<f64>>> {
+    let n = num_class.max(0) as usize;
+    if weights.is_empty() {
+        let mut m = vec![vec![1.0; n]; n];
+        for (i, row) in m.iter_mut().enumerate() {
+            row[i] = 0.0;
+        }
+        return Ok(m);
+    }
+    if weights.len() != n * n {
+        return Err(LgbmError::InvalidParameter(format!(
+            "auc_mu_weights must have {} elements, but found {}",
+            n * n,
+            weights.len()
+        )));
+    }
+    let mut m = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                if weights[i * n + j].abs() < K_ZERO_THRESHOLD {
+                    return Err(LgbmError::InvalidParameter(format!(
+                        "AUC-mu matrix must have non-zero values for non-diagonal entries. Found zero value in position {} of auc_mu_weights.",
+                        i * n + j
+                    )));
+                }
+                m[i][j] = weights[i * n + j];
+            }
+        }
+    }
+    Ok(m)
 }
 
 fn parse_bool(key: &str, v: &str) -> Result<bool> {
@@ -337,6 +404,19 @@ pub struct Config {
     pub lambda_l2: f64,
     pub min_gain_to_split: f64,
     pub path_smooth: f64,
+    pub refit_decay_rate: f64,
+    /// By real feature index; empty means unconstrained.
+    pub monotone_constraints: Vec<i8>,
+    pub monotone_constraints_method: String,
+    pub monotone_penalty: f64,
+    pub drop_rate: f64,
+    pub max_drop: i32,
+    pub skip_drop: f64,
+    pub xgboost_dart_mode: bool,
+    pub uniform_drop: bool,
+    pub interaction_constraints: String,
+    /// Real feature indices per constraint set.
+    pub interaction_constraints_vector: Vec<Vec<i32>>,
     pub verbosity: i32,
     pub max_bin: i32,
     pub min_data_in_bin: i32,
@@ -381,6 +461,9 @@ pub struct Config {
     pub lambdarank_position_bias_regularization: f64,
     /// Sorted; empty means `1..=5`.
     pub eval_at: Vec<i32>,
+    pub auc_mu_weights: Vec<f64>,
+    /// upstream `Config::GetAucMuWeights`: `num_class x num_class`, zero diagonal.
+    pub auc_mu_weights_matrix: Vec<Vec<f64>>,
     pub saved_feature_importance_type: i32,
     pub is_provide_training_metric: bool,
     /// Raw `categorical_feature` value; see [`Config::categorical_indices`].
@@ -394,6 +477,15 @@ pub struct Config {
     pub pred_early_stop: bool,
     pub pred_early_stop_freq: i32,
     pub pred_early_stop_margin: f64,
+    /// Text-file loading (upstream `DatasetLoader`).
+    pub header: bool,
+    pub label_column: String,
+    pub weight_column: String,
+    pub group_column: String,
+    pub ignore_column: String,
+    pub two_round: bool,
+    pub precise_float_parser: bool,
+    pub predict_disable_shape_check: bool,
     /// Canonical key -> value string as supplied (after alias resolution).
     pub explicit: BTreeMap<String, String>,
     /// Non-fatal diagnostics (unknown keys, duplicate aliases), mirroring upstream warnings.
@@ -425,6 +517,17 @@ impl Default for Config {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            refit_decay_rate: 0.9,
+            monotone_constraints: Vec::new(),
+            monotone_constraints_method: "basic".into(),
+            monotone_penalty: 0.0,
+            drop_rate: 0.1,
+            max_drop: 50,
+            skip_drop: 0.5,
+            xgboost_dart_mode: false,
+            uniform_drop: false,
+            interaction_constraints: String::new(),
+            interaction_constraints_vector: Vec::new(),
             verbosity: 1,
             max_bin: 255,
             min_data_in_bin: 3,
@@ -464,6 +567,8 @@ impl Default for Config {
             label_gain: Vec::new(),
             lambdarank_position_bias_regularization: 0.0,
             eval_at: Vec::new(),
+            auc_mu_weights: Vec::new(),
+            auc_mu_weights_matrix: vec![vec![0.0]],
             saved_feature_importance_type: 0,
             is_provide_training_metric: false,
             categorical_feature: String::new(),
@@ -476,6 +581,14 @@ impl Default for Config {
             pred_early_stop: false,
             pred_early_stop_freq: 10,
             pred_early_stop_margin: 10.0,
+            header: false,
+            label_column: String::new(),
+            weight_column: String::new(),
+            group_column: String::new(),
+            ignore_column: String::new(),
+            two_round: false,
+            precise_float_parser: false,
+            predict_disable_shape_check: false,
             explicit: BTreeMap::new(),
             warnings: Vec::new(),
         }
@@ -626,9 +739,8 @@ impl Config {
             self.boosting = match v.to_ascii_lowercase().as_str() {
                 "gbdt" | "gbrt" => "gbdt".to_string(),
                 "goss" => "goss".to_string(),
-                "dart" | "rf" | "random_forest" => {
-                    return Err(LgbmError::Unsupported(format!("boosting={v}")));
-                }
+                "dart" => "dart".to_string(),
+                "rf" | "random_forest" => "rf".to_string(),
                 _ => {
                     return Err(LgbmError::InvalidParameter(format!("Unknown boosting type {v}")));
                 }
@@ -666,6 +778,40 @@ impl Config {
         set_f64!(lambda_l2);
         set_f64!(min_gain_to_split);
         set_f64!(path_smooth);
+        set_f64!(refit_decay_rate);
+        set_f64!(drop_rate);
+        set_int!(max_drop);
+        set_f64!(skip_drop);
+        set_bool!(xgboost_dart_mode);
+        set_bool!(uniform_drop);
+        if let Some(v) = p.get("monotone_constraints") {
+            // upstream: Common::StringToArray<int8_t> (Atoi<int8_t> per token)
+            self.monotone_constraints = split_tokens(v).map(atoi_i8).collect();
+        }
+        if let Some(v) = p.get("monotone_constraints_method") {
+            self.monotone_constraints_method = v.clone();
+        }
+        set_f64!(monotone_penalty);
+        if let Some(v) = p.get("interaction_constraints") {
+            // upstream: Config::Set, Common::StringToArrayofArrays<int>(s, '[', ']', ',')
+            self.interaction_constraints = v.clone();
+            self.interaction_constraints_vector =
+                split_brackets(v).into_iter().map(|s| split_tokens(s).map(atoi).collect()).collect();
+        }
+        set_bool!(header);
+        set_bool!(two_round);
+        set_bool!(precise_float_parser);
+        set_bool!(predict_disable_shape_check);
+        for (field, key) in [
+            (&mut self.label_column, "label_column"),
+            (&mut self.weight_column, "weight_column"),
+            (&mut self.group_column, "group_column"),
+            (&mut self.ignore_column, "ignore_column"),
+        ] {
+            if let Some(v) = p.get(key) {
+                *field = v.clone();
+            }
+        }
         set_int!(verbosity);
         set_int!(max_bin);
         set_int!(min_data_in_bin);
@@ -717,6 +863,16 @@ impl Config {
             self.eval_at = split_tokens(v).map(atoi).collect();
             self.eval_at.sort();
         }
+        if let Some(v) = p.get("auc_mu_weights") {
+            self.auc_mu_weights = split_tokens(v)
+                .map(|t| {
+                    crate::fmt::parse_f64(t.trim()).ok_or_else(|| {
+                        LgbmError::InvalidParameter(format!("cannot parse auc_mu_weights value `{t}`"))
+                    })
+                })
+                .collect::<Result<_>>()?;
+        }
+        self.auc_mu_weights_matrix = auc_mu_weights_matrix(&self.auc_mu_weights, self.num_class)?;
         set_int!(saved_feature_importance_type);
         set_bool!(is_provide_training_metric);
         if let Some(v) = p.get("categorical_feature") {
@@ -794,6 +950,19 @@ impl Config {
                  boosting=gbdt, data_sample_strategy=goss.To suppress this warning, set data_sample_strategy=goss instead."
                     .into(),
             );
+        }
+        // upstream: Config::CheckParamConflict (monotone constraints)
+        let precise_mc = matches!(self.monotone_constraints_method.as_str(), "intermediate" | "advanced");
+        if self.feature_fraction_bynode != 1.0 && precise_mc {
+            self.warnings.push(
+                "Cannot use \"intermediate\" or \"advanced\" monotone constraints with feature fraction different from 1, \
+                 auto set monotone constraints to \"basic\" method."
+                    .into(),
+            );
+            self.monotone_constraints_method = "basic".into();
+        }
+        if self.max_depth > 0 && self.monotone_penalty >= self.max_depth as f64 {
+            self.warnings.push("Monotone penalty greater than tree depth. Monotone features won't be used.".into());
         }
         if self.bagging_by_query && self.data_sample_strategy != "bagging" {
             self.warnings.push(
@@ -881,11 +1050,23 @@ impl Config {
             "early_stopping_round" => self.early_stopping_round.to_string(),
             "early_stopping_min_delta" => g(self.early_stopping_min_delta),
             "first_metric_only" => b(self.first_metric_only),
+            "drop_rate" => g(self.drop_rate),
+            "max_drop" => self.max_drop.to_string(),
+            "skip_drop" => g(self.skip_drop),
+            "xgboost_dart_mode" => b(self.xgboost_dart_mode),
+            "uniform_drop" => b(self.uniform_drop),
             "max_delta_step" => g(self.max_delta_step),
             "lambda_l1" => g(self.lambda_l1),
             "lambda_l2" => g(self.lambda_l2),
             "min_gain_to_split" => g(self.min_gain_to_split),
             "path_smooth" => g(self.path_smooth),
+            "refit_decay_rate" => g(self.refit_decay_rate),
+            "monotone_constraints" => {
+                self.monotone_constraints.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(",")
+            }
+            "monotone_constraints_method" => self.monotone_constraints_method.clone(),
+            "monotone_penalty" => g(self.monotone_penalty),
+            "interaction_constraints" => self.interaction_constraints.clone(),
             "verbosity" => self.verbosity.to_string(),
             "max_bin" => self.max_bin.to_string(),
             "min_data_in_bin" => self.min_data_in_bin.to_string(),
@@ -926,6 +1107,9 @@ impl Config {
             "label_gain" => self.label_gain.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(","),
             "lambdarank_position_bias_regularization" => g(self.lambdarank_position_bias_regularization),
             "eval_at" => self.eval_at.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
+            "auc_mu_weights" => {
+                self.auc_mu_weights.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(",")
+            }
             "saved_feature_importance_type" => self.saved_feature_importance_type.to_string(),
             _ => return self.explicit.get(name).cloned(),
         })
@@ -1057,6 +1241,13 @@ mod tests {
         assert_eq!(c.learning_rate, 0.05);
         assert_eq!(c.num_leaves, 7);
         assert_eq!(c.min_data_in_leaf, 20);
+    }
+
+    #[test]
+    fn interaction_constraints_parse_like_string_to_array_of_arrays() {
+        let c = Config::from_pairs([("interaction_constraints", "[0,1, 2],[],x[3][[4,,5]")]).unwrap();
+        assert_eq!(c.interaction_constraints_vector, vec![vec![0, 1, 2], vec![3], vec![4, 5]]);
+        assert_eq!(c.value_string("interaction_constraints").as_deref(), Some("[0,1, 2],[],x[3][[4,,5]"));
     }
 
     #[test]

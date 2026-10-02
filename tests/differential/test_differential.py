@@ -7,6 +7,7 @@ tests/tolerances.toml (see its rationale entries).
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
@@ -21,6 +22,7 @@ from .conftest import (
     DETERMINISTIC,
     REGRESSION_OBJECTIVES,
     case_ids,
+    make_case,
     parse_dump_text,
     rust_tree_arrays,
     train_both,
@@ -1230,6 +1232,383 @@ def test_reset_parameter_errors():
             bst.reset_parameter({"learning_rate": "1.5x"})
         with pytest.raises(mod.basic.LightGBMError, match="Unknown token abc in data file"):
             mod.train({**case.full_params, "lambda_l2": "abc"}, mod.Dataset(case.X, label=case.y), num_boost_round=1)
+
+
+METRIC_CASES = [
+    make_case("r2_basic", "regression", {"metric": ["r2", "l2"]}),
+    make_case("r2_weighted", "regression", {"metric": "r2"}, weighted=True),
+    make_case("r2_poisson", "poisson", {"metric": ["r2", "poisson"]}),
+    make_case("r2_discrete", "regression", {"metric": "r2", "num_leaves": 3}, kind="discrete", rounds=5),
+    make_case("ap_basic", "binary", {"metric": ["average_precision", "auc"]}),
+    make_case("ap_weighted", "binary", {"metric": "average_precision"}, weighted=True),
+    make_case("ap_imbalanced", "binary", {"metric": "average_precision"}, imbalance=0.9),
+    make_case("ap_ties", "binary", {"metric": "average_precision", "num_leaves": 3}, kind="discrete", rounds=5),
+    make_case("auc_weighted_ties", "binary", {"metric": ["auc", "average_precision"], "num_leaves": 4},
+              weighted=True, rounds=8),
+    make_case("auc_mu_basic", "multiclass", {"num_class": 3, "metric": ["auc_mu", "multi_logloss"]}),
+    make_case("auc_mu_weighted", "multiclass", {"num_class": 4, "metric": "auc_mu"}, weighted=True),
+    make_case("auc_mu_matrix", "multiclass",
+              {"num_class": 3, "metric": "auc_mu", "auc_mu_weights": [0, 1, 2.5, 0.5, 3, 1, 2, 1.5, 0]}),
+    make_case("auc_mu_matrix_weighted", "multiclass",
+              {"num_class": 3, "metric": "auc_mu", "auc_mu_weights": [0, 2, 1, 1, 0, 3, 0.25, 1, 0]}, weighted=True),
+    make_case("auc_mu_ova", "multiclassova", {"num_class": 3, "metric": "auc_mu"}),
+    make_case("auc_mu_ties", "multiclass", {"num_class": 3, "metric": "auc_mu", "num_leaves": 3}, kind="discrete",
+              rounds=4),
+]
+
+
+@pytest.mark.parametrize("case", METRIC_CASES, ids=[c.name for c in METRIC_CASES])
+def test_metrics_r2_ap_auc_mu(case, recorder):
+    """r2 / average_precision / auc_mu per iteration on weighted train and valid sets, plus early stopping."""
+    rec = recorder(case.name)
+    rng = np.random.default_rng(1)
+    wv = rng.uniform(0.2, 3.0, size=len(case.yv)) if case.weight is not None else None
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        ds = mod.Dataset(case.X, label=case.y, weight=case.weight, free_raw_data=False)
+        valid = ds.create_valid(case.Xv, label=case.yv, weight=wv)
+        hist = {}
+        bst = mod.train(case.full_params, ds, num_boost_round=case.num_boost_round, valid_sets=[ds, valid],
+                        valid_names=["train", "valid"],
+                        callbacks=[mod.record_evaluation(hist), mod.early_stopping(3, verbose=False)])
+        out[mod.__name__] = (hist, bst.best_iteration, bst.model_to_string())
+    (h_rs, it_rs, m_rs), (h_up, it_up, m_up) = out["lightgbm_rust"], out["lightgbm"]
+    rec.compare("metric_names", "tree_structure", sorted(h_rs["valid"]), sorted(h_up["valid"]))
+    for data in ("train", "valid"):
+        for m in h_up[data]:
+            rec.compare(f"{data}.{m}[per iteration]", "metrics", h_rs[data].get(m), h_up[data][m])
+    rec.compare("best_iteration", "tree_structure", it_rs, it_up)
+    rec.compare("model_text", "model_text", m_rs, m_up)
+    # 4 threads: upstream's ParallelSort sorts 1024+ row chunks and merges them (reproduced
+    # exactly); the OpenMP reductions of the pointwise metrics combine in thread-arrival order
+    params = {**case.full_params, "num_threads": 4, "force_row_wise": False, "force_col_wise": True}
+    mt = {}
+    for mod in (lgb_rs, lgb_up):
+        ds = mod.Dataset(case.X, label=case.y, weight=case.weight)
+        hist = {}
+        mod.train(params, ds, num_boost_round=case.num_boost_round, valid_sets=[ds], valid_names=["train"],
+                  callbacks=[mod.record_evaluation(hist)])
+        mt[mod.__name__] = hist["train"]
+    for m in mt["lightgbm"]:
+        rec.compare(f"train.{m}[4 threads]", "multithread", mt["lightgbm_rust"].get(m), mt["lightgbm"][m])
+    rec.finish()
+
+
+REFIT_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_weighted", "bin_weighted", "mc_basic", "ova_basic",
+                                              "l1_weighted", "quantile_basic", "poisson_basic", "bag_basic",
+                                              "reg_init_score", "cat_basic", "cat_binary", "extra_trees")]
+
+
+@pytest.mark.parametrize("decay_rate", [0.9, 0.0, 0.37])
+@pytest.mark.parametrize("case", REFIT_CASES, ids=[c.name for c in REFIT_CASES])
+def test_refit(case, decay_rate, recorder):
+    """Booster.refit on the holdout data (weights too when the case has them), then continued training."""
+    rec = recorder(f"{case.name}[decay={decay_rate}]")
+    rng = np.random.default_rng(2)
+    wv = rng.uniform(0.2, 3.0, size=len(case.yv)) if case.weight is not None else None
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.train(case.full_params, mod.Dataset(case.X, label=case.y, weight=case.weight,
+                                                      init_score=case.init_score),
+                        num_boost_round=case.num_boost_round)
+        new = bst.refit(case.Xv, case.yv, decay_rate=decay_rate, weight=wv)
+        text = new.model_to_string()
+        pred = new.predict(case.X, raw_score=True)
+        new.update()
+        out[mod.__name__] = (text, pred, new.model_to_string())
+    (t_rs, p_rs, c_rs), (t_up, p_up, c_up) = out["lightgbm_rust"], out["lightgbm"]
+    rec.compare("model_text[refit]", "model_text", t_rs, t_up)
+    rec.compare("raw_score[refit, train rows]", "predictions", p_rs, p_up)
+    rec.compare("model_text[refit + 1 iteration]", "model_text", c_rs, c_up)
+    rec.finish()
+
+
+def test_refit_variants(recorder):
+    """path_smooth on an in-memory booster, ranking with groups, pandas input with validate_features, kwargs."""
+    import pandas as pd
+
+    rec = recorder("refit_variants")
+    reg = next(c for c in CASES if c.name == "reg_regularized")
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        # upstream reads unset parent indices for trees loaded from text, so keep the trained booster
+        bst = mod.train(reg.full_params, mod.Dataset(reg.X, label=reg.y), num_boost_round=reg.num_boost_round,
+                        keep_training_booster=True)
+        out[mod.__name__] = bst.refit(reg.Xv, reg.yv, decay_rate=0.5).model_to_string()
+    rec.compare("model_text[path_smooth refit]", "model_text", out["lightgbm_rust"], out["lightgbm"])
+
+    rank = RANK_CASES[1]
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.train(rank.full_params, mod.Dataset(rank.X, label=rank.y, group=rank.group, weight=rank.weight),
+                        num_boost_round=rank.rounds)
+        out[mod.__name__] = bst.refit(rank.Xv, rank.yv, group=rank.groupv, decay_rate=0.2).model_to_string()
+    rec.compare("model_text[lambdarank refit]", "model_text", out["lightgbm_rust"], out["lightgbm"])
+
+    case = next(c for c in CASES if c.name == "mc_basic")
+    cols = [f"f{i}" for i in range(case.X.shape[1])]
+    df, dfv = pd.DataFrame(case.X, columns=cols), pd.DataFrame(case.Xv, columns=cols)
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.train(case.full_params, mod.Dataset(df, label=case.y), num_boost_round=case.num_boost_round)
+        new = bst.refit(dfv, case.yv, validate_features=True, dataset_params={"max_bin": 63}, num_threads=1)
+        out[mod.__name__] = new.model_to_string()
+        with pytest.raises(mod.basic.LightGBMError, match="Expected 'f0' at position 0 but found 'g0'"):
+            bst.refit(dfv.rename(columns={"f0": "g0"}), case.yv, validate_features=True)
+    rec.compare("model_text[pandas refit, dataset_params]", "model_text", out["lightgbm_rust"], out["lightgbm"])
+    rec.finish()
+
+
+def test_loaded_params():
+    """Booster(model_str=...).params, i.e. GBDT::GetLoadedParam typing (6-digit doubles, vectors, strings)."""
+    case = next(c for c in CASES if c.name == "cat_basic")
+    params = {**case.full_params, "learning_rate": 0.123456789, "lambda_l2": 1234567.0, "min_gain_to_split": 1e-9,
+              "metric": ["l2", "l1"], "eval_at": [3, 1], "label_gain": [0, 1.5, 3], "max_bin": 63}
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        bst = mod.train(params, mod.Dataset(case.X, label=case.y), num_boost_round=3)
+        loaded = mod.Booster(model_str=bst.model_to_string())
+        out[mod.__name__] = (loaded.params, loaded._get_loaded_param())
+    assert repr(out["lightgbm_rust"]) == repr(out["lightgbm"])
+
+
+def test_refit_errors():
+    case = next(c for c in CASES if c.name == "reg_basic")
+    for mod in (lgb_rs, lgb_up):
+        def fobj(preds, data):
+            return preds - data.get_label(), np.ones_like(preds)
+
+        bst = mod.train({**case.full_params, "objective": fobj}, mod.Dataset(case.X, label=case.y),
+                        num_boost_round=2)
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot refit due to null objective function."):
+            bst.refit(case.Xv, case.yv)
+        bst = mod.train({**case.full_params, "categorical_feature": [1]}, mod.Dataset(case.X, label=case.y),
+                        num_boost_round=2)
+        with pytest.raises(mod.basic.LightGBMError, match="'categorical_feature' value passed to Booster.refit()"):
+            bst.refit(case.Xv, case.yv, categorical_feature=[2])
+
+
+def test_metric_errors():
+    case = next(c for c in CASES if c.name == "mc_basic")
+    for mod in (lgb_rs, lgb_up):
+        ds = mod.Dataset(case.X, label=case.y)
+        with pytest.raises(mod.basic.LightGBMError, match="auc_mu_weights must have 9 elements, but found 4"):
+            mod.train({**case.full_params, "metric": "auc_mu", "auc_mu_weights": [0, 1, 1, 0]}, ds, 1)
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="AUC-mu matrix must have non-zero values for non-diagonal entries. "
+                                 "Found zero value in position 5 of auc_mu_weights."):
+            mod.train({**case.full_params, "metric": "auc_mu", "auc_mu_weights": [0, 1, 1, 1, 0, 0, 1, 1, 0]},
+                      mod.Dataset(case.X, label=case.y), 1)
+        with pytest.raises(mod.basic.LightGBMError, match="Multiclass objective and metrics don't match"):
+            mod.train({**case.full_params, "metric": "average_precision"}, mod.Dataset(case.X, label=case.y), 1)
+
+
+def test_monotone_methods_differ_and_hold():
+    """The three methods give different trees, and predictions respect each constraint."""
+    case = next(c for c in CASES if c.name == "mono_basic")
+    texts = {}
+    for method in ("basic", "intermediate", "advanced"):
+        bst = lgb_rs.train({**case.full_params, "monotone_constraints_method": method},
+                           lgb_rs.Dataset(case.X, label=case.y), num_boost_round=case.num_boost_round)
+        texts[method] = bst.model_to_string()
+        grid = np.linspace(-3, 3, 41)
+        base = case.Xv[:200]
+        for f, sign in enumerate(case.params["monotone_constraints"]):
+            if sign == 0:
+                continue
+            preds = []
+            for v in grid:
+                X = base.copy()
+                X[:, f] = v
+                preds.append(bst.predict(X))
+            diffs = np.diff(np.asarray(preds), axis=0) * sign
+            assert diffs.min() >= 0, (method, f)
+    assert len(set(texts.values())) == 3
+
+
+@pytest.mark.parametrize("name", ["ic_disjoint", "ic_overlap", "ic_partial", "ic_both", "ic_categorical"])
+def test_interaction_constraints_hold(name):
+    """Every root-to-leaf path splits only on features of a single constraint set."""
+    case = next(c for c in CASES if c.name == name)
+    sets = [set(s) for s in case.params["interaction_constraints"]]
+    bst = lgb_rs.train(case.full_params, lgb_rs.Dataset(case.X, label=case.y, weight=case.weight),
+                       num_boost_round=case.num_boost_round)
+
+    def paths(node, used):
+        if "split_feature" not in node:
+            yield used
+            return
+        used = used | {node["split_feature"]}
+        yield from paths(node["left_child"], used)
+        yield from paths(node["right_child"], used)
+
+    n_splits = 0
+    for t in bst.dump_model()["tree_info"]:
+        n_splits += t["num_leaves"] - 1
+        for used in paths(t["tree_structure"], frozenset()):
+            assert any(used <= s for s in sets), (name, sorted(used))
+    assert n_splits > 0
+
+
+def test_dart_custom_objective(recorder):
+    """DART with a callable objective drops trees in ``__inner_predict``.
+
+    Upstream reads ``DART::is_update_score_cur_iter_`` before initializing it, so its first
+    custom-objective iteration may or may not draw from the drop generator (it varies between
+    runs). With the flag cleared, the draws are those of the built-in objective, which upstream
+    computes deterministically, so that is the reference.
+    """
+    rec = recorder("dart_custom_objective")
+    case = next(c for c in CASES if c.name == "dart_no_skip")
+
+    def fobj(preds, data):
+        return preds - data.get_label(), np.ones_like(preds)
+
+    params = {**case.full_params, "boost_from_average": False}
+    rs = lgb_rs.train({**params, "objective": fobj}, lgb_rs.Dataset(case.X, label=case.y),
+                      num_boost_round=case.num_boost_round)
+    up = lgb_up.train(params, lgb_up.Dataset(case.X, label=case.y), num_boost_round=case.num_boost_round)
+    rec.compare("raw_score[custom vs built-in l2]", "predictions", rs.predict(case.Xv), up.predict(case.Xv))
+    rec.compare("trees[custom vs built-in l2]", "model_text", rs.model_to_string().split("Tree=0")[1].split("end of trees")[0],
+                up.model_to_string().split("Tree=0")[1].split("end of trees")[0])
+    rec.finish()
+
+
+def test_dart_training_paths(recorder):
+    """Learning-rate schedule (reset_parameter reseeds the drop generator), a train-set feval
+    (extra drops in __inner_predict), continued training, Booster.update with rollback."""
+    rec = recorder("dart_training_paths")
+    case = next(c for c in CASES if c.name == "dart_no_skip")
+
+    def feval(preds, data):
+        return "my_l2", float(np.mean((preds - data.get_label()) ** 2)), False
+
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        res = {}
+        tr = mod.Dataset(case.X, label=case.y)
+        b = mod.train(case.full_params, tr, num_boost_round=15,
+                      callbacks=[mod.reset_parameter(learning_rate=lambda i: 0.1 * 0.95 ** i)])
+        res["lr_schedule"] = b.model_to_string()
+        tr = mod.Dataset(case.X, label=case.y)
+        hist = {}
+        b = mod.train(case.full_params, tr, num_boost_round=15, valid_sets=[tr, tr.create_valid(case.Xv, label=case.yv)],
+                      valid_names=["train", "valid"], feval=feval, callbacks=[mod.record_evaluation(hist)])
+        res["train_feval"] = b.model_to_string()
+        res["train_feval_hist"] = hist
+        first = mod.train({**case.full_params, "boosting": "gbdt"}, mod.Dataset(case.X, label=case.y), num_boost_round=5)
+        tr = mod.Dataset(case.X, label=case.y)
+        hist = {}
+        b = mod.train(case.full_params, tr, num_boost_round=10, init_model=first,
+                      valid_sets=[tr.create_valid(case.Xv, label=case.yv)], callbacks=[mod.record_evaluation(hist)])
+        res["continued"] = b.model_to_string()
+        res["continued_hist"] = hist
+        b = mod.Booster(case.full_params, mod.Dataset(case.X, label=case.y))
+        for _ in range(8):
+            b.update()
+        b.rollback_one_iter()
+        b.update()
+        res["update_rollback"] = b.model_to_string()
+        out[mod.__name__] = res
+    rs, up = out["lightgbm_rust"], out["lightgbm"]
+    for key in ("lr_schedule", "train_feval", "continued", "update_rollback"):
+        rec.compare(f"model_text[{key}]", "model_text", rs[key], up[key])
+    for key in ("train_feval_hist", "continued_hist"):
+        for data_name, metrics in up[key].items():
+            for m, vals in metrics.items():
+                rec.compare(f"{key}.{data_name}.{m}", "metrics", rs[key][data_name][m], vals)
+    rec.finish()
+
+
+def test_dart_early_stopping_is_disabled():
+    case = next(c for c in CASES if c.name == "dart_basic")
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        tr = mod.Dataset(case.X, label=case.y)
+        with pytest.warns(UserWarning, match="Early stopping is not available in dart mode"):
+            b = mod.train({**case.full_params, "early_stopping_round": 1}, tr, num_boost_round=12,
+                          valid_sets=[tr.create_valid(case.Xv, label=case.yv)])
+        out[mod.__name__] = (b.best_iteration, b.current_iteration())
+    assert out["lightgbm_rust"] == out["lightgbm"] == (0, 12)
+
+
+def test_rf_training_paths(recorder):
+    """Random forest: Booster.update with rollbacks (scores re-averaged), a validation set added
+    mid-training (scaled by 1/iterations), refit, prediction windows and contributions."""
+    rec = recorder("rf_training_paths")
+    out = {}
+    # upstream's thread count is process-global and reset by each Dataset construction
+    one = {"num_threads": 1}
+    for name in ("rf_basic", "rf_multiclass", "rf_l1"):
+        case = next(c for c in CASES if c.name == name)
+        for mod in (lgb_rs, lgb_up):
+            res = {}
+            tr = mod.Dataset(case.X, label=case.y)
+            b = mod.Booster(case.full_params, tr)
+            b.add_valid(tr.create_valid(case.Xv, label=case.yv, params=one), "v")
+            for _ in range(6):
+                b.update()
+            b.rollback_one_iter()
+            b.rollback_one_iter()
+            b.update()
+            res["update_rollback"] = b.model_to_string()
+            res["update_rollback_eval"] = [b.eval_train()[0][2], b.eval_valid()[0][2]]
+            b2 = mod.Booster(case.full_params, tr)
+            for _ in range(4):
+                b2.update()
+            b2.add_valid(tr.create_valid(case.Xv, label=case.yv, params=one), "v")
+            res["late_valid_eval"] = [b2.eval_valid()[0][2]]
+            b2.update()
+            res["late_valid_eval"].append(b2.eval_valid()[0][2])
+            r = b.refit(case.Xv, case.yv)
+            res["refit"] = r.model_to_string()
+            res["window"] = b.predict(case.Xv, start_iteration=1, num_iteration=3)
+            res["contrib"] = np.asarray(b.predict(case.Xv, pred_contrib=True))
+            out[mod.__name__] = res
+        rs, up = out["lightgbm_rust"], out["lightgbm"]
+        for key in ("update_rollback", "refit"):
+            rec.compare(f"model_text[{name}.{key}]", "model_text", rs[key], up[key])
+        for key in ("update_rollback_eval", "late_valid_eval"):
+            rec.compare(f"{name}.{key}", "metrics", rs[key], up[key])
+        for key in ("window", "contrib"):
+            rec.compare(f"{name}.{key}", "predictions", rs[key], up[key])
+    rec.finish()
+
+
+def test_rf_errors():
+    case = next(c for c in CASES if c.name == "rf_basic")
+
+    def fobj(preds, data):
+        return preds - data.get_label(), np.ones_like(preds)
+
+    for mod in (lgb_rs, lgb_up):
+        with pytest.raises(mod.basic.LightGBMError, match=re.escape(
+                "Check failed: (config->bagging_freq > 0 && config->bagging_fraction < 1.0f && "
+                "config->bagging_fraction > 0.0f) || (config->feature_fraction < 1.0f && "
+                "config->feature_fraction > 0.0f)")):
+            mod.train({**case.full_params, "bagging_freq": 0}, mod.Dataset(case.X, label=case.y), 1)
+        with pytest.raises(mod.basic.LightGBMError,
+                           match=re.escape("Check failed: (train_data->metadata().init_score()) == (nullptr)")):
+            mod.train(case.full_params, mod.Dataset(case.X, label=case.y, init_score=np.zeros(len(case.y))), 1)
+        with pytest.raises(mod.basic.LightGBMError, match="RF mode do not support custom objective function"):
+            mod.train({**case.full_params, "objective": fobj}, mod.Dataset(case.X, label=case.y), 1)
+
+
+def test_monotone_errors():
+    case = next(c for c in CASES if c.name == "reg_basic")
+    # Upstream v4.7.0 raises this Log::Fatal inside an OpenMP loop, which aborts the process
+    # ("terminate called without an active exception"), so only the message is compared.
+    with pytest.raises(lgb_rs.basic.LightGBMError,
+                       match="The output cannot be monotone with respect to categorical features"):
+        lgb_rs.train({**case.full_params, "monotone_constraints": [0, 1, 0, 0, 0, 0]},
+                     lgb_rs.Dataset(case.X, label=case.y, categorical_feature=[1]), 1)
+    for mod in (lgb_rs, lgb_up):
+        with pytest.raises(mod.basic.LightGBMError, match=re.escape(
+                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == "
+                "(config->monotone_constraints.size())")):
+            mod.train({**case.full_params, "monotone_constraints": [1, -1]}, mod.Dataset(case.X, label=case.y), 1)
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Cannot use ``monotone_constraints`` in regression_l1 objective, please disable it."):
+            mod.train({**case.full_params, "objective": "l1", "monotone_constraints": [1, 0, 0, 0, 0, 0]},
+                      mod.Dataset(case.X, label=case.y), 1)
 
 
 def leaf_values(b):

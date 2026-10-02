@@ -364,6 +364,8 @@ pub struct Dataset {
     pub(crate) bin_config: BinConstructConfig,
     /// upstream `data_filename_`: the file this dataset was loaded from.
     pub(crate) data_filename: Option<String>,
+    /// upstream `label_idx_`: the label's column in the text file (0 otherwise).
+    pub(crate) label_idx: i32,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -407,6 +409,16 @@ impl Dataset {
         if n > i32::MAX as usize {
             return Err(LgbmError::InvalidData("more than 2^31-1 rows".into()));
         }
+        // upstream: dataset_loader.cpp ConstructFromSampleData
+        if is_categorical
+            .iter()
+            .enumerate()
+            .any(|(c, &cat)| cat && cfg.monotone_constraints.get(c).is_some_and(|&m| m != 0))
+        {
+            return Err(LgbmError::InvalidParameter(
+                "The output cannot be monotone with respect to categorical features".into(),
+            ));
+        }
 
         // upstream: c_api.cpp CreateSampleIndices / SampleCount
         let sample_cnt = n.min(cfg.bin_construct_sample_cnt.max(0) as usize) as i32;
@@ -414,72 +426,53 @@ impl Dataset {
         let sample_indices = rand.sample(n as i32, sample_cnt);
         let total_sample_size = sample_indices.len();
 
-        // upstream: dataset_loader.cpp ConstructFromSampleData
-        let filter_cnt =
-            (cfg.min_data_in_leaf as f64 * total_sample_size as f64 / n as f64) as i32;
-        let params = BinParams {
-            max_bin: cfg.max_bin,
-            min_data_in_bin: cfg.min_data_in_bin,
-            min_split_data: filter_cnt,
-            pre_filter: cfg.feature_pre_filter,
-            use_missing: cfg.use_missing,
-            zero_as_missing: cfg.zero_as_missing,
-        };
         let columns: Vec<SampleColumn> = mat.sample_columns(&sample_indices);
-        let found: Vec<(BinMapper, Vec<String>)> = columns
-            .par_iter()
-            .enumerate()
-            .map(|(c, col)| {
-                let bin_type = if is_categorical[c] { BinType::Categorical } else { BinType::Numerical };
-                let mut w = Vec::new();
-                BinMapper::find_bin_logged(&col.values, total_sample_size, bin_type, &params, &mut w).map(|m| (m, w))
-            })
-            .collect::<Result<_>>()?;
-        let mut warnings = Vec::new();
-        let mut bin_mappers = Vec::with_capacity(found.len());
-        for (m, w) in found {
-            warnings.extend(w);
-            bin_mappers.push(m);
-        }
-        // upstream: DatasetLoader::CheckCategoricalFeatureNumBin
-        if bin_mappers.iter().any(|m| m.bin_type == BinType::Categorical && m.num_bin > cfg.max_bin) {
-            warnings.push("Categorical features with more bins than the configured maximum bin number found.".into());
-            warnings.push(
-                "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories."
-                    .into(),
-            );
-        }
+        let (bin_mappers, warnings) =
+            find_bin_mappers(&columns, total_sample_size, n, &is_categorical, &vec![false; ncol], cfg)?;
 
         let (feature_names, replaced) = match fields.feature_names.clone() {
             Some(names) => sanitize_feature_names(names)?,
             None => ((0..ncol).map(|i| format!("Column_{i}")).collect(), false),
         };
         let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
-        ds.warnings = warnings;
-        ds.bin_config = BinConstructConfig::from_config(cfg);
+        ds.finish_construct(&columns, total_sample_size, cfg, warnings, replaced);
+        Ok(ds)
+    }
+
+    /// Bundling order, recorded parameters and warnings of a freshly binned dataset.
+    ///
+    /// upstream: the end of `Dataset::Construct`.
+    pub(crate) fn finish_construct(
+        &mut self,
+        columns: &[SampleColumn],
+        total_sample_size: usize,
+        cfg: &Config,
+        warnings: Vec<String>,
+        names_replaced: bool,
+    ) {
+        self.warnings = warnings;
+        self.bin_config = BinConstructConfig::from_config(cfg);
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
-        (ds.upstream_inner, ds.num_feature_groups) = upstream_inner_order(
-            &ds.bin_mappers,
-            &ds.used_features,
-            &columns,
+        (self.upstream_inner, self.num_feature_groups) = upstream_inner_order(
+            &self.bin_mappers,
+            &self.used_features,
+            columns,
             total_sample_size,
-            n,
+            self.num_data,
             explicit_bool("enable_bundle").unwrap_or(true),
             explicit_bool("is_enable_sparse").unwrap_or(true),
         );
-        if replaced {
-            ds.warnings.push(FEATURE_NAME_SPACE_WARNING.into());
+        if names_replaced {
+            self.warnings.push(FEATURE_NAME_SPACE_WARNING.into());
         }
-        // upstream: Dataset::Construct
-        if ds.used_features.is_empty() {
-            ds.warnings.push(
+        if self.used_features.is_empty() {
+            self.warnings.push(
                 "There are no meaningful features which satisfy the provided configuration. \
                  Decreasing Dataset parameters min_data_in_bin or min_data_in_leaf and re-constructing \
                  Dataset might resolve this warning."
                     .into(),
             );
         }
-        Ok(ds)
     }
 
     /// Non-fatal diagnostics from construction (upstream `Log::Warning`).
@@ -526,6 +519,7 @@ impl Dataset {
         let mut ds = Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())?;
         ds.upstream_inner = reference.upstream_inner.clone();
         ds.bin_config = reference.bin_config;
+        ds.label_idx = reference.label_idx;
         Ok(ds)
     }
 
@@ -581,6 +575,7 @@ impl Dataset {
             feature_names: self.feature_names.clone(),
             bin_config: self.bin_config,
             data_filename: None,
+            label_idx: self.label_idx,
             warnings: Vec::new(),
         })
     }
@@ -624,7 +619,7 @@ impl Dataset {
         Ok(())
     }
 
-    fn assemble(
+    pub(crate) fn assemble(
         mat: &Matrix<'_>,
         fields: DatasetFields<'_>,
         bin_mappers: Vec<BinMapper>,
@@ -654,6 +649,7 @@ impl Dataset {
             feature_names,
             bin_config: BinConstructConfig::default(),
             data_filename: None,
+            label_idx: 0,
             warnings: Vec::new(),
         })
     }
@@ -761,6 +757,56 @@ impl Dataset {
                     && a.bin_upper_bound.iter().zip(&b.bin_upper_bound).all(|(x, y)| x.to_bits() == y.to_bits())
             })
     }
+}
+
+/// One bin mapper per column from the sampled values; `skip` columns get a
+/// trivial mapper (upstream leaves them null). Returns upstream's warnings.
+///
+/// upstream: dataset_loader.cpp `ConstructFromSampleData` /
+/// `ConstructBinMappersFromTextData` and `CheckCategoricalFeatureNumBin`.
+pub(crate) fn find_bin_mappers(
+    columns: &[SampleColumn],
+    total_sample_size: usize,
+    num_data: usize,
+    is_categorical: &[bool],
+    skip: &[bool],
+    cfg: &Config,
+) -> Result<(Vec<BinMapper>, Vec<String>)> {
+    let filter_cnt = (cfg.min_data_in_leaf as f64 * total_sample_size as f64 / num_data as f64) as i32;
+    let params = BinParams {
+        max_bin: cfg.max_bin,
+        min_data_in_bin: cfg.min_data_in_bin,
+        min_split_data: filter_cnt,
+        pre_filter: cfg.feature_pre_filter,
+        use_missing: cfg.use_missing,
+        zero_as_missing: cfg.zero_as_missing,
+    };
+    let found: Vec<(BinMapper, Vec<String>)> = columns
+        .par_iter()
+        .enumerate()
+        .map(|(c, col)| {
+            if skip[c] {
+                return Ok((BinMapper::default(), Vec::new()));
+            }
+            let bin_type = if is_categorical[c] { BinType::Categorical } else { BinType::Numerical };
+            let mut w = Vec::new();
+            BinMapper::find_bin_logged(&col.values, total_sample_size, bin_type, &params, &mut w).map(|m| (m, w))
+        })
+        .collect::<Result<_>>()?;
+    let mut warnings = Vec::new();
+    let mut bin_mappers = Vec::with_capacity(found.len());
+    for (m, w) in found {
+        warnings.extend(w);
+        bin_mappers.push(m);
+    }
+    if bin_mappers.iter().any(|m| m.bin_type == BinType::Categorical && m.num_bin > cfg.max_bin) {
+        warnings.push("Categorical features with more bins than the configured maximum bin number found.".into());
+        warnings.push(
+            "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories."
+                .into(),
+        );
+    }
+    Ok((bin_mappers, warnings))
 }
 
 /// upstream: utils/common.h `CheckElementsIntervalClosed` (same pairwise scan,
