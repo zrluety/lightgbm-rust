@@ -254,7 +254,8 @@ def _parse_loaded_params(text: Optional[str]) -> Dict[str, Any]:
         value = pair[1][1:-1]
         t = _loaded_param_type(key)
         if t is None:
-            _log_warning(f"Ignoring unrecognized parameter '{key}' found in model string.")
+            # a C++ Log::Warning upstream
+            _emit_engine_warnings([f"Ignoring unrecognized parameter '{key}' found in model string."], None)
             continue
         try:
             if t == "string":
@@ -1419,9 +1420,13 @@ class Booster:
         elif model_file is not None:
             with open(model_file, "r", encoding="utf-8") as f:
                 self._load_model_str(f.read())
+            if params:
+                _log_warning("Ignoring params argument, using parameters from model file.")
             self.params = _parse_loaded_params(self._rs.loaded_parameters())
         elif model_str is not None:
             self._load_model_str(model_str)
+            if params:
+                _log_warning("Ignoring params argument, using parameters from model string.")
             self.params = _parse_loaded_params(self._rs.loaded_parameters())
         else:
             raise TypeError("Need at least one training dataset or model file or model string to create Booster instance")

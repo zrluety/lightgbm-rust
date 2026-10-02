@@ -102,7 +102,7 @@ const HONORED: &[&str] = &[
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
     "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin", "bagging_by_query",
     "auc_mu_weights", "refit_decay_rate", "monotone_constraints", "monotone_constraints_method",
-    "monotone_penalty", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
+    "monotone_penalty", "feature_contri", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
     "group_column", "ignore_column", "precise_float_parser", "two_round",
 ];
@@ -410,6 +410,8 @@ pub struct Config {
     pub monotone_constraints: Vec<i8>,
     pub monotone_constraints_method: String,
     pub monotone_penalty: f64,
+    /// Split-gain multiplier by real feature index; empty means 1 for all.
+    pub feature_contri: Vec<f64>,
     pub drop_rate: f64,
     pub max_drop: i32,
     pub skip_drop: f64,
@@ -522,6 +524,7 @@ impl Default for Config {
             monotone_constraints: Vec::new(),
             monotone_constraints_method: "basic".into(),
             monotone_penalty: 0.0,
+            feature_contri: Vec::new(),
             drop_rate: 0.1,
             max_drop: 50,
             skip_drop: 0.5,
@@ -793,6 +796,16 @@ impl Config {
             self.monotone_constraints_method = v.clone();
         }
         set_f64!(monotone_penalty);
+        if let Some(v) = p.get("feature_contri") {
+            // upstream: Common::StringToArray<double> (std::stod per token)
+            self.feature_contri = split_tokens(v)
+                .map(|t| {
+                    crate::fmt::parse_f64(t.trim()).ok_or_else(|| {
+                        LgbmError::InvalidParameter(format!("cannot parse feature_contri value `{t}`"))
+                    })
+                })
+                .collect::<Result<_>>()?;
+        }
         if let Some(v) = p.get("interaction_constraints") {
             // upstream: Config::Set, Common::StringToArrayofArrays<int>(s, '[', ']', ',')
             self.interaction_constraints = v.clone();
@@ -1067,6 +1080,9 @@ impl Config {
             }
             "monotone_constraints_method" => self.monotone_constraints_method.clone(),
             "monotone_penalty" => g(self.monotone_penalty),
+            "feature_contri" => {
+                self.feature_contri.iter().map(|&x| crate::fmt::fmt_g17(x)).collect::<Vec<_>>().join(",")
+            }
             "interaction_constraints" => self.interaction_constraints.clone(),
             "verbosity" => self.verbosity.to_string(),
             "max_bin" => self.max_bin.to_string(),

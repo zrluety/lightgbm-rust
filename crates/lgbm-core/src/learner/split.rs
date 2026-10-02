@@ -23,6 +23,8 @@ pub struct FeatureMeta {
     pub most_freq_bin: u32,
     pub bin_type: BinType,
     pub monotone_type: i8,
+    /// `feature_contri` of the feature (upstream `FeatureMetainfo::penalty`).
+    pub penalty: f64,
 }
 
 /// Regularization and stopping parameters used during split search.
@@ -250,11 +252,33 @@ pub fn find_best_threshold(
     out.default_left = true;
     out.gain = K_MIN_SCORE;
     let sum_hessian = sum_hessian + 2.0 * K_EPSILON;
-    if meta.bin_type == BinType::Categorical {
-        return find_best_threshold_categorical(
+    let splittable = if meta.bin_type == BinType::Categorical {
+        find_best_threshold_categorical(
             hist, meta, p, sum_gradient, sum_hessian, num_data, parent_output, mc, extra_rand, out,
-        );
-    }
+        )
+    } else {
+        find_best_threshold_numerical(hist, meta, p, sum_gradient, sum_hessian, num_data, parent_output, mc, extra_rand, out)
+    };
+    // also scales the kMinScore of an unsplittable feature, as upstream
+    out.gain *= meta.penalty;
+    splittable
+}
+
+/// upstream `FuncForNumrical` dispatch: `BeforeNumerical` plus the
+/// direction scans. `sum_hessian` already includes `2 * kEpsilon`.
+#[allow(clippy::too_many_arguments)]
+fn find_best_threshold_numerical(
+    hist: &[f64],
+    meta: &FeatureMeta,
+    p: &SplitParams,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    parent_output: f64,
+    mc: Option<FeatureConstraint<'_>>,
+    extra_rand: Option<&mut Random>,
+    out: &mut SplitInfo,
+) -> bool {
     // upstream: BeforeNumerical
     out.monotone_type = meta.monotone_type;
     let min_gain_shift =
@@ -767,6 +791,7 @@ mod tests {
             most_freq_bin: 0,
             bin_type: BinType::Numerical,
             monotone_type: 0,
+            penalty: 1.0,
         };
         let mut out = SplitInfo::default();
         let ok = find_best_threshold(&hist, &meta, &params(), 0.0, 20.0, 20, 0.0, None, None, &mut out);
@@ -789,6 +814,7 @@ mod tests {
             most_freq_bin: 1,
             bin_type: BinType::Categorical,
             monotone_type: 0,
+            penalty: 1.0,
         };
         let hist = [0.0, 10.0, -10.0, 10.0, 10.0, 10.0];
         let mut out = SplitInfo::default();

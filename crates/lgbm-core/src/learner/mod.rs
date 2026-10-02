@@ -106,6 +106,7 @@ impl SerialTreeLearner {
                     most_freq_bin: m.most_freq_bin,
                     bin_type: m.bin_type,
                     monotone_type: cfg.monotone_constraints.get(data.real_feature_index(f)).copied().unwrap_or(0),
+                    penalty: cfg.feature_contri.get(data.real_feature_index(f)).copied().unwrap_or(1.0),
                 }
             })
             .collect();

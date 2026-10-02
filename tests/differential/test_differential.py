@@ -1688,6 +1688,22 @@ def test_monotone_errors():
                       mod.Dataset(case.X, label=case.y), 1)
 
 
+def test_feature_contri_errors_and_params():
+    case = next(c for c in CASES if c.name == "contri_basic")
+    for mod in (lgb_rs, lgb_up):
+        with pytest.raises(mod.basic.LightGBMError, match=re.escape(
+                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == "
+                "(config->feature_contri.size())")):
+            mod.train({**case.full_params, "feature_contri": [0.5, 0.5]}, mod.Dataset(case.X, label=case.y), 1)
+    # the model text keeps upstream's %.17g join, and the alias resolves to the same parameter
+    contri = [0.1, 1 / 3, 1.0, 2.5, 1e-7, 1.0]
+    params = {k: v for k, v in case.full_params.items() if k != "feature_contri"}
+    texts = [mod.train({**params, "feature_penalty": contri}, mod.Dataset(case.X, label=case.y), 3)
+             .model_to_string() for mod in (lgb_rs, lgb_up)]
+    assert texts[0] == texts[1]
+    assert "[feature_contri: 0.10000000000000001,0.33333333333333331,1,2.5,9.9999999999999995e-08,1]" in texts[1]
+
+
 def leaf_values(b):
     return np.concatenate([np.asarray(t["leaf_value"], dtype=float) for t in _trees_of(b)])
 

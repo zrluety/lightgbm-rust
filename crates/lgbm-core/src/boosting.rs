@@ -195,14 +195,21 @@ impl Gbdt {
             ));
         }
         // upstream: GBDT::Init
+        if !config.monotone_constraints.is_empty() && train.num_total_features() != config.monotone_constraints.len() {
+            return Err(LgbmError::InvalidParameter(
+                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
+                 (config->monotone_constraints.size())"
+                    .into(),
+            ));
+        }
+        if !config.feature_contri.is_empty() && train.num_total_features() != config.feature_contri.len() {
+            return Err(LgbmError::InvalidParameter(
+                "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
+                 (config->feature_contri.size())"
+                    .into(),
+            ));
+        }
         if !config.monotone_constraints.is_empty() {
-            if train.num_total_features() != config.monotone_constraints.len() {
-                return Err(LgbmError::InvalidParameter(
-                    "Check failed: (static_cast<size_t>(train_data_->num_total_features())) == \
-                     (config->monotone_constraints.size())"
-                        .into(),
-                ));
-            }
             if let Some(o) = objective.as_ref().filter(|o| o.is_renew_tree_output()) {
                 return Err(LgbmError::InvalidParameter(format!(
                     "Cannot use ``monotone_constraints`` in {} objective, please disable it.",

@@ -411,6 +411,16 @@ CASES = [
                                            "max_depth": 4, "num_leaves": 15, "monotone_penalty": 2.0}),
     make_case("mono_100_rounds", "regression", {"monotone_constraints": _MC, "mc_method": "advanced",
                                                 "num_leaves": 63}, n=8000, rounds=100),
+    # feature_contri (upstream FeatureHistogram::FindBestThreshold, gain *= meta_->penalty)
+    make_case("contri_basic", "regression", {"feature_contri": [1.0, 0.5, 0.2, 1.5, 1.0, 0.8]}),
+    make_case("contri_zero", "binary", {"feature_contri": [0.0, 1.0, 1.0, 0.3, 1.0, 1.0]}, weighted=True),
+    make_case("contri_categorical", "regression", {"feature_contri": [0.7, 0.4, 1.0, 2.0, 0.5, 1.0],
+                                                   "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("contri_monotone", "regression", {"feature_contri": [0.6, 1.0, 0.9, 1.0, 0.3, 1.2],
+                                                "monotone_constraints": _MC, "mc_method": "advanced",
+                                                "monotone_penalty": 1.0}),
+    make_case("contri_multiclass", "multiclass", {"num_class": 3, "feature_contri": [0.9, 0.3, 1.0, 1.0, 0.6, 1.1],
+                                                  "extra_trees": True}),
     # interaction constraints (upstream ColSampler::GetByNode with Tree::branch_features)
     make_case("ic_disjoint", "regression", {"interaction_constraints": _IC}),
     make_case("ic_overlap", "regression", {"interaction_constraints": _IC_OVERLAP}),
