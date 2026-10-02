@@ -27,6 +27,14 @@ The engine does not wrap, link to, or call the upstream C++ library. Upstream Li
 | `benches/` | benchmark vs upstream (`bench_vs_upstream.py`) and a criterion micro-benchmark |
 | `docs/` | [COMPATIBILITY](docs/COMPATIBILITY.md), [ARCHITECTURE](docs/ARCHITECTURE.md), [TESTING](docs/TESTING.md), [UPSTREAM](docs/UPSTREAM.md), [hazard design note](docs/hazard/design-note.md) |
 
+## Install
+
+```bash
+pip install lightgbm-rust
+```
+
+Wheels are published for CPython 3.10 and newer on Windows x64, macOS (arm64 and x86_64), and Linux (x86_64 and aarch64). `pip` downloads the matching wheel, so Rust is not required. Rust is required to build from the source distribution or to develop the package locally.
+
 ## Quick start
 
 ```bash
@@ -46,7 +54,7 @@ p = booster.predict(X)
 booster.save_model("model.txt")  # loadable by upstream lightgbm.Booster(model_file=...)
 ```
 
-See [docs/TESTING.md](docs/TESTING.md) for the full test commands. The current results were verified on Linux (WSL 2); native Windows and macOS builds have not been verified yet.
+See [docs/TESTING.md](docs/TESTING.md) for the full test commands. The differential suite was verified on Linux (WSL 2). Each release smoke-tests a small training run on native Windows, macOS, and Linux before publishing.
 
 ## License
 

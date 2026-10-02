@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the built distributions
+        type: choice
+        options:
+          - none
+          - testpypi
+        default: none
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            smoke: true
+          - target: aarch64
+            smoke: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --locked --out dist --compatibility pypi
+      - uses: actions/setup-python@v5
+        if: matrix.smoke
+        with:
+          python-version: "3.12"
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: bash .github/scripts/smoke_test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    name: macos ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64
+            smoke: true
+          - target: x86_64
+            smoke: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - uses: actions/setup-python@v5
+        if: matrix.smoke
+        with:
+          python-version: "3.12"
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: bash .github/scripts/smoke_test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --locked --out dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Smoke test
+        shell: bash
+        run: bash .github/scripts/smoke_test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "tag v$tag does not match pyproject version $version"
+            exit 1
+          fi
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Reject the LightGBM submodule in the sdist
+        run: |
+          python3 - <<'PY'
+          import tarfile
+          from pathlib import Path
+
+          archives = list(Path("dist").glob("*.tar.gz"))
+          if len(archives) != 1:
+              raise SystemExit(f"expected one sdist, found {archives}")
+          with tarfile.open(archives[0]) as archive:
+              names = archive.getnames()
+          bundled = [name for name in names if "third_party/LightGBM" in name]
+          if bundled:
+              raise SystemExit("sdist contains the LightGBM submodule")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish
+    needs: [linux, macos, windows, sdist]
+    if: github.event_name == 'push' || inputs.publish == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}
+      url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/p/lightgbm-rust' || 'https://pypi.org/p/lightgbm-rust' }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+      - name: Publish to PyPI
+        if: github.event_name == 'push'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

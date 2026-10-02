@@ -17,6 +17,11 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
+[project.urls]
+Homepage = "https://github.com/zrluety/lightgbm-rust"
+Repository = "https://github.com/zrluety/lightgbm-rust"
+Issues = "https://github.com/zrluety/lightgbm-rust/issues"
+
 [project.optional-dependencies]
 pandas = ["pandas>=2.0"]
 scipy = ["scipy>=1.10"]
