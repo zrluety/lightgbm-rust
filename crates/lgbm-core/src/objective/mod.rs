@@ -18,6 +18,7 @@ pub mod multiclass;
 pub mod percentile;
 pub mod rank;
 pub mod regression;
+pub mod xentropy;
 
 use crate::config::Config;
 use crate::dataset::Metadata;
@@ -459,6 +460,8 @@ pub fn create_objective(cfg: &Config) -> Result<Option<Objective>> {
         "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::new(cfg)?)))),
         "lambdarank" => Ok(Some(Objective::Row(Box::new(rank::LambdarankNdcg::new(cfg)?)))),
         "rank_xendcg" => Ok(Some(Objective::Row(Box::new(rank::RankXendcg::new(cfg))))),
+        "cross_entropy" => Ok(Some(Objective::Row(Box::new(xentropy::CrossEntropy::new())))),
+        "cross_entropy_lambda" => Ok(Some(Objective::Row(Box::new(xentropy::CrossEntropyLambda::new())))),
         "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("objective={other}"))),
     }
@@ -488,6 +491,8 @@ pub fn objective_from_model_string(s: &str) -> Result<Option<Objective>> {
         "multiclassova" => Ok(Some(Objective::Row(Box::new(multiclass::MulticlassOva::for_prediction(&rest)?)))),
         "lambdarank" => Ok(Some(Objective::Row(Box::new(rank::RankingForPrediction("lambdarank"))))),
         "rank_xendcg" => Ok(Some(Objective::Row(Box::new(rank::RankingForPrediction("rank_xendcg"))))),
+        "cross_entropy" => Ok(Some(Objective::Row(Box::new(xentropy::CrossEntropy::new())))),
+        "cross_entropy_lambda" => Ok(Some(Objective::Row(Box::new(xentropy::CrossEntropyLambda::new())))),
         "" | "custom" => Ok(None),
         other => Err(LgbmError::Unsupported(format!("loading model with objective={other}"))),
     }

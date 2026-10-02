@@ -47,7 +47,7 @@ def test_pandas_input_uses_column_names():
 
 def test_unsupported_features_raise_lightgbm_error(tmp_path):
     X, y = _data()
-    for params in ({"objective": "cross_entropy"}, {"cegb_tradeoff": 0.5}, {"use_quantized_grad": True}):
+    for params in ({"device_type": "gpu"}, {"tree_learner": "data"}, {"num_machines": 2}):
         with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet"):
             lgb.train({**BASE, **params}, lgb.Dataset(X, label=y), 2)
     text = tmp_path / "train.csv"

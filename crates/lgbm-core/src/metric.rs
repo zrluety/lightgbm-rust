@@ -37,6 +37,9 @@ pub enum MetricKind {
     AucMu,
     Ndcg,
     Map,
+    CrossEntropy,
+    CrossEntropyLambda,
+    KullbackLeibler,
 }
 
 impl MetricKind {
@@ -63,6 +66,9 @@ impl MetricKind {
             "auc_mu" => MetricKind::AucMu,
             "ndcg" => MetricKind::Ndcg,
             "map" => MetricKind::Map,
+            "cross_entropy" => MetricKind::CrossEntropy,
+            "cross_entropy_lambda" => MetricKind::CrossEntropyLambda,
+            "kullback_leibler" => MetricKind::KullbackLeibler,
             other => return Err(LgbmError::Unsupported(format!("metric={other}"))),
         })
     }
@@ -90,6 +96,9 @@ impl MetricKind {
             MetricKind::AucMu => "auc_mu",
             MetricKind::Ndcg => "ndcg",
             MetricKind::Map => "map",
+            MetricKind::CrossEntropy => "cross_entropy",
+            MetricKind::CrossEntropyLambda => "cross_entropy_lambda",
+            MetricKind::KullbackLeibler => "kullback_leibler",
         }
     }
 
@@ -153,7 +162,75 @@ pub struct Metric {
     /// R2: total sum of squares around the (weighted) label mean.
     total_sum_squares: f64,
     auc_mu: Option<AucMuState>,
+    /// Kullback-Leibler: the weighted mean label entropy added to the loss.
+    label_entropy: f64,
     num_threads: usize,
+}
+
+/// upstream: xentropy_metric.hpp `XentLoss` (probability clipped at 1e-12).
+fn xent_loss(label: f32, prob: f64) -> f64 {
+    let log_arg_epsilon = 1.0e-12f64;
+    let mut a = label as f64;
+    a *= if prob > log_arg_epsilon { prob.ln() } else { log_arg_epsilon.ln() };
+    let mut b = (1.0f32 - label) as f64;
+    b *= if 1.0 - prob > log_arg_epsilon { (1.0 - prob).ln() } else { log_arg_epsilon.ln() };
+    -(a + b)
+}
+
+/// upstream `XentLambdaLoss`.
+fn xent_lambda_loss(label: f32, weight: f32, hhat: f64) -> f64 {
+    xent_loss(label, 1.0 - (-weight as f64 * hhat).exp())
+}
+
+/// upstream `YentLoss`: the negative entropy of label `p`.
+fn yent_loss(p: f64) -> f64 {
+    let mut hp = 0.0;
+    if p > 0.0 {
+        hp += p * p.ln();
+    }
+    let q = 1.0f32 as f64 - p;
+    if q > 0.0 {
+        hp += q * q.ln();
+    }
+    hp
+}
+
+/// upstream `CrossEntropyMetric::Init` / `CrossEntropyLambdaMetric::Init` /
+/// `KullbackLeiblerDivergence::Init`: label and weight checks, the weight sum
+/// (accumulated in float) and the Kullback-Leibler offset.
+fn xent_init(kind: MetricKind, meta: &Metadata) -> Result<(f64, f64)> {
+    let name = kind.name();
+    crate::objective::xentropy::check_unit_interval(&meta.label, name)?;
+    let n = meta.label.len();
+    let sum_weights = match &meta.weight {
+        None => n as f64,
+        Some(w) => {
+            let (minw, _, sumw) = crate::objective::xentropy::obtain_min_max_sum(w);
+            let bad = match kind {
+                MetricKind::CrossEntropyLambda => (minw <= 0.0).then_some("all weights must be positive"),
+                MetricKind::CrossEntropy => (minw < 0.0).then_some("weights not allowed to be negative"),
+                _ => (minw < 0.0).then_some("at least one weight is negative"),
+            };
+            if let Some(msg) = bad {
+                return Err(LgbmError::InvalidData(format!("[{name}:Init]: (metric) {msg}")));
+            }
+            sumw as f64
+        }
+    };
+    if kind != MetricKind::CrossEntropyLambda && sum_weights <= 0.0 {
+        // CrossEntropyMetric passes __func__ and the name in swapped order
+        let (a, b) = if kind == MetricKind::CrossEntropy { ("Init", name) } else { (name, "Init") };
+        return Err(LgbmError::InvalidData(format!("[{a}:{b}]: sum-of-weights = {sum_weights:.6} is non-positive")));
+    }
+    let mut label_entropy = 0.0f64;
+    if kind == MetricKind::KullbackLeibler {
+        match &meta.weight {
+            None => meta.label.iter().for_each(|&l| label_entropy += yent_loss(l as f64)),
+            Some(w) => meta.label.iter().zip(w).for_each(|(&l, &w)| label_entropy += yent_loss(l as f64) * w as f64),
+        }
+        label_entropy /= sum_weights;
+    }
+    Ok((sum_weights, label_entropy))
 }
 
 /// upstream `AucMuMetric` members set in the constructor / `Init`.
@@ -268,15 +345,20 @@ impl Metric {
                 return Err(LgbmError::InvalidData("Check failed: (label) > (0)".into()));
             }
         }
-        let sum_weights = match &meta.weight {
-            None => meta.label.len() as f64,
-            Some(w) => {
-                let mut s = 0.0f64;
-                for x in w {
-                    s += *x as f64;
-                }
-                s
+        let (sum_weights, label_entropy) = match kind {
+            MetricKind::CrossEntropy | MetricKind::CrossEntropyLambda | MetricKind::KullbackLeibler => {
+                xent_init(kind, meta)?
             }
+            _ => match &meta.weight {
+                None => (meta.label.len() as f64, 0.0),
+                Some(w) => {
+                    let mut s = 0.0f64;
+                    for x in w {
+                        s += *x as f64;
+                    }
+                    (s, 0.0)
+                }
+            },
         };
         let params = LossParams {
             alpha: cfg.alpha,
@@ -306,6 +388,7 @@ impl Metric {
             rank,
             total_sum_squares,
             auc_mu,
+            label_entropy,
             num_threads: resolve_num_threads(cfg.num_threads),
         })
     }
@@ -435,6 +518,11 @@ impl Metric {
             MetricKind::AucMu => self.auc_mu_eval(score),
             MetricKind::BinaryLogloss | MetricKind::BinaryError => self.binary(score, objective),
             MetricKind::MultiLogloss | MetricKind::MultiError => self.multiclass(score, objective),
+            MetricKind::CrossEntropy => self.weighted_sum(score, objective, xent_loss) / self.sum_weights,
+            MetricKind::KullbackLeibler => {
+                self.label_entropy + self.weighted_sum(score, objective, xent_loss) / self.sum_weights
+            }
+            MetricKind::CrossEntropyLambda => self.xent_lambda(score, objective),
             kind => {
                 let p = self.params;
                 let s = self.weighted_sum(score, objective, |label, s| regression_loss(kind, p, label, s));
@@ -554,6 +642,25 @@ impl Metric {
             };
         }
         sum / self.sum_weights
+    }
+
+    /// upstream `CrossEntropyLambdaMetric::Eval`: weights enter the loss
+    /// itself; the mean is over rows.
+    fn xent_lambda(&self, score: &[f64], objective: Option<&Objective>) -> f64 {
+        let mut sum = 0.0f64;
+        let mut t = [0.0f64];
+        for i in 0..self.label.len() {
+            let hhat = match objective {
+                Some(o) => {
+                    o.convert_output(&score[i..i + 1], &mut t);
+                    t[0]
+                }
+                None => score[i].exp().ln_1p(),
+            };
+            let w = self.weight.as_ref().map_or(1.0f32, |w| w[i]);
+            sum += xent_lambda_loss(self.label[i], w, hhat);
+        }
+        sum / self.label.len() as f64
     }
 
     fn weighted_sum(&self, score: &[f64], objective: Option<&Objective>, loss: impl Fn(f32, f64) -> f64) -> f64 {

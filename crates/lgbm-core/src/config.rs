@@ -127,12 +127,13 @@ const NO_EFFECT: &[&str] = &[
 
 pub const SUPPORTED_OBJECTIVES: &[&str] = &[
     "regression", "regression_l1", "huber", "fair", "poisson", "quantile", "mape", "gamma", "tweedie",
-    "binary", "multiclass", "multiclassova", "lambdarank", "rank_xendcg",
+    "binary", "multiclass", "multiclassova", "lambdarank", "rank_xendcg", "cross_entropy",
+    "cross_entropy_lambda",
 ];
 pub const SUPPORTED_METRICS: &[&str] = &[
     "l2", "rmse", "l1", "quantile", "huber", "fair", "poisson", "mape", "gamma", "gamma_deviance",
     "tweedie", "binary_logloss", "binary_error", "auc", "average_precision", "r2", "multi_logloss",
-    "multi_error", "auc_mu", "ndcg", "map",
+    "multi_error", "auc_mu", "ndcg", "map", "cross_entropy", "cross_entropy_lambda", "kullback_leibler",
 ];
 
 /// upstream: include/LightGBM/config.h `ParseObjectiveAlias`.

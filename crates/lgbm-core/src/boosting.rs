@@ -231,11 +231,10 @@ impl Gbdt {
             }
             None => false,
         };
-        let metrics = if config.is_provide_training_metric {
-            Self::make_metrics(&config, &train)?
-        } else {
-            Vec::new()
-        };
+        // upstream: c_api.cpp `CreateObjectiveAndMetrics` inits every training
+        // metric (and so runs its checks) whether or not it is reported
+        let metrics = Self::make_metrics(&config, &train)?;
+        let metrics = if config.is_provide_training_metric { metrics } else { Vec::new() };
         let pool = build_pool(config.num_threads)?;
         let sampler =
             SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;

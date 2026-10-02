@@ -203,6 +203,8 @@ def _reference_gradients(case):
             g = g * w.astype(np.float32)
         h = np.ones_like(y, dtype=np.float32) if w is None else w.astype(np.float32)
         return g, h
+    if case.objective in ("cross_entropy", "xentropy", "cross_entropy_lambda"):
+        return _reference_xent_gradients(case, y, w)
     if case.objective == "multiclass":
         return _reference_softmax_gradients(case, y, w)
     if case.objective == "multiclassova":
@@ -213,6 +215,42 @@ def _reference_gradients(case):
         return np.concatenate([g for g, _ in parts]), np.concatenate([h for _, h in parts])
     init = None if case.init_score is None else case.init_score.astype(np.float64)
     return _reference_binary_gradients(p, y > 0, ww, init)
+
+
+def _reference_xent_gradients(case, y, w):
+    """upstream CrossEntropy / CrossEntropyLambda (xentropy_objective.hpp)."""
+    lam = case.objective == "cross_entropy_lambda"
+    ww = np.ones_like(y) if w is None else w
+    if case.init_score is not None:
+        score = case.init_score.astype(np.float64)
+    elif case.full_params.get("boost_from_average", True):
+        avg = _seqsum(y * ww) / _seqsum(ww)
+        if lam:
+            init = math.log(math.expm1(avg))
+        else:
+            avg = min(max(avg, 1e-15), 1 - 1e-15)
+            init = math.log(avg / (1 - avg))
+        score = np.full_like(y, init if abs(init) > 1e-15 else 0.0)
+    else:
+        score = np.zeros_like(y)
+    if lam and w is None:
+        z = 1 / (1 + _cexp(-score))
+        return (z - y).astype(np.float32), (z * (1 - z)).astype(np.float32)
+    if lam:
+        epf = _cexp(score)
+        hhat = np.array([math.log1p(v) for v in epf])
+        z = 1 - _cexp(-w * hhat)
+        g = (1 - y / z) * w / (1 + 1 / epf)
+        c = 1 / (1 - z)
+        a = w * epf / ((1 + epf) * (1 + epf))
+        b = (c / ((c - 1) * (c - 1))) * (1 + w * epf - c)
+        return g.astype(np.float32), (a * (1 + y * b)).astype(np.float32)
+    big = score > -37.0
+    e = np.where(big, _cexp(-score), _cexp(score))
+    one_minus_y = (np.float32(1) - y.astype(np.float32)).astype(np.float64)  # float arithmetic upstream
+    g = np.where(big, (one_minus_y - y * e) / (1 + e), e - y)
+    h = np.where(big, e / ((1 + e) * (1 + e)), e)
+    return (g * ww).astype(np.float32), (h * ww).astype(np.float32)
 
 
 def _reference_binary_gradients(p, pos, ww, init):
@@ -447,7 +485,8 @@ def test_dump_model(case, recorder):
 
 
 CV_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
-                                           "bin_init_score", "cat_basic", "cat_binary")]
+                                           "bin_init_score", "cat_basic", "cat_binary", "xent_weighted",
+                                           "xentlambda_weighted")]
 
 
 @pytest.mark.parametrize("case", CV_CASES, ids=[c.name for c in CV_CASES])
@@ -474,7 +513,8 @@ def test_cv(case, recorder):
 
 
 CONT_CASES = [c for c in CASES if c.name in ("reg_basic", "bin_weighted", "mc_basic", "l1_weighted", "bag_basic",
-                                             "goss_basic", "bin_init_score", "ova_basic", "cat_basic")]
+                                             "goss_basic", "bin_init_score", "ova_basic", "cat_basic",
+                                             "xentlambda_basic")]
 
 
 @pytest.mark.parametrize("init_kind", ["booster", "model_file", "reused_dataset"])
@@ -1399,6 +1439,43 @@ def test_metric_errors():
                       mod.Dataset(case.X, label=case.y), 1)
         with pytest.raises(mod.basic.LightGBMError, match="Multiclass objective and metrics don't match"):
             mod.train({**case.full_params, "metric": "average_precision"}, mod.Dataset(case.X, label=case.y), 1)
+
+
+def test_xent_errors():
+    """upstream xentropy_objective.hpp / xentropy_metric.hpp Init checks, same messages."""
+    case = next(c for c in CASES if c.name == "xent_basic")
+    y_bad = case.y.copy()
+    y_bad[7] = 1.25
+    w_neg = np.ones(len(case.y))
+    w_neg[3] = -0.5
+    w_zero = np.ones(len(case.y))
+    w_zero[5] = 0.0
+    checks = [
+        ({"objective": "cross_entropy"}, y_bad, None,
+         r"\[cross_entropy\]: does not tolerate element \[#7 = 1.25\] outside \[0, 1\]"),
+        ({"objective": "cross_entropy_lambda"}, y_bad, None,
+         r"\[cross_entropy_lambda\]: does not tolerate element \[#7 = 1.25\] outside \[0, 1\]"),
+        ({"objective": "cross_entropy"}, case.y, w_neg, r"\[cross_entropy\]: at least one weight is negative"),
+        ({"objective": "cross_entropy"}, case.y, np.zeros(len(case.y)), r"\[cross_entropy\]: sum of weights is zero"),
+        ({"objective": "cross_entropy_lambda"}, case.y, w_zero,
+         r"\[cross_entropy_lambda\]: at least one weight is non-positive"),
+        ({"objective": "regression", "metric": "kullback_leibler"}, y_bad, None,
+         r"\[kullback_leibler\]: does not tolerate element \[#7 = 1.25\]"),
+        ({"objective": "regression", "metric": "cross_entropy"}, case.y, w_neg,
+         r"\[cross_entropy:Init\]: \(metric\) weights not allowed to be negative"),
+        ({"objective": "regression", "metric": "cross_entropy_lambda"}, case.y, w_zero,
+         r"\[cross_entropy_lambda:Init\]: \(metric\) all weights must be positive"),
+        ({"objective": "regression", "metric": "kullback_leibler"}, case.y, w_neg,
+         r"\[kullback_leibler:Init\]: \(metric\) at least one weight is negative"),
+        ({"objective": "regression", "metric": "cross_entropy"}, case.y, np.zeros(len(case.y)),
+         r"\[Init:cross_entropy\]: sum-of-weights = 0.000000 is non-positive"),
+        ({"objective": "regression", "metric": "kullback_leibler"}, case.y, np.zeros(len(case.y)),
+         r"\[kullback_leibler:Init\]: sum-of-weights = 0.000000 is non-positive"),
+    ]
+    for params, y, w, msg in checks:
+        for mod in (lgb_rs, lgb_up):
+            with pytest.raises(mod.basic.LightGBMError, match=msg):
+                mod.train({**DETERMINISTIC, **params}, mod.Dataset(case.X, label=y, weight=w), 1)
 
 
 def test_monotone_methods_differ_and_hold():

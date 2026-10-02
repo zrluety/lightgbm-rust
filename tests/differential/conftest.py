@@ -226,6 +226,9 @@ def _target(rng: np.random.Generator, X: np.ndarray, objective: str, num_labels:
         # compound Poisson-gamma: exact zeros plus a continuous positive part
         counts = rng.poisson(np.exp(f / 2) * 0.8)
         return np.array([rng.gamma(2.0, 0.5, size=k).sum() for k in counts])
+    if objective in ("cross_entropy", "cross_entropy_lambda", "xentropy"):
+        # soft labels in [0, 1], about 10% clipped to exactly 0 or 1
+        return np.clip(1 / (1 + np.exp(-f)) + rng.normal(scale=0.2, size=n), 0.0, 1.0)
     return (rng.random(n) < 1 / (1 + np.exp(-f))).astype(np.float64)
 
 
@@ -303,6 +306,17 @@ CASES = [
     make_case("gamma_weighted", "gamma", {}, weighted=True),
     make_case("tweedie_basic", "tweedie", {"tweedie_variance_power": 1.2}),
     make_case("tweedie_weighted", "tweedie", {"metric": ["tweedie", "poisson", "l2"]}, weighted=True),
+    # upstream xentropy_objective.hpp / xentropy_metric.hpp
+    make_case("xent_basic", "cross_entropy", {"metric": ["cross_entropy", "kullback_leibler", "cross_entropy_lambda"]}),
+    make_case("xent_weighted", "cross_entropy", {"metric": ["cross_entropy", "kullback_leibler"]}, weighted=True),
+    make_case("xent_init_score", "cross_entropy", {}, init_score=True),
+    make_case("xent_no_boost_from_average", "cross_entropy", {"boost_from_average": False}, kind="nan_zero"),
+    make_case("xent_alias", "xentropy", {"metric": "kldiv"}),
+    make_case("xentlambda_basic", "cross_entropy_lambda",
+              {"metric": ["cross_entropy_lambda", "cross_entropy", "kullback_leibler"]}),
+    make_case("xentlambda_weighted", "cross_entropy_lambda", {"metric": ["cross_entropy_lambda", "cross_entropy"]},
+              weighted=True),
+    make_case("xentlambda_init_score", "cross_entropy_lambda", {}, init_score=True, weighted=True),
     make_case("mc_basic", "multiclass", {"num_class": 3, "metric": ["multi_logloss", "multi_error"]}),
     make_case("mc_weighted", "multiclass", {"num_class": 4}, weighted=True),
     make_case("mc_top_k", "multiclass",

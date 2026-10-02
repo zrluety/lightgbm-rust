@@ -531,7 +531,7 @@ impl Dataset {
         if used.is_empty() {
             return Err(LgbmError::InvalidParameter("Check failed: (num_used_row_indices) > (0)".into()));
         }
-        check_elements_interval_closed(used, 0, self.num_data as i32 - 1, "Used indices of subset")?;
+        check_elements_interval_closed(used, 0, self.num_data as i32 - 1, "Used indices of subset", |v| v.to_string())?;
         if used.windows(2).any(|w| w[0] > w[1]) {
             return Err(LgbmError::InvalidData("used_row_indices should be sorted in Subset".into()));
         }
@@ -810,12 +810,21 @@ pub(crate) fn find_bin_mappers(
 }
 
 /// upstream: utils/common.h `CheckElementsIntervalClosed` (same pairwise scan,
-/// so the reported element matches).
-fn check_elements_interval_closed(y: &[i32], ymin: i32, ymax: i32, caller: &str) -> Result<()> {
+/// so the reported element matches). `show` formats a value as upstream's
+/// `std::ostream` does.
+pub(crate) fn check_elements_interval_closed<T: PartialOrd + Copy>(
+    y: &[T],
+    ymin: T,
+    ymax: T,
+    caller: &str,
+    show: impl Fn(T) -> String,
+) -> Result<()> {
     let fatal = |i: usize| {
         Err(LgbmError::InvalidData(format!(
-            "[{caller}]: does not tolerate element [#{i} = {}] outside [{ymin}, {ymax}]",
-            y[i]
+            "[{caller}]: does not tolerate element [#{i} = {}] outside [{}, {}]",
+            show(y[i]),
+            show(ymin),
+            show(ymax)
         )))
     };
     let mut i = 1;
