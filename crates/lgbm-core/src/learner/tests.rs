@@ -30,7 +30,7 @@ fn first_split_separates_step() {
     let mut l = SerialTreeLearner::new(ds.clone(), &cfg);
     let grad: Vec<f32> = y.iter().map(|v| -v).collect();
     let hess = vec![1.0f32; n];
-    let tree = l.train(&grad, &hess);
+    let tree = l.train(&grad, &hess).unwrap();
     assert_eq!(tree.num_leaves, 2);
     assert_eq!(tree.split_feature[0], 0);
     assert_eq!(tree.leaf_count, vec![100, 100]);
@@ -51,7 +51,7 @@ fn partition_is_stable() {
     let mut l = SerialTreeLearner::new(ds, &cfg);
     let grad: Vec<f32> = (0..n).map(|i| ((i * 7919) % 13) as f32 - 6.0).collect();
     let hess = vec![1.0f32; n];
-    let tree = l.train(&grad, &hess);
+    let tree = l.train(&grad, &hess).unwrap();
     let p = l.partition();
     let mut seen = 0;
     for leaf in 0..tree.num_leaves {
@@ -71,7 +71,7 @@ fn max_depth_and_min_data_respected() {
     let mut l = SerialTreeLearner::new(ds, &cfg);
     let grad: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
     let hess = vec![1.0f32; n];
-    let tree = l.train(&grad, &hess);
+    let tree = l.train(&grad, &hess).unwrap();
     assert!(tree.num_leaves <= 4);
     assert!(tree.max_depth() <= 2);
     assert!(tree.leaf_count.iter().all(|&c| c >= 40));
@@ -84,6 +84,6 @@ fn constant_gradient_gives_single_leaf() {
     let cfg = Config::default();
     let ds = dataset(&x, &y, n, &cfg);
     let mut l = SerialTreeLearner::new(ds, &cfg);
-    let tree = l.train(&vec![0.5f32; n], &vec![1.0f32; n]);
+    let tree = l.train(&vec![0.5f32; n], &vec![1.0f32; n]).unwrap();
     assert_eq!(tree.num_leaves, 1);
 }

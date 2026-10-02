@@ -258,6 +258,9 @@ _IC_OVERLAP = [[0, 1, 2], [2, 3], [4]]
 _RF_BAG = {"boosting": "rf", "bagging_freq": 1, "bagging_fraction": 0.7}
 _FORCED_A = str(ROOT / "tests" / "differential" / "data" / "forced_bins_a.json")
 _FORCED_CAT = str(ROOT / "tests" / "differential" / "data" / "forced_bins_categorical.json")
+_FS = {name: str(ROOT / "tests" / "differential" / "data" / f"forced_splits_{name}.json")
+       for name in ("three", "categorical", "deep", "noise", "partial", "sub", "root")}
+_COL = {"force_col_wise": True, "force_row_wise": False}
 _CEGB_LAZY = [0.1, 0.5, 0.02, 1.0, 0.3, 0.05]
 _CEGB_COUPLED = [50.0, 200.0, 10.0, 400.0, 30.0, 5.0]
 
@@ -469,6 +472,39 @@ CASES = [
                                         "cegb_penalty_feature_coupled": _CEGB_COUPLED}),
     make_case("cegb_dart", "regression", {"boosting": "dart", "cegb_penalty_feature_lazy": _CEGB_LAZY,
                                           "bagging_fraction": 0.3, "bagging_freq": 2}),
+    # forced splits (upstream SerialTreeLearner::ForceSplits): forcing below a leaf that was not split
+    # (max_depth, min_data_in_leaf, an unsplittable parent, a by-tree-excluded feature) reads histograms left
+    # in that leaf's pool slot by earlier builds, as upstream does
+    make_case("fs_three", "regression", {"forcedsplits_filename": _FS["three"]}),
+    make_case("fs_root_binary", "binary", {"forcedsplits_filename": _FS["root"]}, weighted=True),
+    make_case("fs_categorical", "regression", {"forcedsplits_filename": _FS["categorical"],
+                                               "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("fs_smooth", "regression", {"forcedsplits_filename": _FS["three"], "path_smooth": 3.0}),
+    make_case("fs_l1_max_delta", "regression", {"forcedsplits_filename": _FS["three"], "lambda_l1": 2.0,
+                                                "max_delta_step": 0.3, "lambda_l2": 1.0}),
+    make_case("fs_l1_col_wise", "regression", {**_COL, "forcedsplits_filename": _FS["three"], "lambda_l1": 2.0,
+                                               "max_delta_step": 0.3}),
+    make_case("fs_multiclass", "multiclass", {"forcedsplits_filename": _FS["three"], "num_class": 3}),
+    make_case("fs_bag_subset", "regression", {"forcedsplits_filename": _FS["three"], "bagging_fraction": 0.4,
+                                              "bagging_freq": 1}),
+    make_case("fs_nan", "regression", {"forcedsplits_filename": _FS["three"]}, kind="nan_zero"),
+    make_case("fs_zero_as_missing", "regression", {"forcedsplits_filename": _FS["three"], "zero_as_missing": True},
+              kind="nan_zero"),
+    make_case("fs_monotone", "regression", {"forcedsplits_filename": _FS["three"], "monotone_constraints": _MC,
+                                            "mc_method": "advanced"}),
+    make_case("fs_cegb", "regression", {"forcedsplits_filename": _FS["three"], "cegb_penalty_feature_lazy": _CEGB_LAZY}),
+    make_case("fs_abort", "regression", {"forcedsplits_filename": _FS["noise"], "min_gain_to_split": 5.0}),
+    make_case("fs_abort_col_wise", "regression", {**_COL, "forcedsplits_filename": _FS["noise"],
+                                                  "min_gain_to_split": 5.0}),
+    make_case("fs_partial", "regression", {"forcedsplits_filename": _FS["partial"]}),
+    make_case("fs_max_depth", "regression", {"forcedsplits_filename": _FS["deep"], "max_depth": 2}),
+    make_case("fs_min_data", "regression", {"forcedsplits_filename": _FS["deep"], "min_data_in_leaf": 400}),
+    make_case("fs_bytree_row_wise", "regression", {"forcedsplits_filename": _FS["sub"], "feature_fraction": 0.67}),
+    make_case("fs_bytree_col_wise", "regression", {**_COL, "forcedsplits_filename": _FS["sub"],
+                                                   "feature_fraction": 0.34}),
+    make_case("fs_rf", "regression", {**_RF_BAG, "forcedsplits_filename": _FS["three"]}),
+    make_case("fs_dart", "regression", {"forcedsplits_filename": _FS["three"], "boosting": "dart"}),
+    make_case("fs_extra_trees", "regression", {"forcedsplits_filename": _FS["three"], "extra_trees": True}),
     # interaction constraints (upstream ColSampler::GetByNode with Tree::branch_features)
     make_case("ic_disjoint", "regression", {"interaction_constraints": _IC}),
     make_case("ic_overlap", "regression", {"interaction_constraints": _IC_OVERLAP}),

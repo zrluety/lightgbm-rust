@@ -1743,6 +1743,49 @@ def test_cegb_errors_and_params():
     assert "[cegb_tradeoff: 0.5]" in texts[1]
 
 
+def test_forced_splits_change_trees():
+    """Every fs_* case changes upstream's trees."""
+    for case in CASES:
+        if not case.name.startswith("fs_"):
+            continue
+        trees = []
+        for params in (case.full_params, {k: v for k, v in case.full_params.items() if k != "forcedsplits_filename"}):
+            b = lgb_up.train(params, lgb_up.Dataset(case.X, label=case.y, weight=case.weight), case.num_boost_round)
+            trees.append(b.model_to_string().split("Tree=0")[1].split("end of trees")[0])
+        assert trees[0] != trees[1], case.name
+
+
+def test_forced_splits_errors_and_files(tmp_path):
+    case = next(c for c in CASES if c.name == "fs_three")
+    files = {"index.json": '{"feature": 0, "threshold": 0.5, "right": {"feature": 6, "threshold": 0.0}}',
+             "empty_side.json": '{"feature": 0, "threshold": 100.0}',
+             "bad.json": '{"feature": 0,', "array.json": "[1, 2]"}
+    for name, text in files.items():
+        (tmp_path / name).write_text(text)
+    sub = next(c for c in CASES if c.name == "fs_bytree_row_wise")
+    errors = [
+        (case, {"forcedsplits_filename": str(tmp_path / "index.json")},
+         "Forced splits file includes feature index 6, but maximum feature index in dataset is 5"),
+        (case, {"forcedsplits_filename": str(tmp_path / "empty_side.json")},
+         "Check failed: (best_split_info.right_count) > (0)"),
+        # a forced feature outside the by-tree sample is read from a histogram left by an earlier build
+        (sub, {"feature_fraction": 0.34}, "Check failed: (best_split_info.right_count) > (0)"),
+    ]
+    for c, extra, msg in errors:
+        for mod in (lgb_rs, lgb_up):
+            with pytest.raises(mod.basic.LightGBMError, match=re.escape(msg)):
+                mod.train({**c.full_params, **extra}, mod.Dataset(c.X, label=c.y), c.num_boost_round)
+    # a missing or unparsable file forces nothing; a non-object reads as {"feature": 0, "threshold": 0}
+    base = {k: v for k, v in case.full_params.items() if k != "forcedsplits_filename"}
+    plain = lgb_up.train(base, lgb_up.Dataset(case.X, label=case.y), 5).model_to_string()
+    for name in ("missing.json", "bad.json", "array.json"):
+        params = {**case.full_params, "forcedsplits_filename": str(tmp_path / name)}
+        texts = [mod.train(params, mod.Dataset(case.X, label=case.y), 5).model_to_string() for mod in (lgb_rs, lgb_up)]
+        assert texts[0] == texts[1]
+        trees = texts[1].split("Tree=0")[1].split("end of trees")[0]
+        assert (trees == plain.split("Tree=0")[1].split("end of trees")[0]) == (name != "array.json")
+
+
 def test_bin_params_errors_and_warnings(tmp_path, capfd):
     case = next(c for c in CASES if c.name == "bins_by_feature")
     bad_json = {"not_array.json": '{"feature": 0}', "bad.json": "[{", "range.json": '[{"feature": 6}]'}

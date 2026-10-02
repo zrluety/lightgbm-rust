@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::consts::K_EPSILON;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
-use crate::learner::{Cegb, SerialTreeLearner};
+use crate::learner::{Cegb, SerialTreeLearner, load_forced_splits};
 use crate::metric::{Metric, MetricKind};
 use crate::objective::{Objective, ScoreView, create_objective};
 use crate::random::Random;
@@ -247,7 +247,9 @@ impl Gbdt {
             SampleStrategy::new(&config, &train, objective.as_ref(), ntpi, resolve_num_threads(config.num_threads))?;
         // upstream: SerialTreeLearner::Init -> CostEfficientGradientBoosting::Init
         Cegb::check(&config, train.num_total_features())?;
-        let learner = SerialTreeLearner::new(train.clone(), &config);
+        let mut learner = SerialTreeLearner::new(train.clone(), &config);
+        // upstream: GBDT::Init loads the forced splits, then CheckForcedSplitFeatures
+        learner.set_forced_split(load_forced_splits(&config.forcedsplits_filename, train.num_total_features() as i32 - 1)?);
         if is_rf {
             // upstream: RF::Init after GBDT::Init
             if has_init_score {
@@ -630,8 +632,8 @@ impl Gbdt {
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 match &self.pool {
-                    Some(p) => p.install(|| learner.train(g, h)),
-                    None => learner.train(g, h),
+                    Some(p) => p.install(|| learner.train(g, h))?,
+                    None => learner.train(g, h)?,
                 }
             } else {
                 Tree::new(2)
@@ -814,8 +816,8 @@ impl Gbdt {
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 let tree = match &self.pool {
-                    Some(p) => p.install(|| learner.train(g, h)),
-                    None => learner.train(g, h),
+                    Some(p) => p.install(|| learner.train(g, h))?,
+                    None => learner.train(g, h)?,
                 };
                 if let Some(s) = st.sampler.as_ref().filter(|s| s.by_query_subset()) {
                     for (i, &row) in s.in_bag().iter().enumerate() {

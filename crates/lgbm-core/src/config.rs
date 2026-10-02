@@ -106,7 +106,7 @@ const HONORED: &[&str] = &[
     "cegb_penalty_feature_coupled", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
     "group_column", "ignore_column", "precise_float_parser", "two_round", "max_bin_by_feature",
-    "forcedbins_filename",
+    "forcedbins_filename", "forcedsplits_filename",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -434,6 +434,8 @@ pub struct Config {
     pub max_bin_by_feature: Vec<i32>,
     /// JSON file of forced numerical bin bounds (empty: none).
     pub forcedbins_filename: String,
+    /// JSON file of splits forced at the top of every tree (empty: none).
+    pub forcedsplits_filename: String,
     pub min_data_in_bin: i32,
     pub bin_construct_sample_cnt: i32,
     pub data_random_seed: i32,
@@ -552,6 +554,7 @@ impl Default for Config {
             max_bin: 255,
             max_bin_by_feature: Vec::new(),
             forcedbins_filename: String::new(),
+            forcedsplits_filename: String::new(),
             min_data_in_bin: 3,
             bin_construct_sample_cnt: 200_000,
             data_random_seed: 1,
@@ -863,6 +866,9 @@ impl Config {
         if let Some(v) = p.get("forcedbins_filename") {
             self.forcedbins_filename = v.clone();
         }
+        if let Some(v) = p.get("forcedsplits_filename") {
+            self.forcedsplits_filename = v.clone();
+        }
         set_int!(min_data_in_bin);
         set_int!(bin_construct_sample_cnt);
         set_int!(data_random_seed);
@@ -1128,6 +1134,7 @@ impl Config {
                 self.max_bin_by_feature.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(",")
             }
             "forcedbins_filename" => self.forcedbins_filename.clone(),
+            "forcedsplits_filename" => self.forcedsplits_filename.clone(),
             "min_data_in_bin" => self.min_data_in_bin.to_string(),
             "bin_construct_sample_cnt" => self.bin_construct_sample_cnt.to_string(),
             "data_random_seed" => self.data_random_seed.to_string(),

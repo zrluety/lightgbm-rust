@@ -264,6 +264,132 @@ pub fn find_best_threshold(
     splittable
 }
 
+/// upstream `GetLeafGain<true, true, USE_SMOOTHING>`: L1 thresholding and the
+/// max-output clamp are always applied, so the gain goes through the output.
+#[inline]
+fn forced_leaf_gain(g: f64, h: f64, p: &SplitParams, smooth: bool, num_data: i32, parent_output: f64) -> f64 {
+    let out = leaf_output_t(g, h, p, true, true, smooth, num_data, parent_output);
+    forced_gain_given_output(g, h, p, out)
+}
+
+/// upstream `GetLeafGainGivenOutput<true>`.
+#[inline]
+fn forced_gain_given_output(g: f64, h: f64, p: &SplitParams, output: f64) -> f64 {
+    let sg = threshold_l1(g, p.lambda_l1);
+    -(2.0 * sg * output + (h + p.lambda_l2) * output * output)
+}
+
+/// The split of a leaf at bin `threshold`, for a forced split. Leaves
+/// `out.gain` at `K_MIN_SCORE` when the split does not improve the gain
+/// (upstream then warns "'Forced Split' will be ignored since the gain
+/// getting worse.").
+///
+/// upstream: `FeatureHistogram::GatherInfoForThreshold` (numerical: bins
+/// above `threshold` go right, missing values left; categorical: one-hot on
+/// `threshold`). `parent_output` is the leaf's `LeafSplits::weight()`, which
+/// also gives the no-split gain; `sum_hessian` is the leaf's raw sum.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_info_for_threshold(
+    hist: &[f64],
+    meta: &FeatureMeta,
+    p: &SplitParams,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    threshold: u32,
+    num_data: i32,
+    parent_output: f64,
+    out: &mut SplitInfo,
+) {
+    let g = |t: i32| hist[2 * t as usize];
+    let h = |t: i32| hist[2 * t as usize + 1];
+    let smooth = p.use_smoothing();
+    let min_gain_shift = forced_gain_given_output(sum_gradient, sum_hessian, p, parent_output) + p.min_gain_to_split;
+    let cnt_factor = num_data as f64 / sum_hessian;
+    if meta.bin_type == BinType::Categorical {
+        out.default_left = false;
+        if threshold >= meta.num_bin as u32 || threshold == 0 {
+            // upstream warns "Invalid categorical threshold split"
+            out.gain = K_MIN_SCORE;
+            return;
+        }
+        let t = threshold as i32 - meta.offset;
+        let (grad, hess) = (g(t), h(t));
+        let left_count = round_int(hess * cnt_factor);
+        let right_count = num_data - left_count;
+        let sum_left_hessian = hess + K_EPSILON;
+        let sum_right_hessian = sum_hessian - sum_left_hessian;
+        let sum_left_gradient = grad;
+        let sum_right_gradient = sum_gradient - sum_left_gradient;
+        let current_gain =
+            forced_leaf_gain(sum_right_gradient, sum_right_hessian, p, smooth, right_count, parent_output)
+                + forced_leaf_gain(sum_left_gradient, sum_left_hessian, p, smooth, left_count, parent_output);
+        if current_gain.is_nan() || current_gain <= min_gain_shift {
+            out.gain = K_MIN_SCORE;
+            return;
+        }
+        out.left_output = leaf_output_t(sum_left_gradient, sum_left_hessian, p, true, true, smooth, left_count, parent_output);
+        out.left_count = left_count;
+        out.left_sum_gradient = sum_left_gradient;
+        out.left_sum_hessian = sum_left_hessian - K_EPSILON;
+        out.right_output =
+            leaf_output_t(sum_right_gradient, sum_right_hessian, p, true, true, smooth, right_count, parent_output);
+        out.right_count = right_count;
+        out.right_sum_gradient = sum_gradient - sum_left_gradient;
+        out.right_sum_hessian = sum_right_hessian - K_EPSILON;
+        out.gain = current_gain - min_gain_shift;
+        out.cat_threshold = vec![threshold];
+        return;
+    }
+    let offset = meta.offset;
+    let mut sum_right_gradient = 0.0f64;
+    let mut sum_right_hessian = K_EPSILON;
+    let mut right_count: i32 = 0;
+    let skip_default_bin = meta.missing_type == MissingType::Zero;
+    let use_na_as_missing = meta.missing_type == MissingType::NaN;
+    let mut t = meta.num_bin - 1 - offset - use_na_as_missing as i32;
+    let t_end = 1 - offset;
+    while t >= t_end {
+        if (t + offset) as u32 <= threshold {
+            break;
+        }
+        if !(skip_default_bin && (t + offset) == meta.default_bin as i32) {
+            sum_right_gradient += g(t);
+            sum_right_hessian += h(t);
+            right_count += round_int(h(t) * cnt_factor);
+        }
+        t -= 1;
+    }
+    let sum_left_gradient = sum_gradient - sum_right_gradient;
+    let sum_left_hessian = sum_hessian - sum_right_hessian;
+    let left_count = num_data - right_count;
+    let current_gain = forced_leaf_gain(sum_left_gradient, sum_left_hessian, p, smooth, left_count, parent_output)
+        + forced_leaf_gain(sum_right_gradient, sum_right_hessian, p, smooth, right_count, parent_output);
+    if current_gain.is_nan() || current_gain <= min_gain_shift {
+        out.gain = K_MIN_SCORE;
+        return;
+    }
+    out.threshold = threshold;
+    out.left_output = leaf_output_t(sum_left_gradient, sum_left_hessian, p, true, true, smooth, left_count, parent_output);
+    out.left_count = left_count;
+    out.left_sum_gradient = sum_left_gradient;
+    out.left_sum_hessian = sum_left_hessian - K_EPSILON;
+    out.right_output = leaf_output_t(
+        sum_gradient - sum_left_gradient,
+        sum_hessian - sum_left_hessian,
+        p,
+        true,
+        true,
+        smooth,
+        right_count,
+        parent_output,
+    );
+    out.right_count = num_data - left_count;
+    out.right_sum_gradient = sum_gradient - sum_left_gradient;
+    out.right_sum_hessian = sum_hessian - sum_left_hessian - K_EPSILON;
+    out.gain = current_gain - min_gain_shift;
+    out.default_left = true;
+}
+
 /// upstream `FuncForNumrical` dispatch: `BeforeNumerical` plus the
 /// direction scans. `sum_hessian` already includes `2 * kEpsilon`.
 #[allow(clippy::too_many_arguments)]
