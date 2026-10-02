@@ -256,6 +256,8 @@ _MC = [1, -1, 1, 0, -1, 0]
 _IC = [[0, 1], [2, 3], [4, 5]]
 _IC_OVERLAP = [[0, 1, 2], [2, 3], [4]]
 _RF_BAG = {"boosting": "rf", "bagging_freq": 1, "bagging_fraction": 0.7}
+_FORCED_A = str(ROOT / "tests" / "differential" / "data" / "forced_bins_a.json")
+_FORCED_CAT = str(ROOT / "tests" / "differential" / "data" / "forced_bins_categorical.json")
 
 CASES = [
     make_case("reg_basic", "regression", {}),
@@ -421,6 +423,21 @@ CASES = [
                                                 "monotone_penalty": 1.0}),
     make_case("contri_multiclass", "multiclass", {"num_class": 3, "feature_contri": [0.9, 0.3, 1.0, 1.0, 0.6, 1.1],
                                                   "extra_trees": True}),
+    # upstream DatasetLoader::GetForcedBins, BinMapper::FindBin with forced bounds, max_bin_by_feature
+    make_case("bins_forced", "regression", {"forcedbins_filename": _FORCED_A, "max_bin": 15}),
+    make_case("bins_forced_wide", "binary", {"forcedbins_filename": _FORCED_A}, weighted=True),
+    make_case("bins_forced_nan_zero", "regression", {"forcedbins_filename": _FORCED_A, "max_bin": 12},
+              kind="nan_zero"),
+    make_case("bins_forced_zero_as_missing", "regression", {"forcedbins_filename": _FORCED_A, "max_bin": 9,
+                                                            "zero_as_missing": True}, kind="nan_zero"),
+    make_case("bins_forced_categorical", "regression", {"forcedbins_filename": _FORCED_CAT, "max_bin": 6,
+                                                        "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("bins_by_feature", "regression", {"max_bin_by_feature": [4, 255, 16, 63, 2, 7]}, kind="nan_zero"),
+    make_case("bins_by_feature_categorical", "binary", {"max_bin_by_feature": [8, 10, 32, 3, 40, 255],
+                                                        "categorical_feature": "1,3,4"}, kind="categorical"),
+    make_case("bins_by_feature_forced", "regression", {"max_bin_by_feature": [5, 3, 4, 300, 2, 6],
+                                                       "forcedbins_filename": _FORCED_A, "min_data_in_bin": 1},
+              kind="discrete"),
     # interaction constraints (upstream ColSampler::GetByNode with Tree::branch_features)
     make_case("ic_disjoint", "regression", {"interaction_constraints": _IC}),
     make_case("ic_overlap", "regression", {"interaction_constraints": _IC_OVERLAP}),

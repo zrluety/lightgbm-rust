@@ -30,7 +30,16 @@ from .conftest import (
 )
 
 _BIN_PARAMS = ("max_bin", "min_data_in_bin", "bin_construct_sample_cnt", "data_random_seed", "seed", "use_missing",
-               "zero_as_missing", "feature_pre_filter", "min_data_in_leaf", "categorical_feature")
+               "zero_as_missing", "feature_pre_filter", "min_data_in_leaf", "categorical_feature",
+               "max_bin_by_feature", "forcedbins_filename")
+
+
+def _dump_bin_params(path):
+    """The ``max_bin_by_feature`` and ``forced_bins`` lines of ``_dump_text``."""
+    lines = path.read_text().splitlines()
+    i = next(k for k, ln in enumerate(lines) if ln.startswith("forced_bins: "))
+    n_total = int(lines[1].split(": ")[1])
+    return "\n".join([ln for ln in lines if ln.startswith("max_bin_by_feature: ")] + lines[i:i + 1 + n_total])
 
 
 @pytest.mark.parametrize("case", CASES, ids=case_ids())
@@ -48,6 +57,10 @@ def test_bins(case, recorder, tmp_path):
     for j in used_up:
         if j in used_rs:
             rec.compare(f"bin_index[f{j}]", "bins", rs._bin_indices(j), up_cols[j])
+    if "max_bin_by_feature" in params or "forcedbins_filename" in params:
+        rs._dump_text(tmp_path / "rs.txt")
+        rec.compare("dump_bin_params", "bins", _dump_bin_params(tmp_path / "rs.txt"),
+                    _dump_bin_params(tmp_path / "up.txt"))
     rec.finish()
 
 
@@ -1702,6 +1715,63 @@ def test_feature_contri_errors_and_params():
              .model_to_string() for mod in (lgb_rs, lgb_up)]
     assert texts[0] == texts[1]
     assert "[feature_contri: 0.10000000000000001,0.33333333333333331,1,2.5,9.9999999999999995e-08,1]" in texts[1]
+
+
+def test_bin_params_errors_and_warnings(tmp_path, capfd):
+    case = next(c for c in CASES if c.name == "bins_by_feature")
+    bad_json = {"not_array.json": '{"feature": 0}', "bad.json": "[{", "range.json": '[{"feature": 6}]'}
+    for name, text in bad_json.items():
+        (tmp_path / name).write_text(text)
+    errors = [
+        ({"max_bin_by_feature": [4, 4]},
+         "Check failed: (static_cast<size_t>(num_col)) == (config_.max_bin_by_feature.size())"),
+        ({"max_bin_by_feature": [4, 4, 1, 4, 4, 4]},
+         "Check failed: (*(std::min_element(config_.max_bin_by_feature.begin(), "
+         "config_.max_bin_by_feature.end()))) > (1)"),
+        ({"forcedbins_filename": str(tmp_path / "not_array.json")}, "Check failed: forced_bins_json.is_array()"),
+        ({"forcedbins_filename": str(tmp_path / "bad.json")}, "Check failed: forced_bins_json.is_array()"),
+        ({"forcedbins_filename": str(tmp_path / "range.json")}, "Check failed: (feature_num) < (num_total_features)"),
+    ]
+    for extra, msg in errors:
+        for mod in (lgb_rs, lgb_up):
+            with pytest.raises(mod.basic.LightGBMError, match=re.escape(msg)):
+                mod.Dataset(case.X, label=case.y, params={"verbosity": -1, **extra}).construct()
+    # warnings: a missing file and forced bins on a categorical feature
+    missing = str(tmp_path / "missing.json")
+    cat = next(c for c in CASES if c.name == "bins_forced_categorical")
+    logs = []
+    for mod in (lgb_rs, lgb_up):
+        capfd.readouterr()
+        mod.Dataset(case.X, label=case.y, params={"forcedbins_filename": missing, "verbosity": 1}).construct()
+        mod.Dataset(cat.X, label=cat.y, params={"verbosity": 1, "forcedbins_filename": cat.params["forcedbins_filename"]},
+                    categorical_feature=[1, 3, 4]).construct()
+        out = capfd.readouterr().out
+        logs.append([ln for ln in out.splitlines() if "Will ignore" in ln])
+    assert logs[0] == logs[1]
+    assert logs[1] == [f"[LightGBM] [Warning] Could not open {missing}. Will ignore.",
+                       "[LightGBM] [Warning] Feature 1 is categorical. Will ignore forced bins for this feature.",
+                       "[LightGBM] [Warning] Feature 4 is categorical. Will ignore forced bins for this feature."]
+
+
+def test_bin_params_reset_and_binary(tmp_path):
+    case = next(c for c in CASES if c.name == "bins_by_feature_forced")
+    params = {k: v for k, v in case.full_params.items() if k in _BIN_PARAMS}
+    for mod in (lgb_rs, lgb_up):
+        ds = mod.Dataset(case.X, label=case.y, params={**params, "verbosity": -1}).construct()
+        with pytest.raises(mod.basic.LightGBMError,
+                           match=re.escape("Cannot change max_bin_by_feature after constructed Dataset handle.")):
+            ds._update_params({"max_bin_by_feature": [5, 3, 4, 300, 2, 7]})
+        ds._update_params({"max_bin_by_feature": [5, 3, 4, 300, 2, 6]})
+        path = tmp_path / f"{mod.__name__}.bin"
+        ds.save_binary(path)
+        with pytest.raises(mod.basic.LightGBMError,
+                           match="Parameter max_bin_by_feature cannot be changed when loading from binary file."):
+            mod.Dataset(str(path), params={k: v for k, v in params.items() if k != "max_bin_by_feature"}
+                        ).construct()
+        # a given value replaces the stored one
+        back = mod.Dataset(str(path), params={**params, "max_bin_by_feature": [9, 9, 9, 9, 9, 9],
+                                              "verbosity": -1}).construct()
+        assert back.num_data() == len(case.y)
 
 
 def leaf_values(b):

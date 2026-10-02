@@ -1,0 +1,7 @@
+[
+    {"feature": 0, "bin_upper_bound": [-1.5, -0.5, -0.5, 0.0, 0.25, 0.25, 0.7, 1.2, 2.0]},
+    {"feature": 2, "bin_upper_bound": [0.1, -0.3, 1e-40, 3.5]},
+    {"feature": 1, "bin_upper_bound": []},
+    {"feature": 2, "bin_upper_bound": [3.5, 0.8]},
+    {"feature": 5}
+]

@@ -1321,24 +1321,25 @@ class Dataset:
     def _dump_text(self, filename: Union[str, Path]) -> "Dataset":
         """Write per-row bin indices in upstream ``Dataset::DumpTextFile`` format.
 
-        Differences: ``num_groups`` equals the number of used features (no
-        exclusive feature bundling), and ``max_bin_by_feature``/forced bins are
-        always empty.
+        Difference: ``num_groups`` equals the number of used features (no
+        exclusive feature bundling).
         """
         self.construct()
         assert self._rs is not None
         names = self._rs.feature_names()
         n_total = self._rs.num_feature()
         cols = [self._rs.bin_indices(j) for j in range(n_total)]
+        forced = self._rs.forced_bin_bounds()
         lines = [
             f"num_features: {self._rs.num_used_features()}",
             f"num_total_features: {n_total}",
             f"num_groups: {self._rs.num_used_features()}",
             f"num_data: {self._rs.num_data()}",
             "feature_names: " + "".join(f"{n}, " for n in names),
-            "max_bin_by_feature: ",
+            "max_bin_by_feature: " + "".join(f"{m}, " for m in self._rs.max_bin_by_feature()),
             "".join(f"{n}, " for n in names),
-            "forced_bins: " + "".join(f"\nfeature {i}: " for i in range(n_total)),
+            # printf "%lf"
+            "forced_bins: " + "".join(f"\nfeature {i}: " + "".join(f"{b:f}, " for b in forced[i]) for i in range(n_total)),
         ]
         with open(filename, "w", newline="\n") as f:
             f.write("\n".join(lines))

@@ -128,6 +128,10 @@ pub fn greedy_find_bin(
     let num_distinct_values = distinct_values.len() as i32;
     let mut bin_upper_bound = Vec::new();
     assert!(max_bin > 0);
+    if num_distinct_values == 0 {
+        // reached from FindBinWithPredefinedBin for an empty forced interval
+        return vec![f64::INFINITY];
+    }
     if num_distinct_values <= max_bin {
         let mut cur_cnt_inbin = 0;
         for i in 0..(num_distinct_values - 1) as usize {
@@ -274,6 +278,104 @@ pub fn find_bin_with_zero_as_one_bin(
     bin_upper_bound
 }
 
+/// upstream: src/io/bin.cpp `FindBinWithPredefinedBin`: zero bounds and the
+/// forced bounds first, then the free bins shared out over the forced
+/// intervals by sample count and filled by `GreedyFindBin`.
+pub fn find_bin_with_predefined_bin(
+    distinct_values: &[f64],
+    counts: &[i32],
+    max_bin: i32,
+    total_sample_cnt: usize,
+    min_data_in_bin: i32,
+    forced_upper_bounds: &[f64],
+) -> Result<Vec<f64>> {
+    let n = distinct_values.len();
+    let mut bin_upper_bound: Vec<f64> = Vec::new();
+    let left_cnt = distinct_values.iter().position(|&v| v > -K_ZERO_THRESHOLD).unwrap_or(n);
+    let right_start = distinct_values[left_cnt..].iter().position(|&v| v > K_ZERO_THRESHOLD).map(|p| p + left_cnt);
+
+    if max_bin == 2 {
+        bin_upper_bound.push(if left_cnt == 0 { K_ZERO_THRESHOLD } else { -K_ZERO_THRESHOLD });
+    } else if max_bin >= 3 {
+        if left_cnt > 0 {
+            bin_upper_bound.push(-K_ZERO_THRESHOLD);
+        }
+        if right_start.is_some() {
+            bin_upper_bound.push(K_ZERO_THRESHOLD);
+        }
+    }
+    bin_upper_bound.push(f64::INFINITY);
+
+    // forced bounds, excluding zeros (the zero bounds are already in)
+    let max_to_insert = max_bin - bin_upper_bound.len() as i32;
+    let mut num_inserted = 0;
+    for &b in forced_upper_bounds {
+        if num_inserted >= max_to_insert {
+            break;
+        }
+        if b.abs() > K_ZERO_THRESHOLD {
+            bin_upper_bound.push(b);
+            num_inserted += 1;
+        }
+    }
+    let by_value = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    bin_upper_bound.sort_by(by_value);
+
+    let free_bins = max_bin - bin_upper_bound.len() as i32;
+    let mut bounds_to_add: Vec<f64> = Vec::new();
+    let mut value_ind = 0usize;
+    for i in 0..bin_upper_bound.len() {
+        let mut cnt_in_bin = 0i32;
+        let bin_start = value_ind;
+        while value_ind < n && distinct_values[value_ind] < bin_upper_bound[i] {
+            cnt_in_bin += counts[value_ind];
+            value_ind += 1;
+        }
+        let bins_remaining = max_bin - bin_upper_bound.len() as i32 - bounds_to_add.len() as i32;
+        // std::lround: half away from zero
+        let num_sub_bins = (cnt_in_bin as f64 * free_bins as f64 / total_sample_cnt as f64).round() as i32;
+        let mut num_sub_bins = num_sub_bins.min(bins_remaining) + 1;
+        if i == bin_upper_bound.len() - 1 {
+            num_sub_bins = bins_remaining + 1;
+        }
+        let new_upper_bounds = greedy_find_bin(
+            &distinct_values[bin_start..value_ind],
+            &counts[bin_start..value_ind],
+            num_sub_bins,
+            cnt_in_bin as usize,
+            min_data_in_bin,
+        );
+        // the last bound is +inf
+        bounds_to_add.extend_from_slice(&new_upper_bounds[..new_upper_bounds.len() - 1]);
+    }
+    bin_upper_bound.extend(bounds_to_add);
+    bin_upper_bound.sort_by(by_value);
+    if bin_upper_bound.len() > max_bin as usize {
+        return Err(crate::error::LgbmError::InvalidData(
+            "Check failed: (bin_upper_bound.size()) <= (static_cast<size_t>(max_bin))".into(),
+        ));
+    }
+    Ok(bin_upper_bound)
+}
+
+/// upstream: the `FindBinWithZeroAsOneBin` overload taking forced bounds.
+fn find_bin_with_forced(
+    distinct_values: &[f64],
+    counts: &[i32],
+    max_bin: i32,
+    total_sample_cnt: usize,
+    min_data_in_bin: i32,
+    forced_upper_bounds: &[f64],
+) -> Result<Vec<f64>> {
+    if forced_upper_bounds.is_empty() {
+        Ok(find_bin_with_zero_as_one_bin(distinct_values, counts, max_bin, total_sample_cnt, min_data_in_bin))
+    } else {
+        find_bin_with_predefined_bin(
+            distinct_values, counts, max_bin, total_sample_cnt, min_data_in_bin, forced_upper_bounds,
+        )
+    }
+}
+
 impl BinMapper {
     /// Build a bin mapper from sampled values.
     ///
@@ -288,15 +390,17 @@ impl BinMapper {
         bin_type: BinType,
         p: &BinParams,
     ) -> Result<Self> {
-        Self::find_bin_logged(values, total_sample_cnt, bin_type, p, &mut Vec::new())
+        Self::find_bin_logged(values, total_sample_cnt, bin_type, p, &[], &mut Vec::new())
     }
 
-    /// Like [`BinMapper::find_bin`], appending upstream's `Log::Warning`s to `warnings`.
+    /// Like [`BinMapper::find_bin`], with upstream's forced upper bounds for
+    /// a numerical feature, appending upstream's `Log::Warning`s to `warnings`.
     pub fn find_bin_logged(
         values: &[f64],
         total_sample_cnt: usize,
         bin_type: BinType,
         p: &BinParams,
+        forced_upper_bounds: &[f64],
         warnings: &mut Vec<String>,
     ) -> Result<Self> {
         let num_sample_values_in = values.len() as i32;
@@ -355,27 +459,29 @@ impl BinMapper {
             ));
         }
 
+        let forced = forced_upper_bounds;
         let mut bin_upper_bound = match missing_type {
             MissingType::Zero => {
-                let b = find_bin_with_zero_as_one_bin(
-                    &distinct_values, &counts, p.max_bin, total_sample_cnt, p.min_data_in_bin,
-                );
+                let b = find_bin_with_forced(
+                    &distinct_values, &counts, p.max_bin, total_sample_cnt, p.min_data_in_bin, forced,
+                )?;
                 if b.len() == 2 {
                     missing_type = MissingType::None;
                 }
                 b
             }
-            MissingType::None => find_bin_with_zero_as_one_bin(
-                &distinct_values, &counts, p.max_bin, total_sample_cnt, p.min_data_in_bin,
-            ),
+            MissingType::None => find_bin_with_forced(
+                &distinct_values, &counts, p.max_bin, total_sample_cnt, p.min_data_in_bin, forced,
+            )?,
             MissingType::NaN => {
-                let mut b = find_bin_with_zero_as_one_bin(
+                let mut b = find_bin_with_forced(
                     &distinct_values,
                     &counts,
                     p.max_bin - 1,
                     total_sample_cnt - na_cnt as usize,
                     p.min_data_in_bin,
-                );
+                    forced,
+                )?;
                 b.push(f64::NAN);
                 b
             }
@@ -640,7 +746,7 @@ mod tests {
         vals.extend(std::iter::repeat_n(-1.0, 5));
         let total = vals.len() + 15;
         let mut w = Vec::new();
-        let m = BinMapper::find_bin_logged(&vals, total, BinType::Categorical, &params(255), &mut w).unwrap();
+        let m = BinMapper::find_bin_logged(&vals, total, BinType::Categorical, &params(255), &[], &mut w).unwrap();
         assert_eq!(m.bin_2_categorical, vec![-1, 3, 1, 0, 2]);
         assert_eq!(m.missing_type, MissingType::NaN);
         assert_eq!(m.bin_info_string(), "-1:3:1:0:2");
@@ -652,6 +758,18 @@ mod tests {
         assert_eq!(m.bin_to_value(2), 1.0);
         assert_eq!(m.default_bin, 3);
         assert!(w[0].starts_with("Met negative value"));
+    }
+
+    #[test]
+    fn forced_bounds_are_kept() {
+        // upstream examples/regression/forced_bins.json on x = 0, 0.01, ..., 0.99 with max_bin = 5
+        let vals: Vec<f64> = (1..100).map(|i| i as f64 * 0.01).collect();
+        let m = BinMapper::find_bin_logged(&vals, 100, BinType::Numerical, &params(5), &[0.3, 0.35, 0.4], &mut Vec::new())
+            .unwrap();
+        assert_eq!(m.bin_upper_bound, vec![K_ZERO_THRESHOLD, 0.3, 0.35, 0.4, f64::INFINITY]);
+        // no free bins are left, so an empty forced interval adds nothing
+        let b = find_bin_with_predefined_bin(&[1.0, 2.0], &[5, 5], 4, 10, 1, &[-3.0, 5.0]).unwrap();
+        assert_eq!(b, vec![-3.0, K_ZERO_THRESHOLD, 5.0, f64::INFINITY]);
     }
 
     #[test]

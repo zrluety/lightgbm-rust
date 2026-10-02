@@ -50,7 +50,7 @@ PowerShell expands `$` inside double quotes, so put anything non-trivial in a sc
 
 ### Differential tests (`tests/differential`)
 - **Engines.** Both engines are trained on the same data and parameters. The default setup is `deterministic=True`, `force_row_wise=True`, and `num_threads=1`; `test_multithread` uses 4 threads.
-- **Bins.** Bin assignments are compared through `Dataset._dump_text`.
+- **Bins.** Bin assignments are compared through `Dataset._dump_text`, and for cases with `max_bin_by_feature` or `forcedbins_filename` also its `max_bin_by_feature` and `forced_bins` lines. The forced-bin JSON files the cases use are in `tests/differential/data/`.
 - **First-iteration gradients and Hessians.** These are compared against a NumPy reference that reproduces upstream's float32 arithmetic and summation order.
 - **Model and predictions.** The checks cover:
   - the full model text, byte for byte;

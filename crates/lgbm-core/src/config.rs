@@ -104,7 +104,8 @@ const HONORED: &[&str] = &[
     "auc_mu_weights", "refit_decay_rate", "monotone_constraints", "monotone_constraints_method",
     "monotone_penalty", "feature_contri", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
-    "group_column", "ignore_column", "precise_float_parser", "two_round",
+    "group_column", "ignore_column", "precise_float_parser", "two_round", "max_bin_by_feature",
+    "forcedbins_filename",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -422,6 +423,10 @@ pub struct Config {
     pub interaction_constraints_vector: Vec<Vec<i32>>,
     pub verbosity: i32,
     pub max_bin: i32,
+    /// By column; empty means `max_bin` for every feature.
+    pub max_bin_by_feature: Vec<i32>,
+    /// JSON file of forced numerical bin bounds (empty: none).
+    pub forcedbins_filename: String,
     pub min_data_in_bin: i32,
     pub bin_construct_sample_cnt: i32,
     pub data_random_seed: i32,
@@ -534,6 +539,8 @@ impl Default for Config {
             interaction_constraints_vector: Vec::new(),
             verbosity: 1,
             max_bin: 255,
+            max_bin_by_feature: Vec::new(),
+            forcedbins_filename: String::new(),
             min_data_in_bin: 3,
             bin_construct_sample_cnt: 200_000,
             data_random_seed: 1,
@@ -828,6 +835,13 @@ impl Config {
         }
         set_int!(verbosity);
         set_int!(max_bin);
+        if let Some(v) = p.get("max_bin_by_feature") {
+            // upstream: Common::StringToArray<int32_t> (Atoi per token)
+            self.max_bin_by_feature = split_tokens(v).map(atoi).collect();
+        }
+        if let Some(v) = p.get("forcedbins_filename") {
+            self.forcedbins_filename = v.clone();
+        }
         set_int!(min_data_in_bin);
         set_int!(bin_construct_sample_cnt);
         set_int!(data_random_seed);
@@ -1086,6 +1100,10 @@ impl Config {
             "interaction_constraints" => self.interaction_constraints.clone(),
             "verbosity" => self.verbosity.to_string(),
             "max_bin" => self.max_bin.to_string(),
+            "max_bin_by_feature" => {
+                self.max_bin_by_feature.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(",")
+            }
+            "forcedbins_filename" => self.forcedbins_filename.clone(),
             "min_data_in_bin" => self.min_data_in_bin.to_string(),
             "bin_construct_sample_cnt" => self.bin_construct_sample_cnt.to_string(),
             "data_random_seed" => self.data_random_seed.to_string(),
@@ -1150,11 +1168,11 @@ pub fn dataset_update_param_checking(old: &Config, new: &Config) -> Result<()> {
             }
         )*};
     }
-    typed!(data_random_seed, max_bin, bin_construct_sample_cnt, min_data_in_bin, use_missing,
+    typed!(data_random_seed, max_bin, max_bin_by_feature, bin_construct_sample_cnt, min_data_in_bin, use_missing,
         zero_as_missing, feature_pre_filter);
     let reg = registry();
     for k in [
-        "max_bin_by_feature", "categorical_feature", "is_enable_sparse", "pre_partition",
+        "categorical_feature", "is_enable_sparse", "pre_partition",
         "enable_bundle", "header", "two_round", "label_column", "weight_column", "group_column",
         "ignore_column",
     ] {

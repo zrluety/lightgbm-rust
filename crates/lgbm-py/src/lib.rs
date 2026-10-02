@@ -280,6 +280,14 @@ impl RsDataset {
         self.inner.feature_infos()
     }
 
+    fn max_bin_by_feature(&self) -> Vec<i32> {
+        self.inner.max_bin_by_feature().to_vec()
+    }
+
+    fn forced_bin_bounds(&self) -> Vec<Vec<f64>> {
+        self.inner.forced_bin_bounds().to_vec()
+    }
+
     /// Bin upper bounds of input column `col`.
     fn bin_upper_bounds(&self, col: usize) -> PyResult<Vec<f64>> {
         if col >= self.inner.num_total_features() {

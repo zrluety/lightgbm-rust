@@ -362,6 +362,10 @@ pub struct Dataset {
     pub metadata: Metadata,
     pub(crate) feature_names: Vec<String>,
     pub(crate) bin_config: BinConstructConfig,
+    /// upstream `max_bin_by_feature_` (empty unless given at construction).
+    pub(crate) max_bin_by_feature: Vec<i32>,
+    /// upstream `forced_bin_bounds_`: one (possibly empty) list per column.
+    pub(crate) forced_bin_bounds: Vec<Vec<f64>>,
     /// upstream `data_filename_`: the file this dataset was loaded from.
     pub(crate) data_filename: Option<String>,
     /// upstream `label_idx_`: the label's column in the text file (0 otherwise).
@@ -427,15 +431,23 @@ impl Dataset {
         let total_sample_size = sample_indices.len();
 
         let columns: Vec<SampleColumn> = mat.sample_columns(&sample_indices);
-        let (bin_mappers, warnings) =
-            find_bin_mappers(&columns, total_sample_size, n, &is_categorical, &vec![false; ncol], cfg)?;
+        let found = find_bin_mappers(
+            &columns,
+            total_sample_size,
+            n,
+            &is_categorical,
+            &vec![false; ncol],
+            cfg,
+            "static_cast<size_t>(num_col)",
+        )?;
 
         let (feature_names, replaced) = match fields.feature_names.clone() {
             Some(names) => sanitize_feature_names(names)?,
             None => ((0..ncol).map(|i| format!("Column_{i}")).collect(), false),
         };
-        let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
-        ds.finish_construct(&columns, total_sample_size, cfg, warnings, replaced);
+        let mut ds = Self::assemble(mat, fields, found.bin_mappers, feature_names)?;
+        ds.forced_bin_bounds = found.forced_bin_bounds;
+        ds.finish_construct(&columns, total_sample_size, cfg, found.warnings, replaced);
         Ok(ds)
     }
 
@@ -452,6 +464,7 @@ impl Dataset {
     ) {
         self.warnings = warnings;
         self.bin_config = BinConstructConfig::from_config(cfg);
+        self.max_bin_by_feature = cfg.max_bin_by_feature.clone();
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
         (self.upstream_inner, self.num_feature_groups) = upstream_inner_order(
             &self.bin_mappers,
@@ -519,6 +532,7 @@ impl Dataset {
         let mut ds = Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())?;
         ds.upstream_inner = reference.upstream_inner.clone();
         ds.bin_config = reference.bin_config;
+        ds.forced_bin_bounds = reference.forced_bin_bounds.clone();
         ds.label_idx = reference.label_idx;
         Ok(ds)
     }
@@ -574,6 +588,8 @@ impl Dataset {
             },
             feature_names: self.feature_names.clone(),
             bin_config: self.bin_config,
+            max_bin_by_feature: Vec::new(),
+            forced_bin_bounds: self.forced_bin_bounds.clone(),
             data_filename: None,
             label_idx: self.label_idx,
             warnings: Vec::new(),
@@ -639,6 +655,7 @@ impl Dataset {
         metadata.set_init_score(n, fields.init_score)?;
         Ok(Self {
             num_data: n,
+            forced_bin_bounds: vec![Vec::new(); bin_mappers.len()],
             bin_mappers,
             upstream_inner: (0..used_features.len()).collect(),
             num_feature_groups: used_features.len(),
@@ -648,6 +665,7 @@ impl Dataset {
             metadata,
             feature_names,
             bin_config: BinConstructConfig::default(),
+            max_bin_by_feature: Vec::new(),
             data_filename: None,
             label_idx: 0,
             warnings: Vec::new(),
@@ -742,6 +760,16 @@ impl Dataset {
         &self.bin_mappers
     }
 
+    /// upstream `max_bin_by_feature_` (empty when not set at construction).
+    pub fn max_bin_by_feature(&self) -> &[i32] {
+        &self.max_bin_by_feature
+    }
+
+    /// upstream `forced_bin_bounds_`, one list per column.
+    pub fn forced_bin_bounds(&self) -> &[Vec<f64>] {
+        &self.forced_bin_bounds
+    }
+
     /// Whether `other` was binned with identical mappers (NaN bounds compare equal).
     pub fn same_bins_as(&self, other: &Dataset) -> bool {
         self.bin_mappers.len() == other.bin_mappers.len()
@@ -771,16 +799,13 @@ pub(crate) fn find_bin_mappers(
     is_categorical: &[bool],
     skip: &[bool],
     cfg: &Config,
-) -> Result<(Vec<BinMapper>, Vec<String>)> {
+    num_total_features_expr: &str,
+) -> Result<FoundBins> {
+    check_max_bin_by_feature(cfg, columns.len(), num_total_features_expr)?;
+    let mut warnings = Vec::new();
+    let forced_bin_bounds = get_forced_bins(&cfg.forcedbins_filename, columns.len(), is_categorical, &mut warnings)?;
     let filter_cnt = (cfg.min_data_in_leaf as f64 * total_sample_size as f64 / num_data as f64) as i32;
-    let params = BinParams {
-        max_bin: cfg.max_bin,
-        min_data_in_bin: cfg.min_data_in_bin,
-        min_split_data: filter_cnt,
-        pre_filter: cfg.feature_pre_filter,
-        use_missing: cfg.use_missing,
-        zero_as_missing: cfg.zero_as_missing,
-    };
+    let max_bin_of = |c: usize| if cfg.max_bin_by_feature.is_empty() { cfg.max_bin } else { cfg.max_bin_by_feature[c] };
     let found: Vec<(BinMapper, Vec<String>)> = columns
         .par_iter()
         .enumerate()
@@ -789,24 +814,107 @@ pub(crate) fn find_bin_mappers(
                 return Ok((BinMapper::default(), Vec::new()));
             }
             let bin_type = if is_categorical[c] { BinType::Categorical } else { BinType::Numerical };
+            let params = BinParams {
+                max_bin: max_bin_of(c),
+                min_data_in_bin: cfg.min_data_in_bin,
+                min_split_data: filter_cnt,
+                pre_filter: cfg.feature_pre_filter,
+                use_missing: cfg.use_missing,
+                zero_as_missing: cfg.zero_as_missing,
+            };
             let mut w = Vec::new();
-            BinMapper::find_bin_logged(&col.values, total_sample_size, bin_type, &params, &mut w).map(|m| (m, w))
+            BinMapper::find_bin_logged(&col.values, total_sample_size, bin_type, &params, &forced_bin_bounds[c], &mut w)
+                .map(|m| (m, w))
         })
         .collect::<Result<_>>()?;
-    let mut warnings = Vec::new();
     let mut bin_mappers = Vec::with_capacity(found.len());
     for (m, w) in found {
         warnings.extend(w);
         bin_mappers.push(m);
     }
-    if bin_mappers.iter().any(|m| m.bin_type == BinType::Categorical && m.num_bin > cfg.max_bin) {
+    if bin_mappers
+        .iter()
+        .enumerate()
+        .any(|(c, m)| m.bin_type == BinType::Categorical && m.num_bin > max_bin_of(c))
+    {
         warnings.push("Categorical features with more bins than the configured maximum bin number found.".into());
         warnings.push(
             "For categorical features, max_bin and max_bin_by_feature may be ignored with a large number of categories."
                 .into(),
         );
     }
-    Ok((bin_mappers, warnings))
+    Ok(FoundBins { bin_mappers, warnings, forced_bin_bounds })
+}
+
+/// Output of [`find_bin_mappers`].
+pub(crate) struct FoundBins {
+    pub bin_mappers: Vec<BinMapper>,
+    pub warnings: Vec<String>,
+    pub forced_bin_bounds: Vec<Vec<f64>>,
+}
+
+/// upstream's `CHECK_EQ`/`CHECK_GT` on `max_bin_by_feature`;
+/// `num_total_features_expr` is the left operand as upstream spells it.
+pub(crate) fn check_max_bin_by_feature(cfg: &Config, num_total_features: usize, num_total_features_expr: &str) -> Result<()> {
+    let m = &cfg.max_bin_by_feature;
+    if m.is_empty() {
+        return Ok(());
+    }
+    if m.len() != num_total_features {
+        return Err(LgbmError::InvalidParameter(format!(
+            "Check failed: ({num_total_features_expr}) == (config_.max_bin_by_feature.size())"
+        )));
+    }
+    if m.iter().min().is_some_and(|&v| v <= 1) {
+        return Err(LgbmError::InvalidParameter(
+            "Check failed: (*(std::min_element(config_.max_bin_by_feature.begin(), config_.max_bin_by_feature.end()))) > (1)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// upstream: dataset_loader.cpp `DatasetLoader::GetForcedBins` (json11
+/// semantics: missing or mistyped keys read as 0 / empty). A negative
+/// `feature` is undefined behavior upstream; it is ignored here.
+pub(crate) fn get_forced_bins(
+    path: &str,
+    num_total_features: usize,
+    is_categorical: &[bool],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Vec<f64>>> {
+    let mut forced_bins = vec![Vec::new(); num_total_features];
+    if path.is_empty() {
+        return Ok(forced_bins);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        warnings.push(format!("Could not open {path}. Will ignore."));
+        return Ok(forced_bins);
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let serde_json::Value::Array(items) = json else {
+        return Err(LgbmError::InvalidParameter("Check failed: forced_bins_json.is_array()".into()));
+    };
+    for item in &items {
+        // json11 int_value(): static_cast<int> of the double
+        let feature_num = item.get("feature").and_then(|v| v.as_f64()).map_or(0, |v| v as i32);
+        if feature_num as i64 >= num_total_features as i64 {
+            return Err(LgbmError::InvalidParameter("Check failed: (feature_num) < (num_total_features)".into()));
+        }
+        if feature_num < 0 {
+            continue;
+        }
+        let f = feature_num as usize;
+        if is_categorical.get(f).copied().unwrap_or(false) {
+            warnings.push(format!("Feature {feature_num} is categorical. Will ignore forced bins for this feature."));
+        } else if let Some(serde_json::Value::Array(bounds)) = item.get("bin_upper_bound") {
+            forced_bins[f].extend(bounds.iter().map(|b| b.as_f64().unwrap_or(0.0)));
+        }
+    }
+    for b in &mut forced_bins {
+        b.dedup();
+    }
+    Ok(forced_bins)
 }
 
 /// upstream: utils/common.h `CheckElementsIntervalClosed` (same pairwise scan,

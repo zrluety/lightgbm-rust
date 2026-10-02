@@ -17,13 +17,14 @@ use std::path::{Path, PathBuf};
 
 use crate::binning::{BinMapper, BinType, MissingType};
 use crate::config::Config;
-use crate::dataset::{BinColumn, BinConstructConfig, Dataset, Metadata};
+use crate::dataset::{check_max_bin_by_feature, BinColumn, BinConstructConfig, Dataset, Metadata};
 use crate::error::{LgbmError, Result};
 
 /// First bytes of a lightgbm-rust binary dataset file.
 pub const MAGIC: &[u8; 16] = b"\x89LGBMRS-DATASET\n";
-/// Version written by this build. Version 1 (without `label_idx`) is also read.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version written by this build. Versions 1 (without `label_idx`) and 2
+/// (without `max_bin_by_feature` and forced bin bounds) are also read.
+pub const FORMAT_VERSION: u32 = 3;
 /// upstream `Dataset::binary_file_token`.
 pub const UPSTREAM_TOKEN: &[u8] = b"______LightGBM_Binary_File_Token______\n";
 
@@ -363,6 +364,10 @@ impl Dataset {
         if let Some(b) = queries {
             w.i32_vec(b);
         }
+        w.i32_vec(&self.max_bin_by_feature);
+        for b in &self.forced_bin_bounds {
+            w.f64_vec(b);
+        }
         w.0
     }
 
@@ -465,6 +470,16 @@ impl Dataset {
         } else {
             None
         };
+        let (max_bin_by_feature, forced_bin_bounds) = if version >= 3 {
+            let m = r.i32_vec("bin parameters")?;
+            if !(m.is_empty() || m.len() == ncol) {
+                return Err(r.corrupt("bin parameters"));
+            }
+            let f = (0..ncol).map(|_| r.f64_vec("bin parameters")).collect::<Result<Vec<_>>>()?;
+            (m, f)
+        } else {
+            (Vec::new(), vec![Vec::new(); ncol])
+        };
         if r.pos != bytes.len() {
             return Err(r.corrupt("unexpected trailing bytes"));
         }
@@ -488,6 +503,8 @@ impl Dataset {
             metadata,
             feature_names,
             bin_config,
+            max_bin_by_feature,
+            forced_bin_bounds,
             data_filename: None,
             label_idx,
             warnings: Vec::new(),
@@ -516,7 +533,22 @@ impl Dataset {
         let mut ds = Self::from_binary_bytes(&bytes, &path)?;
         ds.data_filename = Some(filename.to_string());
         if let Some(cfg) = check {
+            // upstream: LoadFromBinFile takes a given max_bin_by_feature
+            // over the stored one, so only an omitted one can mismatch
+            if !cfg.max_bin_by_feature.is_empty() {
+                check_max_bin_by_feature(
+                    cfg,
+                    ds.num_total_features(),
+                    "static_cast<size_t>(dataset->num_total_features_)",
+                )?;
+                ds.max_bin_by_feature = cfg.max_bin_by_feature.clone();
+            }
             check_loaded_config(&ds.bin_config, cfg)?;
+            if ds.max_bin_by_feature != cfg.max_bin_by_feature {
+                return Err(LgbmError::InvalidParameter(
+                    "Parameter max_bin_by_feature cannot be changed when loading from binary file.".into(),
+                ));
+            }
         }
         Ok(ds)
     }
@@ -614,14 +646,61 @@ mod tests {
         next[MAGIC.len()] = FORMAT_VERSION as u8 + 1;
         let err = Dataset::from_binary_bytes(&next, Path::new("t")).unwrap_err();
         assert!(matches!(err, LgbmError::Unsupported(_)), "{err}");
-        // version 1 has no label_idx (after magic, version, 2 sizes, 3 i32 and 2 bool fields)
+        // version 2 has no bin-parameter section (an empty max_bin_by_feature
+        // and an empty bound list per column)
+        let tail = 8 + 8 * sample().num_total_features();
+        let mut v2 = bytes[..bytes.len() - tail].to_vec();
+        v2[MAGIC.len()] = 2;
+        let back = Dataset::from_binary_bytes(&v2, Path::new("t")).unwrap();
+        assert_eq!(back.to_binary_bytes(), bytes);
+        // version 1 also has no label_idx (after magic, version, 2 sizes, 3 i32 and 2 bool fields)
         let at = MAGIC.len() + 4 + 8 + 8 + 12 + 2;
-        let mut v1 = bytes.clone();
+        let mut v1 = v2.clone();
         v1[MAGIC.len()] = 1;
         v1.drain(at..at + 4);
         let back = Dataset::from_binary_bytes(&v1, Path::new("t")).unwrap();
         assert_eq!(back.label_idx, 0);
         assert_eq!(back.metadata.label, sample().metadata.label);
+    }
+
+    #[test]
+    fn max_bin_by_feature_and_forced_bins_round_trip_and_are_checked() {
+        let dir = std::env::temp_dir().join(format!("lgbmrs-binary-mbf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let forced = dir.join("forced.json");
+        std::fs::write(&forced, r#"[{"feature": 0, "bin_upper_bound": [3.0, 7.5, 7.5]}]"#).unwrap();
+        let n = 200;
+        let x: Vec<f64> = (0..n * 2).map(|i| ((i * 7) % 23) as f64 * 0.5).collect();
+        let label: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
+        let mat = DenseMatrix::from_f64_row_major(&x, n, 2).unwrap();
+        let pairs = |mbf: &str| {
+            let f = forced.to_str().unwrap().to_string();
+            let mut v = vec![("forcedbins_filename".to_string(), f)];
+            if !mbf.is_empty() {
+                v.push(("max_bin_by_feature".to_string(), mbf.to_string()));
+            }
+            Config::from_pairs(v).unwrap()
+        };
+        let cfg = pairs("4,6");
+        let ds = Dataset::from_dense(&mat, DatasetFields { label: &label, ..Default::default() }, &cfg).unwrap();
+        assert_eq!(ds.forced_bin_bounds, vec![vec![3.0, 7.5], vec![]]);
+        assert_eq!(ds.max_bin_by_feature, vec![4, 6]);
+        let back = Dataset::from_binary_bytes(&ds.to_binary_bytes(), Path::new("m")).unwrap();
+        assert_eq!(back.forced_bin_bounds, ds.forced_bin_bounds);
+        assert_eq!(back.max_bin_by_feature, ds.max_bin_by_feature);
+
+        let path = dir.join("d.bin");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap();
+        ds.save_binary(p).unwrap();
+        assert_eq!(Dataset::load_binary(p, Some(&cfg)).unwrap().max_bin_by_feature, vec![4, 6]);
+        // a given value replaces the stored one, as upstream
+        assert_eq!(Dataset::load_binary(p, Some(&pairs("5,5"))).unwrap().max_bin_by_feature, vec![5, 5]);
+        let err = Dataset::load_binary(p, Some(&pairs(""))).unwrap_err();
+        assert!(err.to_string().contains("max_bin_by_feature cannot be changed"), "{err}");
+        let err = Dataset::load_binary(p, Some(&pairs("5"))).unwrap_err();
+        assert!(err.to_string().contains("(config_.max_bin_by_feature.size())"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

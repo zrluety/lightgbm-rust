@@ -20,8 +20,8 @@ use crate::binning::BinMapper;
 use crate::config::Config;
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::{
-    avoid_inf_f32, avoid_inf_f64, find_bin_mappers, sanitize_feature_names, with_num_threads, Dataset, DatasetFields,
-    DenseValues,
+    avoid_inf_f32, avoid_inf_f64, check_max_bin_by_feature, find_bin_mappers, sanitize_feature_names,
+    with_num_threads, Dataset, DatasetFields, DenseValues,
 };
 use crate::error::{LgbmError, Result};
 use crate::feature_groups::SampleColumn;
@@ -31,6 +31,9 @@ use crate::text_parser::{self, Parser};
 
 /// Lines parsed per parallel batch when streaming a file (`two_round`).
 const BATCH_LINES: usize = 1 << 16;
+
+/// The operand upstream's `max_bin_by_feature` size check names for text files.
+const NTF_EXPR: &str = "static_cast<size_t>(dataset->num_total_features_)";
 
 /// Column roles resolved from the parameters and the header line.
 ///
@@ -572,6 +575,7 @@ impl Dataset {
                     "Check failed: (dataset->num_total_features_) == (static_cast<int>(feature_names_.size()))".into(),
                 ));
             }
+            check_max_bin_by_feature(cfg, ntf, NTF_EXPR)?;
             if !(c.label_idx >= 0 && c.label_idx as usize <= ntf) {
                 return Err(LgbmError::InvalidData(
                     "Check failed: label_idx_ >= 0 && label_idx_ <= dataset->num_total_features_".into(),
@@ -604,14 +608,15 @@ impl Dataset {
                     "The output cannot be monotone with respect to categorical features".into(),
                 ));
             }
-            let (bin_mappers, bin_warnings) = find_bin_mappers(&columns, sample.len(), n, &is_cat, &skip_col, cfg)?;
-            warnings.extend(bin_warnings);
-            let used: Vec<bool> = bin_mappers.iter().map(|m| !m.is_trivial).collect();
+            let found = find_bin_mappers(&columns, sample.len(), n, &is_cat, &skip_col, cfg, NTF_EXPR)?;
+            warnings.extend(found.warnings);
+            let used: Vec<bool> = found.bin_mappers.iter().map(|m| !m.is_trivial).collect();
             let rows = extract(filename, skip, lines, &parser, &c, &used)?;
             let mat = csr(&rows, ntf)?;
             let label = vec![0.0f32; rows.num_rows()];
             let fields = DatasetFields { label: &label, ..Default::default() };
-            let mut ds = Self::assemble(&mat, fields, bin_mappers, feature_names)?;
+            let mut ds = Self::assemble(&mat, fields, found.bin_mappers, feature_names)?;
+            ds.forced_bin_bounds = found.forced_bin_bounds;
             ds.finish_construct(&columns, sample.len(), cfg, warnings, replaced);
             ds.label_idx = c.label_idx;
             set_metadata(&mut ds, rows, side)?;
