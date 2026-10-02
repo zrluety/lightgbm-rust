@@ -19,7 +19,7 @@ The engine does not wrap, link to, or call the upstream C++ library. Upstream Li
 | path | contents |
 |---|---|
 | `crates/lgbm-core` | the engine: pure Rust, no Python dependency, usable as a Rust library |
-| `crates/lgbm-py` | PyO3 bindings (`lightgbm_rust._lightgbm_rust`, abi3, Python ≥ 3.10) |
+| `crates/lgbm-py` | PyO3 bindings (`lightgbm_rust._lightgbm_rust`, abi3, Python ≥ 3.11) |
 | `python/lightgbm_rust` | the Python API: `Dataset`, `Booster`, `train`, callbacks, `register_logger` |
 | `tests/differential` | comparisons against LightGBM 4.7.0 (tolerances in `tests/tolerances.toml`) |
 | `tests/upstream_runner` | runs upstream's Python test suite, unmodified, against `lightgbm_rust` |
@@ -33,7 +33,7 @@ The engine does not wrap, link to, or call the upstream C++ library. Upstream Li
 pip install lightgbm-rust
 ```
 
-Wheels are published for CPython 3.10 and newer on Windows x64, macOS (arm64 and x86_64), and Linux (x86_64 and aarch64). `pip` downloads the matching wheel, so Rust is not required. Rust is required to build from the source distribution or to develop the package locally.
+Wheels are published for CPython 3.11–3.14 on Windows x64, macOS (arm64 and x86_64), and Linux (x86_64 and aarch64). Each platform wheel is built with Python 3.11 and tested on 3.11, 3.12, 3.13, and 3.14. `pip` downloads the matching wheel, so Rust is not required. Rust is required to build from the source distribution or to develop the package locally.
 
 ## Quick start
 

@@ -13,5 +13,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lgbm-core = { path = "../lgbm-core" }
-pyo3 = { version = "0.29.3", features = ["abi3-py310"] }
+pyo3 = { version = "0.29.3", features = ["abi3-py311"] }
 numpy = "0.29.0"

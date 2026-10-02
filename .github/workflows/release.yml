@@ -24,11 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64
-            smoke: true
-          - target: aarch64
-            smoke: false
+        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
       - name: Build wheel
@@ -36,15 +32,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --locked --out dist --compatibility pypi
-      - uses: actions/setup-python@v5
-        if: matrix.smoke
-        with:
-          python-version: "3.12"
-      - name: Smoke test
-        if: matrix.smoke
-        shell: bash
-        run: bash .github/scripts/smoke_test.sh
+          args: --release --locked --out dist --compatibility pypi -i python3.11
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -56,26 +44,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: aarch64
-            smoke: true
-          - target: x86_64
-            smoke: false
+        target: [aarch64, x86_64]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --locked --out dist
-      - uses: actions/setup-python@v5
-        if: matrix.smoke
-        with:
-          python-version: "3.12"
-      - name: Smoke test
-        if: matrix.smoke
-        shell: bash
-        run: bash .github/scripts/smoke_test.sh
+          args: --release --locked --out dist -i python3.11
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -86,21 +65,51 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --locked --out dist
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Smoke test
-        shell: bash
-        run: bash .github/scripts/smoke_test.sh
+          args: --release --locked --out dist -i python
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
           path: dist
+
+  # One abi3 wheel per platform supports every CPython from 3.11 up.
+  # Test that wheel on each supported release before publishing.
+  smoke:
+    name: smoke ${{ matrix.target.os }} py${{ matrix.python }}
+    needs: [linux, macos, windows]
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        target:
+          - os: linux
+            runner: ubuntu-latest
+            artifact: wheels-linux-x86_64
+          - os: macos
+            runner: macos-latest
+            artifact: wheels-macos-aarch64
+          - os: windows
+            runner: windows-latest
+            artifact: wheels-windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: dist
+      - name: Smoke test
+        shell: bash
+        run: bash .github/scripts/smoke_test.sh
 
   sdist:
     name: sdist
@@ -151,7 +160,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [linux, macos, windows, sdist]
+    needs: [linux, macos, windows, sdist, smoke]
     if: github.event_name == 'push' || inputs.publish == 'testpypi'
     runs-on: ubuntu-latest
     environment:

@@ -8,12 +8,16 @@ version = "0.2.0"
 description = "Pure-Rust re-implementation of LightGBM with a LightGBM-like Python API (work in progress)"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = ["narwhals>=1.15", "numpy>=1.24"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
 ]
 

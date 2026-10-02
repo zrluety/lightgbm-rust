@@ -42,7 +42,7 @@ This crate holds all modeling logic. It has no Python dependency and is usable d
 Ported code carries `upstream: <file> <function>` comments. Ported C++ tests carry `// upstream: tests/cpp_tests/<file>.cpp TEST(<suite>, <name>)`.
 
 ### `crates/lgbm-py`
-This crate is the PyO3 extension module `lightgbm_rust._lightgbm_rust` (abi3, Python ≥ 3.10). It only converts between Python and core types, through two classes, `RsDataset` and `RsBooster`, plus a few functions (`param_specs`, `validate_params`, `dataset_update_param_checking`). No modeling decisions are made here.
+This crate is the PyO3 extension module `lightgbm_rust._lightgbm_rust` (abi3, Python ≥ 3.11). It only converts between Python and core types, through two classes, `RsDataset` and `RsBooster`, plus a few functions (`param_specs`, `validate_params`, `dataset_update_param_checking`). No modeling decisions are made here.
 
 ### `python/lightgbm_rust`
 This is the user-facing API, mirroring `lightgbm` 4.7.0: `Dataset`, `Booster`, `train`, `callback` (a near-verbatim port of upstream `callback.py`), `register_logger`, `EvalResult`, and `Sequence`.
