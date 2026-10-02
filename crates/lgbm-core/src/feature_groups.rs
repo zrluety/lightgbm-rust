@@ -137,8 +137,8 @@ fn find_groups(
 }
 
 /// Upstream inner index of every used feature, indexed like `used_features`
-/// (real column indices, ascending). `columns` holds every column's sampled
-/// non-zero entries.
+/// (real column indices, ascending), and upstream's `num_feature_groups`.
+/// `columns` holds every column's sampled non-zero entries.
 pub fn upstream_inner_order(
     bin_mappers: &[BinMapper],
     used_features: &[usize],
@@ -147,9 +147,9 @@ pub fn upstream_inner_order(
     num_data: usize,
     enable_bundle: bool,
     is_sparse: bool,
-) -> Vec<usize> {
+) -> (Vec<usize>, usize) {
     if !enable_bundle || used_features.is_empty() {
-        return (0..used_features.len()).collect();
+        return ((0..used_features.len()).collect(), used_features.len());
     }
     let total = total_sample_cnt as i64;
     // upstream FastFeatureBundling: dense features first
@@ -182,5 +182,5 @@ pub fn upstream_inner_order(
     for (inner, f) in groups.iter().flatten().enumerate() {
         inner_of_real[*f] = inner;
     }
-    used_features.iter().map(|&f| inner_of_real[f]).collect()
+    (used_features.iter().map(|&f| inner_of_real[f]).collect(), groups.len())
 }

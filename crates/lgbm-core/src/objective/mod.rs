@@ -54,6 +54,18 @@ pub trait RowObjective: Send + Sync {
     }
     /// Writes `grad[k*n+i]`, `hess[k*n+i]` (f32 like upstream `score_t`).
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]);
+    /// upstream `GetGradientsWithSampledQueries` (`bagging_by_query`): ranking
+    /// objectives only write the rows of the `sampled` queries (ascending
+    /// query indices); others compute every row.
+    fn gradients_with_sampled_queries(
+        &self,
+        scores: ScoreView<'_>,
+        _sampled: &[u32],
+        grad: &mut [f32],
+        hess: &mut [f32],
+    ) {
+        self.gradients(scores, grad, hess)
+    }
     /// Initial raw score when `boost_from_average` is on.
     fn boost_from_score(&self, _output: usize) -> f64 {
         0.0
@@ -417,6 +429,21 @@ impl Objective {
                     *h = *v as f32;
                 }
             }
+        }
+    }
+
+    /// [`Objective::gradients`] restricted to sampled queries (see
+    /// [`RowObjective::gradients_with_sampled_queries`]).
+    pub fn gradients_with_sampled_queries(
+        &self,
+        scores: ScoreView<'_>,
+        sampled: &[u32],
+        grad: &mut [f32],
+        hess: &mut [f32],
+    ) {
+        match self {
+            Objective::Row(o) => o.gradients_with_sampled_queries(scores, sampled, grad, hess),
+            Objective::Grouped { .. } => self.gradients(scores, grad, hess),
         }
     }
 }

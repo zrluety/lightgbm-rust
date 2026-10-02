@@ -324,6 +324,9 @@ pub struct Dataset {
     used_features: Vec<usize>,
     /// Upstream's inner index of each inner feature (see `feature_groups`).
     upstream_inner: Vec<usize>,
+    /// upstream `num_feature_groups()`: one group per feature for datasets
+    /// built from a reference (`CreateValid`).
+    num_feature_groups: usize,
     real_to_inner: Vec<Option<usize>>,
     bins: Vec<BinColumn>,
     pub metadata: Metadata,
@@ -421,7 +424,7 @@ impl Dataset {
         let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
         ds.warnings = warnings;
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
-        ds.upstream_inner = upstream_inner_order(
+        (ds.upstream_inner, ds.num_feature_groups) = upstream_inner_order(
             &ds.bin_mappers,
             &ds.used_features,
             &columns,
@@ -527,6 +530,7 @@ impl Dataset {
             bin_mappers: self.bin_mappers.clone(),
             used_features: self.used_features.clone(),
             upstream_inner: self.upstream_inner.clone(),
+            num_feature_groups: self.num_feature_groups,
             real_to_inner: self.real_to_inner.clone(),
             bins,
             metadata: Metadata {
@@ -605,6 +609,7 @@ impl Dataset {
             num_data: n,
             bin_mappers,
             upstream_inner: (0..used_features.len()).collect(),
+            num_feature_groups: used_features.len(),
             used_features,
             real_to_inner,
             bins,
@@ -639,6 +644,10 @@ impl Dataset {
     /// numbered in shuffled feature-group order).
     pub fn upstream_inner_index(&self, inner: usize) -> usize {
         self.upstream_inner[inner]
+    }
+
+    pub fn num_feature_groups(&self) -> usize {
+        self.num_feature_groups
     }
 
     pub fn feature_bin_mapper(&self, inner: usize) -> &BinMapper {

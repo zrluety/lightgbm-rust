@@ -55,27 +55,36 @@ impl RankingBase {
         self.boundaries.len() - 1
     }
 
-    /// upstream `RankingObjective::GetGradients`: per-query gradients from
-    /// position-adjusted scores, scaled by the row weights.
+    /// upstream `RankingObjective::GetGradientsWithSampledQueries`: per-query
+    /// gradients from position-adjusted scores, scaled by the row weights,
+    /// for every query or only the `sampled` ones (ascending).
     fn gradients(
         &self,
         score: &[f64],
+        sampled: Option<&[u32]>,
         grad: &mut [f32],
         hess: &mut [f32],
         one_query: impl Fn(usize, &[f32], &[f64], &mut [f32], &mut [f32]) + Sync,
     ) {
         let biases = self.pos_biases.lock().unwrap().clone();
-        let mut chunks = Vec::with_capacity(self.num_queries());
+        let mut chunks = Vec::with_capacity(sampled.map_or(self.num_queries(), |s| s.len()));
+        let mut next = sampled.map(|s| s.iter().peekable());
         let (mut g_rest, mut h_rest) = (&mut grad[..], &mut hess[..]);
-        for q in self.boundaries.windows(2) {
-            let cnt = (q[1] - q[0]) as usize;
+        for (q, b) in self.boundaries.windows(2).enumerate() {
+            let cnt = (b[1] - b[0]) as usize;
             let (g, gr) = std::mem::take(&mut g_rest).split_at_mut(cnt);
             let (h, hr) = std::mem::take(&mut h_rest).split_at_mut(cnt);
-            chunks.push((q[0] as usize, g, h));
+            let keep = match next.as_mut() {
+                None => true,
+                Some(it) => it.next_if(|&&s| s as usize == q).is_some(),
+            };
+            if keep {
+                chunks.push((q, b[0] as usize, g, h));
+            }
             g_rest = gr;
             h_rest = hr;
         }
-        chunks.into_par_iter().enumerate().for_each(|(q, (start, g, h))| {
+        chunks.into_par_iter().for_each(|(q, start, g, h)| {
             let cnt = g.len();
             let label = &self.label[start..start + cnt];
             match (&self.positions, self.num_position_ids > 0) {
@@ -248,6 +257,18 @@ impl LambdarankNdcg {
     /// upstream `LambdarankNDCG::UpdatePositionBiasFactors`, accumulated in
     /// row order (upstream's single-thread order; with several OpenMP threads
     /// upstream sums per-thread partials, which can differ in the last bits).
+    /// The position-bias update reads every row, including rows of queries
+    /// left out of the sample (their previous gradients), as upstream does.
+    fn sampled_gradients(&self, scores: ScoreView<'_>, sampled: Option<&[u32]>, grad: &mut [f32], hess: &mut [f32]) {
+        let n = scores.num_data;
+        self.base.gradients(scores.scores, sampled, &mut grad[..n], &mut hess[..n], |q, l, s, g, h| {
+            self.one_query(q, l, s, g, h)
+        });
+        if self.base.num_position_ids > 0 {
+            self.update_position_bias_factors(&grad[..n], &hess[..n]);
+        }
+    }
+
     fn update_position_bias_factors(&self, lambdas: &[f32], hessians: &[f32]) {
         let (Some(pos), npos) = (&self.base.positions, self.base.num_position_ids) else { return };
         let mut first = vec![0.0f64; npos];
@@ -298,13 +319,11 @@ impl RowObjective for LambdarankNdcg {
     }
 
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {
-        let n = scores.num_data;
-        self.base.gradients(scores.scores, &mut grad[..n], &mut hess[..n], |q, l, s, g, h| {
-            self.one_query(q, l, s, g, h)
-        });
-        if self.base.num_position_ids > 0 {
-            self.update_position_bias_factors(&grad[..n], &hess[..n]);
-        }
+        self.sampled_gradients(scores, None, grad, hess);
+    }
+
+    fn gradients_with_sampled_queries(&self, scores: ScoreView<'_>, sampled: &[u32], grad: &mut [f32], hess: &mut [f32]) {
+        self.sampled_gradients(scores, Some(sampled), grad, hess);
     }
 
     fn to_model_string(&self) -> String {
@@ -398,7 +417,14 @@ impl RowObjective for RankXendcg {
 
     fn gradients(&self, scores: ScoreView<'_>, grad: &mut [f32], hess: &mut [f32]) {
         let n = scores.num_data;
-        self.base.gradients(scores.scores, &mut grad[..n], &mut hess[..n], |q, l, s, g, h| {
+        self.base.gradients(scores.scores, None, &mut grad[..n], &mut hess[..n], |q, l, s, g, h| {
+            self.one_query(q, l, s, g, h)
+        });
+    }
+
+    fn gradients_with_sampled_queries(&self, scores: ScoreView<'_>, sampled: &[u32], grad: &mut [f32], hess: &mut [f32]) {
+        let n = scores.num_data;
+        self.base.gradients(scores.scores, Some(sampled), &mut grad[..n], &mut hess[..n], |q, l, s, g, h| {
             self.one_query(q, l, s, g, h)
         });
     }

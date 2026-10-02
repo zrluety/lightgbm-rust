@@ -99,7 +99,7 @@ const HONORED: &[&str] = &[
     "lambdarank_truncation_level", "lambdarank_norm", "label_gain",
     "lambdarank_position_bias_regularization", "eval_at", "categorical_feature",
     "min_data_per_group", "max_cat_threshold", "cat_l2", "cat_smooth", "max_cat_to_onehot",
-    "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin",
+    "pred_early_stop", "pred_early_stop_freq", "pred_early_stop_margin", "bagging_by_query",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -372,6 +372,7 @@ pub struct Config {
     pub cat_l2: f64,
     pub cat_smooth: f64,
     pub min_data_per_group: i32,
+    pub bagging_by_query: bool,
     pub pred_early_stop: bool,
     pub pred_early_stop_freq: i32,
     pub pred_early_stop_margin: f64,
@@ -453,6 +454,7 @@ impl Default for Config {
             cat_l2: 10.0,
             cat_smooth: 10.0,
             min_data_per_group: 100,
+            bagging_by_query: false,
             pred_early_stop: false,
             pred_early_stop_freq: 10,
             pred_early_stop_margin: 10.0,
@@ -707,6 +709,7 @@ impl Config {
         set_f64!(cat_l2);
         set_f64!(cat_smooth);
         set_int!(min_data_per_group);
+        set_bool!(bagging_by_query);
         set_bool!(pred_early_stop);
         set_int!(pred_early_stop_freq);
         set_f64!(pred_early_stop_margin);
@@ -773,6 +776,13 @@ impl Config {
                  boosting=gbdt, data_sample_strategy=goss.To suppress this warning, set data_sample_strategy=goss instead."
                     .into(),
             );
+        }
+        if self.bagging_by_query && self.data_sample_strategy != "bagging" {
+            self.warnings.push(
+                "bagging_by_query=true is only compatible with data_sample_strategy=bagging. Setting bagging_by_query=false."
+                    .into(),
+            );
+            self.bagging_by_query = false;
         }
         Ok(())
     }
@@ -878,6 +888,7 @@ impl Config {
             "feature_fraction" => g(self.feature_fraction),
             "feature_fraction_bynode" => g(self.feature_fraction_bynode),
             "extra_trees" => b(self.extra_trees),
+            "bagging_by_query" => b(self.bagging_by_query),
             "use_missing" => b(self.use_missing),
             "zero_as_missing" => b(self.zero_as_missing),
             "feature_pre_filter" => b(self.feature_pre_filter),

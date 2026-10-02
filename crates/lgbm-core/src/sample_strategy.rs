@@ -40,6 +40,21 @@ pub struct SampleStrategy {
     bag_cnt: usize,
     need_re_bagging: bool,
     label: Vec<f32>,
+    by_query: Option<ByQuery>,
+}
+
+/// upstream `bagging_by_query`: whole queries are drawn (one draw per query
+/// from `rands[query / BAGGING_RAND_BLOCK]`, ignoring the balanced fractions).
+#[derive(Debug, Clone)]
+struct ByQuery {
+    boundaries: Vec<i32>,
+    /// upstream `bag_query_indices_[..num_sampled_queries_]` (ascending).
+    sampled: Vec<u32>,
+    /// upstream `is_use_subset_`. Without it upstream rewrites only the
+    /// in-bag prefix of `bag_data_indices_`, so the "out-of-bag" rows whose
+    /// scores get the tree prediction are whatever an earlier bag (or the
+    /// zero-initialized buffer) left there; this reproduces that buffer.
+    use_subset: bool,
 }
 
 /// upstream: `Threading::BlockInfoForceSize` -> (number of blocks, block size).
@@ -103,6 +118,22 @@ impl SampleStrategy {
             Kind::Bagging { balanced: Some(_), .. } => data.label().to_vec(),
             _ => Vec::new(),
         };
+        let by_query = match kind {
+            Kind::Bagging { freq, .. } if cfg.bagging_by_query => {
+                // upstream has zero queries without query data: every bag is
+                // empty and no tree can split
+                let boundaries = data.metadata.query_boundaries.clone().unwrap_or_else(|| vec![0]);
+                // upstream ResetSampleConfig (non-CUDA): subset when
+                // average_bag_rate <= 0.5 and num_feature_groups < 100
+                let average_bag_rate = (bag_cnt as f64 / n as f64) / freq as f64;
+                Some(ByQuery {
+                    boundaries,
+                    sampled: Vec::new(),
+                    use_subset: average_bag_rate <= 0.5 && data.num_feature_groups() < 100,
+                })
+            }
+            _ => None,
+        };
         Ok(Some(Self {
             kind,
             num_data: n,
@@ -115,7 +146,60 @@ impl SampleStrategy {
             bag_cnt,
             need_re_bagging: matches!(kind, Kind::Bagging { .. }),
             label,
+            by_query,
         }))
+    }
+
+    /// upstream `bag_query_indices_` when `bagging_by_query` is on.
+    pub fn sampled_queries(&self) -> Option<&[u32]> {
+        self.by_query.as_ref().map(|q| q.sampled.as_slice())
+    }
+
+    /// `bagging_by_query` in upstream's subset mode, where `GBDT::TrainOneIter`
+    /// compacts the in-bag gradients to the front of the gradient buffer in
+    /// place. Only rows of unsampled queries keep those values into the next
+    /// iteration (read by the position-bias update), so only this mode needs
+    /// the compaction reproduced.
+    pub fn by_query_subset(&self) -> bool {
+        self.by_query.as_ref().is_some_and(|q| q.use_subset) && self.bag_cnt < self.num_data
+    }
+
+    /// upstream `BaggingSampleStrategy::Bagging`, `bagging_by_query` branch.
+    fn bag_queries(&mut self, fraction: f64) {
+        let q = self.by_query.as_mut().expect("bagging_by_query");
+        let num_queries = q.boundaries.len() - 1;
+        q.sampled.clear();
+        for i in 0..num_queries {
+            if (self.rands[i / BAGGING_RAND_BLOCK].next_float() as f64) < fraction {
+                q.sampled.push(i as u32);
+            }
+        }
+        let mut cnt = 0usize;
+        for &qi in &q.sampled {
+            let (start, end) = (q.boundaries[qi as usize] as usize, q.boundaries[qi as usize + 1] as usize);
+            for row in start..end {
+                self.indices[cnt] = row as u32;
+                cnt += 1;
+            }
+        }
+        if q.use_subset {
+            // upstream predicts every row of the full dataset in subset mode
+            let mut next = 0usize;
+            let mut tail = cnt;
+            for &qi in &q.sampled {
+                let start = q.boundaries[qi as usize] as usize;
+                for row in next..start {
+                    self.indices[tail] = row as u32;
+                    tail += 1;
+                }
+                next = q.boundaries[qi as usize + 1] as usize;
+            }
+            for row in next..self.num_data {
+                self.indices[tail] = row as u32;
+                tail += 1;
+            }
+        }
+        self.bag_cnt = cnt;
     }
 
     /// upstream: `SampleStrategy::Bagging`. Returns `true` when a new bag was
@@ -129,6 +213,10 @@ impl SampleStrategy {
                     return false;
                 }
                 self.need_re_bagging = false;
+                if self.by_query.is_some() {
+                    self.bag_queries(fraction);
+                    return true;
+                }
                 // Chunks of upstream's ParallelPartitionRunner are multiples of
                 // BAGGING_RAND_BLOCK, so one sequential pass draws the same values.
                 let mut left = 0usize;

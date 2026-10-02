@@ -779,6 +779,18 @@ RANK_CASES = [
     make_rank_case("xendcg_seeded_weighted", "rank_xendcg", {"objective_seed": 11, "metric": ["map"]},
                    weighted=True, seed=8),
     make_rank_case("xendcg_alias_seed", "xendcg", {"seed": 3, "eval_at": [2, 4]}, seed=9),
+    # bagging_by_query: average bag rate <= 0.5 trains on a subset; above it upstream's out-of-bag
+    # update reads the stale tail of its index buffer
+    make_rank_case("rank_bagging_by_query", "lambdarank",
+                   {"bagging_by_query": True, "bagging_fraction": 0.3, "bagging_freq": 1}, seed=10),
+    make_rank_case("rank_bagging_by_query_stale", "lambdarank",
+                   {"bagging_by_query": True, "bagging_fraction": 0.7, "bagging_freq": 1, "bagging_seed": 5},
+                   seed=11),
+    make_rank_case("rank_bagging_by_query_position", "lambdarank",
+                   {"bagging_by_query": True, "bagging_fraction": 0.8, "bagging_freq": 2,
+                    "lambdarank_position_bias_regularization": 0.1}, positions=True, seed=12),
+    make_rank_case("xendcg_bagging_by_query", "rank_xendcg",
+                   {"bagging_by_query": True, "bagging_fraction": 0.6, "bagging_freq": 1}, seed=13),
 ]
 
 
@@ -822,6 +834,43 @@ def test_ranking(case, recorder):
     rec.compare("upstream(rust model)", "predictions",
                 lgb_up.Booster(model_str=rs.model_to_string()).predict(case.Xv), rs.predict(case.Xv))
     rec.finish()
+
+
+def test_bagging_by_query_edge_cases():
+    """bagging_by_query changes the model, falls back for goss / unsampled configs, and matches upstream
+    without query data (empty bags) and for non-ranking objectives."""
+    case = next(c for c in RANK_CASES if c.name == "rank_bagging_by_query_stale")
+
+    def fit(mod, params, rounds=10, group=True, fobj=None):
+        ds = mod.Dataset(case.X, label=case.y, group=case.group if group else None)
+        p = {**DETERMINISTIC, **params}
+        if fobj is not None:
+            p["objective"] = fobj
+        return mod.train(p, ds, num_boost_round=rounds)
+
+    by_query = {"objective": "lambdarank", "bagging_fraction": 0.7, "bagging_freq": 1}
+    with_q = fit(lgb_rs, {**by_query, "bagging_by_query": True}).predict(case.Xv, raw_score=True)
+    without = fit(lgb_rs, by_query).predict(case.Xv, raw_score=True)
+    assert np.max(np.abs(with_q - without)) > 1e-3
+
+    variants = [
+        ({"objective": "lambdarank", "bagging_by_query": True, "data_sample_strategy": "goss"}, True),
+        ({**by_query, "bagging_by_query": True, "bagging_fraction": 1.0}, True),
+        ({"objective": "regression", "bagging_by_query": True, "bagging_fraction": 0.7, "bagging_freq": 1}, True),
+        ({"objective": "regression", "bagging_by_query": True, "bagging_fraction": 0.4, "bagging_freq": 1}, False),
+        ({"objective": "regression", "bagging_by_query": True, "bagging_fraction": 0.8, "bagging_freq": 1}, False),
+    ]
+    for params, group in variants:
+        rs, up = fit(lgb_rs, params, group=group), fit(lgb_up, params, group=group)
+        assert rs.model_to_string() == up.model_to_string(), params
+        np.testing.assert_array_equal(rs.predict(case.Xv, raw_score=True), up.predict(case.Xv, raw_score=True))
+    assert rs.num_trees() == 1  # no queries: every bag is empty
+
+    def fobj(preds, ds):
+        return preds - ds.get_label(), np.ones_like(preds)
+
+    with pytest.raises(lgb_rs.basic.LightGBMError, match="bagging_by_query with custom gradients"):
+        fit(lgb_rs, {"bagging_by_query": True, "bagging_fraction": 0.7, "bagging_freq": 1}, fobj=fobj)
 
 
 RANK_CV_CASES = [c for c in RANK_CASES if c.name in ("rank_basic", "rank_weighted", "xendcg_basic")]

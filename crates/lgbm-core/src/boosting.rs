@@ -330,6 +330,7 @@ impl Gbdt {
         }
         let ntpi = self.num_tree_per_iteration;
         let n = self.train.as_ref().unwrap().data.num_data();
+        let by_query = self.config.as_ref().is_some_and(|c| c.bagging_by_query);
         let mut init_scores = vec![0.0; ntpi];
         match custom {
             None => {
@@ -343,17 +344,37 @@ impl Gbdt {
                 }
                 let st = self.train.as_mut().unwrap();
                 let obj = self.objective.as_ref().unwrap();
+                // upstream GBDT::Boosting: query bagging precedes the gradients
+                if by_query {
+                    if let Some(s) = st.sampler.as_mut() {
+                        if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
+                            st.learner.set_bagging_data(Some(s.in_bag()));
+                        }
+                    }
+                }
+                let sampled = st.sampler.as_ref().and_then(|s| s.sampled_queries());
                 let view = ScoreView { scores: &st.scores, num_data: n, num_outputs: ntpi };
                 let pool = self.pool.clone();
-                match pool {
-                    Some(p) => p.install(|| obj.gradients(view, &mut st.grad, &mut st.hess)),
+                let mut compute = || match sampled {
+                    Some(q) => obj.gradients_with_sampled_queries(view, q, &mut st.grad, &mut st.hess),
                     None => obj.gradients(view, &mut st.grad, &mut st.hess),
+                };
+                match pool {
+                    Some(p) => p.install(compute),
+                    None => compute(),
                 }
             }
             Some((g, h)) => {
                 if self.objective.is_some() {
                     return Err(LgbmError::InvalidParameter(
                         "custom gradients require objective=none/custom".into(),
+                    ));
+                }
+                if by_query && self.train.as_ref().unwrap().sampler.is_some() {
+                    return Err(LgbmError::Unsupported(
+                        "bagging_by_query with custom gradients: upstream skips bagging but still \
+                         updates the scores of rows from its never-filled bagging buffer"
+                            .into(),
                     ));
                 }
                 if g.len() != n * ntpi || h.len() != n * ntpi {
@@ -371,7 +392,7 @@ impl Gbdt {
         }
 
         // upstream: data_sample_strategy_->Bagging
-        {
+        if !by_query {
             let st = self.train.as_mut().unwrap();
             if let Some(s) = st.sampler.as_mut() {
                 if s.bagging(st.iter, &mut st.grad, &mut st.hess) {
@@ -392,10 +413,17 @@ impl Gbdt {
                 let st = self.train.as_mut().unwrap();
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
-                match &self.pool {
+                let tree = match &self.pool {
                     Some(p) => p.install(|| learner.train(g, h)),
                     None => learner.train(g, h),
+                };
+                if let Some(s) = st.sampler.as_ref().filter(|s| s.by_query_subset()) {
+                    for (i, &row) in s.in_bag().iter().enumerate() {
+                        st.grad[offset + i] = st.grad[offset + row as usize];
+                        st.hess[offset + i] = st.hess[offset + row as usize];
+                    }
                 }
+                tree
             } else {
                 Tree::new(2)
             };
