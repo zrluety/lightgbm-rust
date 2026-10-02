@@ -14,6 +14,7 @@ mod cegb;
 pub mod col_sampler;
 pub mod constraints;
 mod forced;
+mod linear;
 pub mod partition;
 mod quant;
 pub mod split;
@@ -39,6 +40,7 @@ use cegb::RowView;
 pub(crate) use forced::{load_forced_splits, reload_forced_splits};
 use col_sampler::ColSampler;
 use constraints::{LeafConstraints, Method, monotone_split_gain_penalty};
+use linear::{Linear, LinearRows};
 use partition::DataPartition;
 use quant::GradientDiscretizer;
 use split::{FeatureMeta, IntSums, SplitInfo, SplitParams, find_best_threshold, find_best_threshold_int, root_output};
@@ -140,8 +142,13 @@ pub struct SerialTreeLearner {
     quant_active: bool,
     quant_renew: bool,
     iblock_bufs: Vec<Vec<i64>>,
-    /// The bag's rows when bagging uses a subset (kept only with quantized gradients).
+    /// The bag's rows when bagging uses a subset (kept only with quantized
+    /// gradients or linear trees).
     subset_rows: Option<Vec<u32>>,
+    /// upstream `LinearTreeLearner` (present iff `linear_tree`).
+    linear: Option<Linear>,
+    /// upstream `leaf_map_`: the leaf of each row of the last tree (-1: none).
+    leaf_map: Vec<i32>,
     pub trace: Option<TreeTrace>,
 }
 
@@ -256,12 +263,15 @@ impl SerialTreeLearner {
         let quant = cfg.use_quantized_grad.then(|| {
             GradientDiscretizer::new(cfg.num_grad_quant_bins, cfg.seed, false, cfg.stochastic_rounding, num_data, num_threads)
         });
+        let linear = cfg.linear_tree.then(|| Linear::new(&data, cfg.linear_lambda));
         Self {
             quant,
             quant_active: cfg.use_quantized_grad,
             quant_renew: cfg.quant_train_renew_leaf,
             iblock_bufs: Vec::new(),
             subset_rows: None,
+            leaf_map: if linear.is_some() { vec![-1; num_data] } else { Vec::new() },
+            linear,
             cegb,
             view_num_data: num_data,
             bag_local: None,
@@ -392,6 +402,9 @@ impl SerialTreeLearner {
             c.reset_config(cfg);
         }
         self.constraints = leaf_constraints(cfg, self.num_leaves, self.data.num_features());
+        if let Some(lin) = self.linear.as_mut() {
+            lin.linear_lambda = cfg.linear_lambda;
+        }
         let threads = resolve_num_threads(cfg.num_threads);
         if threads != self.team.num_threads() {
             self.team = ThreadTeam::new(threads);
@@ -413,6 +426,19 @@ impl SerialTreeLearner {
             return Err(LgbmError::Unsupported(
                 "training data with more rows than the first training set under use_quantized_grad (upstream \
                  keeps the gradient discretizer's buffers and writes past them)"
+                    .into(),
+            ));
+        }
+        if self.linear.is_some() && !data.has_raw() {
+            return Err(LgbmError::Unsupported(
+                "linear_tree with a Dataset constructed without linear_tree=true (it keeps no raw feature values)"
+                    .into(),
+            ));
+        }
+        if self.linear.is_some() && num_data > self.leaf_map.len() {
+            return Err(LgbmError::Unsupported(
+                "training data with more rows than the first training set under linear_tree (upstream keeps \
+                 the linear learner's leaf map and writes past it)"
                     .into(),
             ));
         }
@@ -444,7 +470,17 @@ impl SerialTreeLearner {
     /// `DataPartition::ResetByLeafPred` (rows of a leaf in row order). With
     /// path smoothing upstream passes the leaf's parent node index as the
     /// parent output, and so does this.
-    pub fn fit_by_existing_tree(&self, old: &Tree, leaf_pred: &[i32], grad: &[f32], hess: &[f32], decay: f64) -> Tree {
+    ///
+    /// With linear trees the leaf models are refit as well (upstream
+    /// `LinearTreeLearner::FitByExistingTree`).
+    pub fn fit_by_existing_tree(
+        &self,
+        old: &Tree,
+        leaf_pred: &[i32],
+        grad: &[f32],
+        hess: &[f32],
+        decay: f64,
+    ) -> Result<Tree> {
         let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); old.num_leaves];
         for (i, &l) in leaf_pred.iter().enumerate() {
             rows_of[l as usize].push(i as u32);
@@ -463,7 +499,38 @@ impl SerialTreeLearner {
             let new_output = output * old.shrinkage;
             tree.set_leaf_output(leaf, decay * old.leaf_value[leaf] + (1.0 - decay) * new_output);
         }
-        tree
+        if let Some(lin) = &self.linear {
+            let rows = LinearRows {
+                leaf_map: leaf_pred,
+                bag: None,
+                num_data: leaf_pred.len(),
+                leaf_count: &|l| rows_of[l].len(),
+            };
+            lin.calculate(&mut tree, &self.data, &self.team, &rows, grad, hess, decay, true, false)?;
+        }
+        Ok(tree)
+    }
+
+    /// upstream: `LinearTreeLearner::InitLinear` (called again by `GBDT::RefitTree`).
+    pub fn init_linear(&mut self) {
+        if let Some(lin) = self.linear.as_mut() {
+            *lin = Linear::new(&self.data, lin.linear_lambda);
+            self.leaf_map = vec![-1; self.data.num_data()];
+        }
+    }
+
+    /// Add the outputs of the refit `tree` to the training scores, with rows
+    /// in their `leaf_pred` leaves (upstream `ScoreUpdater::AddScore` through
+    /// the tree learner).
+    pub fn add_refit_score(&self, tree: &Tree, leaf_pred: &[i32], score: &mut [f64]) {
+        match &self.linear {
+            Some(lin) => lin.add_prediction_to_score(tree, &self.data, leaf_pred, score),
+            None => {
+                for (s, &l) in score.iter_mut().zip(leaf_pred) {
+                    *s += tree.leaf_value[l as usize];
+                }
+            }
+        }
     }
 
     /// Add the last tree's leaf outputs to the training scores.
@@ -481,7 +548,7 @@ impl SerialTreeLearner {
         match used {
             Some(u) if subset => {
                 self.view_num_data = u.len();
-                if self.quant.is_some() {
+                if self.quant.is_some() || self.linear.is_some() {
                     self.subset_rows = Some(u.to_vec());
                 }
                 if self.cegb.is_some() {
@@ -500,8 +567,9 @@ impl SerialTreeLearner {
         }
     }
 
-    /// Train one tree on `grad`/`hess` (length `num_data`).
-    pub fn train(&mut self, grad: &[f32], hess: &[f32]) -> Result<Tree> {
+    /// Train one tree on `grad`/`hess` (length `num_data`). `is_first_tree`
+    /// (the booster has no full iteration yet) keeps linear leaves constant.
+    pub fn train(&mut self, grad: &[f32], hess: &[f32], is_first_tree: bool) -> Result<Tree> {
         let n = self.data.num_data();
         let quant = self.quant_active;
         if quant {
@@ -574,7 +642,10 @@ impl SerialTreeLearner {
         }
 
         let mut tree = Tree::new(self.num_leaves);
-        tree.set_leaf_output(0, root_output(sg, sh, &self.params, root_cnt as i32));
+        // upstream's LinearTreeLearner::Train leaves the root output at 0
+        if self.linear.is_none() {
+            tree.set_leaf_output(0, root_output(sg, sh, &self.params, root_cnt as i32));
+        }
 
         let mut left_leaf: i32 = 0;
         let mut right_leaf: i32 = -1;
@@ -595,6 +666,23 @@ impl SerialTreeLearner {
         }
         if quant && self.quant_renew {
             self.renew_int_grad_tree_output(&mut tree, grad, hess);
+        }
+        if let Some(lin) = &self.linear {
+            // upstream: GetLeafMap, CalculateLinear
+            self.leaf_map.fill(-1);
+            for leaf in 0..tree.num_leaves {
+                for &i in self.partition.indices_on_leaf(leaf) {
+                    self.leaf_map[i as usize] = leaf as i32;
+                }
+            }
+            let partition = &self.partition;
+            let rows = LinearRows {
+                leaf_map: &self.leaf_map,
+                bag: self.subset_rows.as_deref(),
+                num_data: self.view_num_data,
+                leaf_count: &|l| partition.leaf_count(l),
+            };
+            lin.calculate(&mut tree, &self.data, &self.team, &rows, grad, hess, 0.0, false, is_first_tree)?;
         }
         if crate::log::enabled(crate::log::LogLevel::Debug) {
             crate::log::debug(&format!(

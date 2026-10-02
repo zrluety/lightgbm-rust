@@ -333,6 +333,10 @@ pub struct Dataset {
     pub(crate) data_filename: Option<String>,
     /// upstream `label_idx_`: the label's column in the text file (0 otherwise).
     pub(crate) label_idx: i32,
+    /// upstream `raw_data_` (kept iff `has_raw_`, i.e. built with
+    /// `linear_tree`): `f32` feature values per inner feature, empty for
+    /// categorical features.
+    pub(crate) raw: Option<Vec<Vec<f32>>>,
 }
 
 /// Optional per-row fields supplied with the features.
@@ -409,6 +413,9 @@ impl Dataset {
         };
         let layout = train_layout(&found.bin_mappers, &columns, total_sample_size, n, cfg);
         let mut ds = Self::assemble(mat, fields, found.bin_mappers, feature_names, layout)?;
+        if cfg.linear_tree {
+            ds.set_raw_from(mat);
+        }
         ds.forced_bin_bounds = found.forced_bin_bounds;
         ds.finish_construct(cfg, replaced);
         Ok(ds)
@@ -468,6 +475,13 @@ impl Dataset {
                 reference.num_total_features()
             )));
         }
+        if reference.has_raw() && mat.is_csc() {
+            return Err(LgbmError::Unsupported(
+                "CSC validation data for a Dataset with linear_tree (upstream writes its raw values without \
+                 allocating them)"
+                    .into(),
+            ));
+        }
         let mut ds = Self::assemble(
             mat,
             fields,
@@ -475,6 +489,9 @@ impl Dataset {
             reference.feature_names.clone(),
             Layout::Valid(&reference.upstream_inner),
         )?;
+        if reference.has_raw() {
+            ds.set_raw_from(mat);
+        }
         ds.bin_config = reference.bin_config;
         ds.forced_bin_bounds = reference.forced_bin_bounds.clone();
         ds.label_idx = reference.label_idx;
@@ -529,6 +546,9 @@ impl Dataset {
             forced_bin_bounds: self.forced_bin_bounds.clone(),
             data_filename: None,
             label_idx: self.label_idx,
+            raw: self.raw.as_ref().map(|r| {
+                r.iter().map(|col| if col.is_empty() { Vec::new() } else { pick_f32(col) }).collect()
+            }),
         })
     }
 
@@ -638,7 +658,24 @@ impl Dataset {
             max_bin_by_feature: Vec::new(),
             data_filename: None,
             label_idx: 0,
+            raw: None,
         }
+    }
+
+    /// upstream `Dataset::has_raw`.
+    pub fn has_raw(&self) -> bool {
+        self.raw.is_some()
+    }
+
+    /// Raw values of inner feature `inner` (upstream `raw_index`); empty
+    /// without raw storage or for a categorical feature.
+    pub fn raw(&self, inner: usize) -> &[f32] {
+        self.raw.as_ref().map_or(&[][..], |r| r[inner].as_slice())
+    }
+
+    /// Store the raw values of `mat` (see [`Matrix::raw_values`]).
+    fn set_raw_from(&mut self, mat: &Matrix<'_>) {
+        self.raw = Some(mat.raw_values(&self.used_features, &self.bin_mappers, &self.real_to_inner));
     }
 
     /// Fill the bins of an [`Dataset::unfilled`] dataset: `push(builder, self)`

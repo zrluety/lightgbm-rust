@@ -661,6 +661,11 @@ impl RsBooster {
         self.inner.current_iteration()
     }
 
+    /// upstream: `LGBM_BoosterGetLinear`.
+    fn get_linear(&self) -> bool {
+        self.inner.is_linear()
+    }
+
     fn num_feature(&self) -> usize {
         self.inner.num_feature()
     }

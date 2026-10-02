@@ -300,6 +300,7 @@ impl Gbdt {
         // parameters block
         let mut params = String::new();
         let mut in_params = false;
+        let mut linear_tree = false;
         while pos < text.len() {
             let (end, nxt) = next_line(pos);
             let line = &text[pos..end];
@@ -310,11 +311,17 @@ impl Gbdt {
             } else if in_params {
                 params.push_str(line);
                 params.push('\n');
+                if let Some(rest) = line.strip_prefix("[linear_tree: ") {
+                    // upstream: Atoi of the one character after the prefix
+                    let c = rest.get(..1).unwrap_or("");
+                    linear_tree = crate::text_parser::atoi(c.as_bytes(), 0).0 != 0;
+                }
             }
             pos = nxt;
         }
 
         let mut g = Gbdt::empty();
+        g.linear_tree = linear_tree;
         g.loaded_parameters = if params.is_empty() { None } else { Some(params) };
         g.objective = objective;
         g.models = models;

@@ -111,6 +111,9 @@ pub struct Gbdt {
     /// Trained with `boosting=rf` (upstream `RF`, which never uses
     /// prediction early stopping); models loaded from text are plain GBDT.
     pub(crate) is_rf: bool,
+    /// upstream `linear_tree_`: set by `linear_tree` or a loaded model's
+    /// `[linear_tree: 1]` parameter.
+    pub(crate) linear_tree: bool,
     train: Option<TrainState>,
     pool: Option<Arc<rayon::ThreadPool>>,
 }
@@ -187,9 +190,15 @@ impl Gbdt {
             num_init_iteration: 0,
             average_output: false,
             is_rf: false,
+            linear_tree: false,
             train: None,
             pool: None,
         }
+    }
+
+    /// upstream `GBDT::IsLinear` (`LGBM_BoosterGetLinear`).
+    pub fn is_linear(&self) -> bool {
+        self.linear_tree
     }
 
     /// Create a booster for training. `objective` overrides the built-in one
@@ -256,6 +265,13 @@ impl Gbdt {
         let pool = build_pool(config.num_threads)?;
         // upstream: SerialTreeLearner::Init -> CostEfficientGradientBoosting::Init
         Cegb::check(&config, train.num_total_features())?;
+        if config.linear_tree && !train.has_raw() {
+            // upstream reads raw values the Dataset did not keep
+            return Err(LgbmError::Unsupported(
+                "linear_tree with a Dataset constructed without linear_tree=true (it keeps no raw feature values)"
+                    .into(),
+            ));
+        }
         let mut learner = SerialTreeLearner::new(train.clone(), &config);
         // upstream: GBDT::GetIsConstHessian (false when the sample strategy changes hessians)
         learner.set_is_constant_hessian(
@@ -293,6 +309,7 @@ impl Gbdt {
             num_init_iteration: 0,
             average_output: is_rf,
             is_rf,
+            linear_tree: config.linear_tree,
             train: Some(TrainState {
                 data: train,
                 learner,
@@ -850,8 +867,8 @@ impl Gbdt {
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 match &self.pool {
-                    Some(p) => crate::log::install(p, || learner.train(g, h))?,
-                    None => learner.train(g, h)?,
+                    Some(p) => crate::log::install(p, || learner.train(g, h, false))?,
+                    None => learner.train(g, h, false)?,
                 }
             } else {
                 Tree::new(2)
@@ -1028,12 +1045,13 @@ impl Gbdt {
                 st.class_need_train[k] && st.data.num_features() > 0
             };
             let mut tree = if need_train {
+                let is_first_tree = self.models.len() < ntpi;
                 let st = self.train.as_mut().unwrap();
                 let (g, h) = (&st.grad[offset..offset + n], &st.hess[offset..offset + n]);
                 let learner = &mut st.learner;
                 let tree = match &self.pool {
-                    Some(p) => crate::log::install(p, || learner.train(g, h))?,
-                    None => learner.train(g, h)?,
+                    Some(p) => crate::log::install(p, || learner.train(g, h, is_first_tree))?,
+                    None => learner.train(g, h, is_first_tree)?,
                 };
                 if st.sampler.by_query_subset() {
                     for (i, &row) in st.sampler.in_bag().iter().enumerate() {
@@ -1144,6 +1162,9 @@ impl Gbdt {
         }
         let ntpi = self.num_tree_per_iteration;
         let num_iterations = self.models.len() / ntpi;
+        if self.linear_tree {
+            self.train.as_mut().unwrap().learner.init_linear();
+        }
         let mut leaf_pred = vec![0i32; n];
         for iter in 0..num_iterations {
             // upstream GBDT::Boosting; RF::Boosting with trees present starts from zero scores
@@ -1182,10 +1203,8 @@ impl Gbdt {
                     &st.grad[offset..offset + n],
                     &st.hess[offset..offset + n],
                     cfg.refit_decay_rate,
-                );
-                for (s, &l) in st.scores[offset..offset + n].iter_mut().zip(&leaf_pred) {
-                    *s += tree.leaf_value[l as usize];
-                }
+                )?;
+                st.learner.add_refit_score(&tree, &leaf_pred, &mut st.scores[offset..offset + n]);
                 self.models[mi] = tree;
             }
         }
@@ -1363,6 +1382,16 @@ fn update_score(st: &mut TrainState, pool: &Option<Arc<rayon::ThreadPool>>, tree
     let n = st.data.num_data();
     let offset = k * n;
     let mut update = || {
+        if tree.is_linear {
+            // the same values as upstream's learner path for in-bag rows
+            // (each row's partition leaf and raw values)
+            tree.add_prediction_to_score(&st.data, &mut st.scores[offset..offset + n]);
+            for v in st.valid.iter_mut() {
+                let vn = v.data.num_data();
+                tree.add_prediction_to_score(&v.data, &mut v.scores[k * vn..(k + 1) * vn]);
+            }
+            return;
+        }
         st.learner.add_leaf_outputs(&tree.leaf_value, &mut st.scores[offset..offset + n]);
         if st.sampler.is_bagging() {
             tree.add_prediction_to_score_rows(&st.data, st.sampler.out_of_bag(), &mut st.scores[offset..offset + n]);

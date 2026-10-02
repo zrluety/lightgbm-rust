@@ -1,7 +1,7 @@
 //! Decision tree model.
 //!
 //! upstream: include/LightGBM/tree.h, src/io/tree.cpp (numerical and
-//! categorical splits; no linear trees).
+//! categorical splits, linear leaf models).
 
 use std::collections::HashMap;
 
@@ -146,6 +146,16 @@ pub struct Tree {
     pub cat_boundaries_inner: Vec<i32>,
     /// Bitsets of the bins sent left (training data only; not saved).
     pub cat_threshold_inner: Vec<u32>,
+    /// Linear tree: each leaf outputs `leaf_const + sum(leaf_coeff * x[leaf_features])`.
+    pub is_linear: bool,
+    /// Per leaf (linear trees only).
+    pub leaf_const: Vec<f64>,
+    pub leaf_coeff: Vec<Vec<f64>>,
+    /// Real feature indices of each leaf's model.
+    pub leaf_features: Vec<Vec<i32>>,
+    /// Inner feature indices of each leaf's model (training data only; not
+    /// saved, so empty for a loaded tree, as upstream).
+    pub leaf_features_inner: Vec<Vec<i32>>,
 }
 
 /// Arguments of one numerical split (upstream `Tree::Split`).
@@ -194,7 +204,33 @@ impl Tree {
             cat_threshold: Vec::new(),
             cat_boundaries_inner: vec![0],
             cat_threshold_inner: Vec::new(),
+            is_linear: false,
+            leaf_const: Vec::new(),
+            leaf_coeff: Vec::new(),
+            leaf_features: Vec::new(),
+            leaf_features_inner: Vec::new(),
         }
+    }
+
+    /// upstream: `Tree::SetIsLinear(true)` on a tree constructed with
+    /// `is_linear` (zero constants, no leaf models).
+    pub fn make_linear(&mut self) {
+        let n = self.num_leaves;
+        self.is_linear = true;
+        self.leaf_const.resize(n, 0.0);
+        self.leaf_coeff.resize(n, Vec::new());
+        self.leaf_features.resize(n, Vec::new());
+        self.leaf_features_inner.resize(n, Vec::new());
+    }
+
+    /// upstream: `Tree::SetLeafConst`.
+    pub fn set_leaf_const(&mut self, leaf: usize, v: f64) {
+        self.leaf_const[leaf] = maybe_round_to_zero(v);
+    }
+
+    /// upstream: `Tree::SetLeafCoeffs`.
+    pub fn set_leaf_coeffs(&mut self, leaf: usize, coeffs: &[f64]) {
+        self.leaf_coeff[leaf] = coeffs.iter().map(|&c| maybe_round_to_zero(c)).collect();
     }
 
     /// Categorical split of `leaf` (`a.threshold*` and `a.default_left` are
@@ -271,6 +307,14 @@ impl Tree {
         }
         let last = self.num_leaves - 1;
         self.leaf_value[last] = maybe_round_to_zero(self.leaf_value[last] * rate);
+        if self.is_linear {
+            for i in 0..self.num_leaves {
+                self.leaf_const[i] = maybe_round_to_zero(self.leaf_const[i] * rate);
+                for c in self.leaf_coeff[i].iter_mut() {
+                    *c = maybe_round_to_zero(*c * rate);
+                }
+            }
+        }
         self.shrinkage *= rate;
     }
 
@@ -281,12 +325,24 @@ impl Tree {
         }
         let last = self.num_leaves - 1;
         self.leaf_value[last] = maybe_round_to_zero(self.leaf_value[last] + v);
+        if self.is_linear {
+            for c in self.leaf_const[..self.num_leaves].iter_mut() {
+                *c = maybe_round_to_zero(*c + v);
+            }
+        }
         self.shrinkage = 1.0;
     }
 
     pub fn as_constant(&mut self, v: f64, count: i32) {
         self.num_leaves = 1;
         self.shrinkage = 1.0;
+        if self.is_linear {
+            self.leaf_const.truncate(1);
+            self.leaf_const[0] = v;
+            self.leaf_coeff.truncate(1);
+            self.leaf_features.truncate(1);
+            self.leaf_features_inner.truncate(1);
+        }
         self.leaf_value.truncate(1);
         self.leaf_value[0] = v;
         self.leaf_count.truncate(1);
@@ -388,7 +444,46 @@ impl Tree {
 
     #[inline]
     pub fn predict(&self, row: &[f64]) -> f64 {
-        self.leaf_value[self.get_leaf(row)]
+        self.leaf_output(self.get_leaf(row), row)
+    }
+
+    /// Output of `leaf` for a row of raw values (indexed by real feature):
+    /// its value, or for a linear tree its linear model (the value when a
+    /// model feature is NaN).
+    ///
+    /// upstream: `Tree::Predict`.
+    #[inline]
+    pub fn leaf_output(&self, leaf: usize, row: &[f64]) -> f64 {
+        if !self.is_linear {
+            return self.leaf_value[leaf];
+        }
+        let mut output = self.leaf_const[leaf];
+        for (&f, &c) in self.leaf_features[leaf].iter().zip(&self.leaf_coeff[leaf]) {
+            let v = row.get(f as usize).copied().unwrap_or(0.0);
+            if v.is_nan() {
+                return self.leaf_value[leaf];
+            }
+            output += c * v;
+        }
+        output
+    }
+
+    /// Linear output of `leaf` for row `i` of `data`'s raw values (the value
+    /// when a model feature is NaN). Uses the inner model features, which a
+    /// loaded tree does not have.
+    ///
+    /// upstream: `PredictionFunLinear` in `Tree::AddPredictionToScore`.
+    #[inline]
+    fn linear_output_raw(&self, data: &Dataset, leaf: usize, i: usize) -> f64 {
+        let mut output = self.leaf_const[leaf];
+        for (&f, &c) in self.leaf_features_inner[leaf].iter().zip(&self.leaf_coeff[leaf]) {
+            let v = data.raw(f as usize)[i];
+            if v.is_nan() {
+                return self.leaf_value[leaf];
+            }
+            output += c * v as f64;
+        }
+        output
     }
 
     #[inline]
@@ -538,7 +633,7 @@ impl Tree {
 
     /// upstream: `Tree::AddPredictionToScore` on a binned dataset.
     pub fn add_prediction_to_score(&self, data: &Dataset, score: &mut [f64]) {
-        if self.num_leaves <= 1 {
+        if !self.is_linear && self.num_leaves <= 1 {
             let v = self.leaf_value[0];
             for s in score.iter_mut() {
                 *s += v;
@@ -549,13 +644,41 @@ impl Tree {
         score.par_chunks_mut(PREDICT_CHUNK).enumerate().for_each(|(c, chunk)| {
             let mut cursors = self.node_cursors();
             for (k, s) in chunk.iter_mut().enumerate() {
-                *s += self.leaf_value[self.leaf_binned_with(data, &mut cursors, c * PREDICT_CHUNK + k)];
+                let i = c * PREDICT_CHUNK + k;
+                let leaf = if self.num_leaves > 1 { self.leaf_binned_with(data, &mut cursors, i) } else { 0 };
+                *s += if self.is_linear { self.linear_output_raw(data, leaf, i) } else { self.leaf_value[leaf] };
             }
         });
     }
 
     /// upstream: `Tree::AddPredictionToScore(data, used_data_indices, num_data, score)`.
     pub fn add_prediction_to_score_rows(&self, data: &Dataset, rows: &[u32], score: &mut [f64]) {
+        if self.is_linear {
+            use rayon::prelude::*;
+            let outputs: Vec<f64> = rows
+                .par_chunks(PREDICT_CHUNK)
+                .flat_map_iter(|chunk| {
+                    let mut cursors = self.node_cursors();
+                    let mut last = 0usize;
+                    chunk
+                        .iter()
+                        .map(|&i| {
+                            let i = i as usize;
+                            if i < last {
+                                cursors = self.node_cursors();
+                            }
+                            last = i;
+                            let leaf = if self.num_leaves > 1 { self.leaf_binned_with(data, &mut cursors, i) } else { 0 };
+                            self.linear_output_raw(data, leaf, i)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (&i, v) in rows.iter().zip(outputs) {
+                score[i as usize] += v;
+            }
+            return;
+        }
         if self.num_leaves <= 1 {
             let v = self.leaf_value[0];
             for &i in rows {
@@ -620,7 +743,29 @@ impl Tree {
             s.push_str(&format!("cat_boundaries={}\n", join(&self.cat_boundaries[..nb], |x| x.to_string())));
             s.push_str(&format!("cat_threshold={}\n", join(&self.cat_threshold, |x| x.to_string())));
         }
-        s.push_str("is_linear=0\n");
+        s.push_str(&format!("is_linear={}\n", u8::from(self.is_linear)));
+        if self.is_linear {
+            s.push_str(&format!("leaf_const={}\n", join(&self.leaf_const[..n], |x| fmt_g17(*x))));
+            s.push_str(&format!("num_features={}\n", join(&self.leaf_coeff[..n], |c| c.len().to_string())));
+            // upstream writes each non-empty leaf list then a space, and one more space per leaf
+            let per_leaf = |f: &dyn Fn(usize) -> String, sizes: &dyn Fn(usize) -> usize| {
+                let mut out = String::new();
+                for i in 0..n {
+                    if sizes(i) > 0 {
+                        out.push_str(&f(i));
+                        out.push(' ');
+                    }
+                    out.push(' ');
+                }
+                out
+            };
+            let nf = |i: usize| self.leaf_coeff[i].len();
+            s.push_str(&format!(
+                "leaf_features={}\n",
+                per_leaf(&|i| join(&self.leaf_features[i], |x| x.to_string()), &nf)
+            ));
+            s.push_str(&format!("leaf_coeff={}\n", per_leaf(&|i| join(&self.leaf_coeff[i], |x| fmt_g17(*x)), &nf)));
+        }
         s.push_str(&format!("shrinkage={}\n", fmt_g6(self.shrinkage)));
         s.push('\n');
         s
@@ -634,7 +779,14 @@ impl Tree {
             self.num_cat,
             fmt_g17(self.shrinkage)
         );
-        if self.num_leaves == 1 {
+        if self.num_leaves == 1 && self.is_linear {
+            s.push_str(&format!(
+                "\"tree_structure\":{{\"leaf_value\":{}, \n\"leaf_count\":{}, \n{}}}\n",
+                fmt_g17(self.leaf_value[0]),
+                self.leaf_count[0],
+                self.linear_model_to_json(0)
+            ));
+        } else if self.num_leaves == 1 {
             s.push_str(&format!(
                 "\"tree_structure\":{{\"leaf_value\":{}, \n\"leaf_count\":{}}}\n",
                 fmt_g17(self.leaf_value[0]),
@@ -684,13 +836,32 @@ impl Tree {
             s.push_str("\n}");
         } else {
             let leaf = !index as usize;
+            let tail = if self.is_linear {
+                format!(",\n{}", self.linear_model_to_json(leaf))
+            } else {
+                "\n".to_string()
+            };
             s.push_str(&format!(
-                "{{\n\"leaf_index\":{leaf},\n\"leaf_value\":{},\n\"leaf_weight\":{},\n\"leaf_count\":{}\n}}",
+                "{{\n\"leaf_index\":{leaf},\n\"leaf_value\":{},\n\"leaf_weight\":{},\n\"leaf_count\":{}{tail}}}",
                 fmt_g17(self.leaf_value[leaf]),
                 fmt_g17(self.leaf_weight.get(leaf).copied().unwrap_or(0.0)),
                 self.leaf_count[leaf],
             ));
         }
+    }
+
+    /// upstream: `Tree::LinearModelToJSON`.
+    fn linear_model_to_json(&self, leaf: usize) -> String {
+        let mut s = format!("\"leaf_const\":{},\n", fmt_g17(self.leaf_const[leaf]));
+        let feats = &self.leaf_features[leaf];
+        if feats.is_empty() {
+            s.push_str("\"leaf_features\":[],\n\"leaf_coeff\":[]\n");
+        } else {
+            let f: Vec<String> = feats.iter().map(|x| x.to_string()).collect();
+            let c: Vec<String> = self.leaf_coeff[leaf].iter().take(feats.len()).map(|&x| fmt_g17(x)).collect();
+            s.push_str(&format!("\"leaf_features\":[{}], \n\"leaf_coeff\":[{}]\n", f.join(", "), c.join(", ")));
+        }
+        s
     }
 
     /// Parse a tree block (the lines after `Tree=i`) as produced by upstream
@@ -773,9 +944,8 @@ impl Tree {
             .ok()
             .filter(|&c| c >= 0)
             .ok_or_else(|| LgbmError::ModelFormat("bad num_cat".into()))?;
-        if kv.get("is_linear").is_some_and(|v| v.trim() != "0") {
-            return Err(LgbmError::Unsupported("linear trees".into()));
-        }
+        // upstream: Common::Atoi
+        let is_linear = kv.get("is_linear").is_some_and(|v| crate::text_parser::atoi(v.as_bytes(), 0).0 != 0);
         let n = num_leaves;
         let ni = n - 1;
         let mut t = Tree::new(n);
@@ -791,7 +961,7 @@ impl Tree {
         t.leaf_depth = vec![0; n];
         // upstream Tree(const char*) returns before reading the remaining fields of a one-leaf tree
         t.leaf_weight = Vec::new();
-        if n > 1 {
+        if n > 1 || is_linear {
             t.leaf_weight = match kv.get("leaf_weight") {
                 Some(s) => arr_f64(s, n, "leaf_weight")?,
                 None => vec![0.0; n],
@@ -854,13 +1024,44 @@ impl Tree {
             }
             t.split_feature_inner = vec![-1; ni];
             t.threshold_in_bin = vec![0; ni];
-            t.recompute_leaf_depths(0, 0);
+            if ni > 0 {
+                t.recompute_leaf_depths(0, 0);
+            }
             for node in 0..ni {
                 for c in [t.left_child[node], t.right_child[node]] {
                     if c < 0 {
                         t.leaf_parent[(!c) as usize] = node as i32;
                     }
                 }
+            }
+        }
+        if is_linear {
+            t.is_linear = true;
+            t.leaf_const = match kv.get("leaf_const") {
+                Some(s) => arr_f64(s, n, "leaf_const")?,
+                None => vec![0.0; n],
+            };
+            t.leaf_coeff = vec![Vec::new(); n];
+            t.leaf_features = vec![Vec::new(); n];
+            t.leaf_features_inner = vec![Vec::new(); n];
+            if let Some(s) = kv.get("num_features") {
+                let num_feat: Vec<usize> = arr(s, n, "num_features")?;
+                let total: usize = num_feat.iter().sum();
+                let feats: Option<Vec<i32>> = kv.get("leaf_features").map(|s| arr(s, total, "leaf_features")).transpose()?;
+                let coeffs: Option<Vec<f64>> = kv.get("leaf_coeff").map(|s| arr_f64(s, total, "leaf_coeff")).transpose()?;
+                let mut start = 0;
+                for (i, &k) in num_feat.iter().enumerate() {
+                    if let Some(f) = &feats {
+                        t.leaf_features[i] = f[start..start + k].to_vec();
+                    }
+                    if let Some(c) = &coeffs {
+                        t.leaf_coeff[i] = c[start..start + k].to_vec();
+                    }
+                    start += k;
+                }
+            }
+            if t.leaf_coeff.iter().zip(&t.leaf_features).any(|(c, f)| c.len() != f.len()) {
+                return Err(LgbmError::ModelFormat("linear tree leaf_features and leaf_coeff do not match".into()));
             }
         }
         Ok((t, consumed))

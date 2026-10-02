@@ -287,10 +287,19 @@ impl Gbdt {
                                 for k in 0..ntpi {
                                     let m = it * ntpi + k;
                                     flat[m].leaves(rows, stride, leaf);
-                                    let values = &models[m].leaf_value;
-                                    for r in 0..nb {
-                                        if !stopped[r] {
-                                            raw[r * ntpi + k] += values[leaf[r]];
+                                    let t = &models[m];
+                                    if t.is_linear {
+                                        for r in 0..nb {
+                                            if !stopped[r] {
+                                                let row = &rows[r * stride..r * stride + ncol];
+                                                raw[r * ntpi + k] += t.leaf_output(leaf[r], row);
+                                            }
+                                        }
+                                    } else {
+                                        for r in 0..nb {
+                                            if !stopped[r] {
+                                                raw[r * ntpi + k] += t.leaf_value[leaf[r]];
+                                            }
                                         }
                                     }
                                 }
@@ -329,6 +338,16 @@ impl Gbdt {
         Ok(out)
     }
 
+    /// upstream: the `predict_contrib` branch of the `Predictor` constructor.
+    fn check_contrib_supported(&self) -> Result<()> {
+        if self.linear_tree {
+            return Err(LgbmError::InvalidParameter(
+                "Predicting SHAP feature contributions is not implemented for linear trees.".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_num_features(&self, mat: &Matrix<'_>) -> Result<()> {
         if mat.ncols() != self.num_feature() {
             return Err(LgbmError::InvalidData(format!(
@@ -345,6 +364,7 @@ impl Gbdt {
     ///
     /// upstream: `GBDT::PredictContrib`, `Predictor` (`predict_contrib`).
     pub fn predict_contrib(&self, mat: &Matrix<'_>, start_iteration: i32, num_iteration: i32) -> Result<Vec<f64>> {
+        self.check_contrib_supported()?;
         self.check_num_features(mat)?;
         let nf = self.num_feature();
         let ntpi = self.num_tree_per_iteration;
@@ -373,6 +393,7 @@ impl Gbdt {
         num_iteration: i32,
         csr: bool,
     ) -> Result<Vec<SparseContrib>> {
+        self.check_contrib_supported()?;
         self.check_num_features(mat)?;
         let nf = self.num_feature();
         let ntpi = self.num_tree_per_iteration;

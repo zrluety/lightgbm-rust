@@ -1919,8 +1919,7 @@ class Booster:
             params=self.params,
             default_value=None,
         )
-        # linear trees are not implemented, so no model here is linear
-        new_params["linear_tree"] = False
+        new_params["linear_tree"] = bool(self._rs.get_linear())
         new_params.update(dataset_params)
 
         # 'categorical_feature' can end up in self.params when a Booster

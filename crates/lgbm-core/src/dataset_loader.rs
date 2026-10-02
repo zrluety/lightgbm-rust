@@ -17,8 +17,10 @@ use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
+use crate::binning::BinType;
 use crate::config::Config;
 use crate::consts::K_ZERO_THRESHOLD;
+use crate::threading::resolve_num_threads;
 use crate::dataset::{
     avoid_inf_f32, avoid_inf_f64, check_max_bin_by_feature, find_bin_mappers, sanitize_feature_names,
     train_layout, with_num_threads, Dataset, Layout,
@@ -380,10 +382,55 @@ fn read_and_sample(filename: &str, skip: usize, cfg: &Config) -> Result<Sampled>
     Ok(Sampled { lines: None, sample, num_data: n })
 }
 
+/// The raw values (linear trees) of a text file's rows, as upstream's
+/// `ExtractFeaturesFromMemory` stores them: each OpenMP thread keeps one
+/// `feature_row` across the rows of its static block without resetting it,
+/// so a feature a line does not list (CSV/TSV zeros, LibSVM omissions)
+/// repeats the previous row's value within the block.
+struct RawRows {
+    raw: Vec<Vec<f32>>,
+    current: Vec<f32>,
+    /// First row of each thread's block.
+    block_starts: Vec<usize>,
+}
+
+impl RawRows {
+    fn new(d: &Dataset, threads: usize) -> Self {
+        let n = d.num_data;
+        let raw = (0..d.num_features())
+            .map(|f| if d.feature_bin_mapper(f).bin_type == BinType::Numerical { vec![0.0; n] } else { Vec::new() })
+            .collect();
+        // libgomp's schedule(static): the first n % t threads take one extra row
+        let (q, r) = (n / threads, n % threads);
+        let block_starts = (0..threads).map(|t| t * q + t.min(r)).collect();
+        Self { raw, current: vec![0.0; d.num_features()], block_starts }
+    }
+
+    fn push(&mut self, d: &Dataset, row: usize, feats: &[(i32, f64)]) {
+        if self.block_starts.binary_search(&row).is_ok() {
+            self.current.fill(0.0);
+        }
+        let ntf = d.num_total_features();
+        for &(c, v) in feats {
+            if (c as usize) < ntf {
+                if let Some(f) = d.real_to_inner[c as usize] {
+                    self.current[f] = v as f32;
+                }
+            }
+        }
+        for (col, &v) in self.raw.iter_mut().zip(&self.current) {
+            if let Some(x) = col.get_mut(row) {
+                *x = v;
+            }
+        }
+    }
+}
+
 /// Parse the `num_data` data lines in batches, from memory or streaming the
 /// file, pushing each batch into `ds`'s feature groups (upstream
 /// `PushOneRow`/`FinishOneRow` per line); returns the labels, weights and
-/// query ids.
+/// query ids. With `raw_threads` it also stores the raw values (see
+/// [`RawRows`]) as loaded with that many threads.
 fn extract(
     ds: &mut Dataset,
     filename: &str,
@@ -391,11 +438,13 @@ fn extract(
     lines: Option<Vec<Vec<u8>>>,
     parser: &Parser,
     c: &Columns,
+    raw_threads: Option<usize>,
 ) -> Result<Rows> {
     let n = ds.num_data;
     let ntf = ds.num_total_features();
     let mut rows = Rows::new(c);
     let mut result = Ok(());
+    let mut raw = raw_threads.map(|t| RawRows::new(ds, t.max(1)));
     ds.fill_groups(|b, d| {
         let mut flush = |batch: &[&[u8]], rows: &mut Rows| -> Result<()> {
             let row0 = rows.num_rows();
@@ -408,6 +457,11 @@ fn extract(
                     sink(f as usize, v);
                 }
             });
+            if let Some(r) = raw.as_mut() {
+                for (k, f) in feats.iter().enumerate() {
+                    r.push(d, row0 + k, f);
+                }
+            }
             Ok(())
         };
         result = (|| match lines {
@@ -445,6 +499,7 @@ fn extract(
     if rows.num_rows() != n {
         return Err(LgbmError::InvalidData(format!("Data file {filename} changed while it was read")));
     }
+    ds.raw = raw.map(|r| r.raw);
     Ok(rows)
 }
 
@@ -610,6 +665,14 @@ impl Dataset {
         if !cfg.explicit.get("parser_config_file").is_none_or(|v| v.is_empty()) {
             return Err(LgbmError::Unsupported("parser_config_file (custom C++ parsers)".into()));
         }
+        let linear = reference.map_or(cfg.linear_tree, Dataset::has_raw);
+        if linear && cfg.two_round {
+            return Err(LgbmError::Unsupported(
+                "two_round with linear_tree (upstream stores the raw values of each streamed chunk at the \
+                 chunk's row positions)"
+                    .into(),
+            ));
+        }
         let c = set_header(filename, cfg)?;
         let parser = Parser::create(filename, cfg.header, 0, c.label_idx, cfg.precise_float_parser)?;
         let side = load_side_files(filename)?;
@@ -674,8 +737,10 @@ impl Dataset {
             let layout = train_layout(&found.bin_mappers, &columns, sample.len(), n, cfg);
             drop(columns);
             let mut ds = Self::unfilled(n, found.bin_mappers, feature_names, layout);
+            let raw_threads = cfg.linear_tree.then(|| resolve_num_threads(cfg.num_threads));
             // upstream reads the file again only after constructing the bin mappers
-            let (rows, extract_log) = crate::log::defer(|| extract(&mut ds, filename, skip, lines, &parser, &c));
+            let (rows, extract_log) =
+                crate::log::defer(|| extract(&mut ds, filename, skip, lines, &parser, &c, raw_threads));
             let rows = match rows {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -722,7 +787,8 @@ impl Dataset {
         ds.bin_config = reference.bin_config;
         ds.forced_bin_bounds = reference.forced_bin_bounds.clone();
         ds.label_idx = reference.label_idx;
-        let rows = extract(&mut ds, filename, skip, lines, &parser, &c)?;
+        let raw_threads = reference.has_raw().then(|| resolve_num_threads(cfg.num_threads));
+        let rows = extract(&mut ds, filename, skip, lines, &parser, &c, raw_threads)?;
         set_metadata(&mut ds, filename, rows, side)?;
         ds.data_filename = Some(filename.to_string());
         Ok(ds)

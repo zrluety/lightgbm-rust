@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 
-use crate::binning::BinMapper;
+use crate::binning::{BinMapper, BinType};
 use crate::consts::K_ZERO_THRESHOLD;
 use crate::dataset::{DenseMatrix, DenseValues};
 use crate::error::{LgbmError, Result};
@@ -290,6 +290,61 @@ impl Matrix<'_> {
                 }
             }),
         }
+    }
+
+    /// The raw values linear trees read (upstream `raw_data_`): per inner
+    /// feature, `f32` of every value [`Matrix::push_into`] pushes for it, 0
+    /// where nothing is pushed; empty for categorical features.
+    ///
+    /// upstream: the `has_raw_` branches of `Dataset::PushOneValue`,
+    /// `PushOneRow` and `PushOneData`, after `ResizeRaw` zero-fills.
+    pub(crate) fn raw_values(&self, used: &[usize], mappers: &[BinMapper], real_to_inner: &[Option<usize>]) -> Vec<Vec<f32>> {
+        let n = self.nrows();
+        let mut raw: Vec<Vec<f32>> = used
+            .iter()
+            .map(|&c| if mappers[c].bin_type == BinType::Numerical { vec![0.0; n] } else { Vec::new() })
+            .collect();
+        match self {
+            Matrix::Dense(mat) => raw.par_iter_mut().enumerate().for_each(|(f, col)| {
+                let c = used[f];
+                for (r, v) in col.iter_mut().enumerate() {
+                    *v = mat.get(r, c) as f32;
+                }
+            }),
+            Matrix::Sparse(mat) if mat.row_major => {
+                for r in 0..n {
+                    for k in mat.outer(r) {
+                        if let Some(f) = real_to_inner[mat.indices[k] as usize] {
+                            if let Some(v) = raw[f].get_mut(r) {
+                                *v = mat.value(k) as f32;
+                            }
+                        }
+                    }
+                }
+            }
+            Matrix::Sparse(mat) => raw.par_iter_mut().enumerate().for_each(|(f, col)| {
+                if col.is_empty() {
+                    return;
+                }
+                let c = used[f];
+                let m = &mappers[c];
+                if m.default_bin == m.most_freq_bin {
+                    for k in mat.outer(c) {
+                        col[mat.indices[k] as usize] = mat.value(k) as f32;
+                    }
+                } else {
+                    let mut it = CscRowIterator::new(mat, c);
+                    for (r, v) in col.iter_mut().enumerate() {
+                        *v = it.get(r as i64) as f32;
+                    }
+                }
+            }),
+        }
+        raw
+    }
+
+    pub(crate) fn is_csc(&self) -> bool {
+        matches!(self, Matrix::Sparse(m) if !m.row_major)
     }
 
     /// Row reader for prediction (CSC input is transposed to CSR once).

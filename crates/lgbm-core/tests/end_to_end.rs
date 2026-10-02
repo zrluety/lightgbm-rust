@@ -217,8 +217,10 @@ fn reset_parameter_and_training_data() {
 
 #[test]
 fn unsupported_parameters_are_rejected() {
-    for (k, v) in [("tree_learner", "data"), ("objective", "multiclass"), ("linear_tree", "true")] {
+    for (k, v) in [("tree_learner", "data"), ("objective", "multiclass")] {
         let e = Config::from_pairs([(k, v)]);
         assert!(e.is_err(), "{k}={v} should be rejected");
     }
+    assert!(Config::from_pairs([("linear_tree", "true"), ("objective", "regression_l1")]).is_err());
+    assert!(Config::from_pairs([("linear_tree", "true"), ("zero_as_missing", "true")]).is_err());
 }

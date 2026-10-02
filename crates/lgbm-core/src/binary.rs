@@ -29,8 +29,9 @@ pub const MAGIC: &[u8; 16] = b"\x89LGBMRS-DATASET\n";
 /// their (dense, 4-bit or sparse) bins. Versions 1 to 4 stored one column
 /// per feature and are still read, as one group per feature (version 4
 /// keeps its multi-value group); version 1 has no `label_idx`, 2 no
-/// `max_bin_by_feature` and forced bin bounds, 3 no multi-value group.
-pub const FORMAT_VERSION: u32 = 5;
+/// `max_bin_by_feature` and forced bin bounds, 3 no multi-value group,
+/// 5 no raw feature values (linear trees).
+pub const FORMAT_VERSION: u32 = 6;
 /// upstream `Dataset::binary_file_token`.
 pub const UPSTREAM_TOKEN: &[u8] = b"______LightGBM_Binary_File_Token______\n";
 
@@ -363,6 +364,13 @@ impl Dataset {
         for b in &self.forced_bin_bounds {
             w.f64_vec(b);
         }
+        // upstream: has_raw_, then each numerical feature's raw values
+        w.bool(self.raw.is_some());
+        if let Some(raw) = &self.raw {
+            for col in raw {
+                w.f32s(col);
+            }
+        }
         w.0
     }
 
@@ -517,6 +525,18 @@ impl Dataset {
             (Vec::new(), vec![Vec::new(); ncol])
         };
         let multi_val_group = if version == 4 { r.usize_vec("feature groups")? } else { Vec::new() };
+        let raw = if version >= 6 && r.bool("raw data")? {
+            let cols = used_features
+                .iter()
+                .map(|&c| {
+                    let k = if bin_mappers[c].bin_type == BinType::Numerical { num_data } else { 0 };
+                    r.f32s(k, "raw data")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(cols)
+        } else {
+            None
+        };
         let mut real_to_inner = vec![None; ncol];
         for (inner, &real) in used_features.iter().enumerate() {
             real_to_inner[real] = Some(inner);
@@ -570,6 +590,7 @@ impl Dataset {
         ds.max_bin_by_feature = max_bin_by_feature;
         ds.forced_bin_bounds = forced_bin_bounds;
         ds.label_idx = label_idx;
+        ds.raw = raw;
         Ok(ds)
     }
 
@@ -690,6 +711,25 @@ mod tests {
         let mut ds = Dataset::from_dense(&mat, fields, &cfg).unwrap();
         ds.metadata.set_query(n, Some(&[100, 150, 50])).unwrap();
         ds
+    }
+
+    #[test]
+    fn raw_values_round_trip() {
+        let n = 200;
+        let x: Vec<f64> = (0..n * 3).map(|k| if k % 7 == 0 { f64::NAN } else { (k % 13) as f64 * 0.25 }).collect();
+        let label = vec![0.0f32; n];
+        let mat = DenseMatrix::from_f64_row_major(&x, n, 3).unwrap();
+        let cfg = Config::from_pairs([("linear_tree", "true"), ("categorical_feature", "2")]).unwrap();
+        let ds = Dataset::from_dense(&mat, DatasetFields { label: &label, ..Default::default() }, &cfg).unwrap();
+        assert!(ds.has_raw());
+        let back = Dataset::from_binary_bytes(&ds.to_binary_bytes(), Path::new("mem")).unwrap();
+        let bits = |d: &Dataset| -> Vec<Vec<u32>> {
+            (0..d.num_features()).map(|f| d.raw(f).iter().map(|v| v.to_bits()).collect()).collect()
+        };
+        assert_eq!(bits(&back), bits(&ds));
+        assert_eq!(back.raw(0).len(), n);
+        assert!(back.raw(ds.inner_feature_index(2).unwrap()).is_empty(), "categorical features keep no raw values");
+        assert!(!Dataset::from_binary_bytes(&sample().to_binary_bytes(), Path::new("mem")).unwrap().has_raw());
     }
 
     #[test]

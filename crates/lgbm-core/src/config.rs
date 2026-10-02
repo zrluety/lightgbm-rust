@@ -107,7 +107,7 @@ const HONORED: &[&str] = &[
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
     "group_column", "ignore_column", "precise_float_parser", "two_round", "max_bin_by_feature",
     "forcedbins_filename", "forcedsplits_filename", "use_quantized_grad", "num_grad_quant_bins",
-    "quant_train_renew_leaf", "stochastic_rounding",
+    "quant_train_renew_leaf", "stochastic_rounding", "linear_tree", "linear_lambda",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -122,7 +122,6 @@ const NO_EFFECT: &[&str] = &[
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
     "local_listen_port", "time_out", "machine_list_filename", "machines",
     "top_k",
-    "linear_lambda",
     "convert_model_language", "convert_model",
 ];
 
@@ -449,6 +448,8 @@ pub struct Config {
     pub feature_fraction: f64,
     pub feature_fraction_bynode: f64,
     pub extra_trees: bool,
+    pub linear_tree: bool,
+    pub linear_lambda: f64,
     pub use_quantized_grad: bool,
     pub num_grad_quant_bins: i32,
     pub quant_train_renew_leaf: bool,
@@ -568,6 +569,8 @@ impl Default for Config {
             feature_fraction: 1.0,
             feature_fraction_bynode: 1.0,
             extra_trees: false,
+            linear_tree: false,
+            linear_lambda: 0.0,
             use_quantized_grad: false,
             num_grad_quant_bins: 4,
             quant_train_renew_leaf: false,
@@ -749,6 +752,24 @@ impl Config {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let p = &given;
+        let linear = match p.get("linear_tree") {
+            Some(v) => parse_bool("linear_tree", v)?,
+            None => self.linear_tree,
+        };
+        // upstream: CheckParamConflict forces the serial learner and the CPU
+        // device (from CUDA) for linear trees
+        let forced_by_linear = |name: &str, value: &str| {
+            let v = value.trim().to_ascii_lowercase();
+            linear
+                && match name {
+                    "tree_learner" => matches!(
+                        v.as_str(),
+                        "serial" | "feature" | "feature_parallel" | "data" | "data_parallel" | "voting" | "voting_parallel"
+                    ),
+                    "device_type" => v == "cuda",
+                    _ => false,
+                }
+        };
         for (name, value) in p {
             let spec = &reg.specs[reg.by_name[name]];
             if spec.cpp_type == "int" || spec.cpp_type == "double" {
@@ -765,7 +786,7 @@ impl Config {
             }
             let honored = HONORED.contains(&name.as_str());
             let no_effect = NO_EFFECT.contains(&name.as_str());
-            if !honored && !no_effect && !values_equal_to_default(spec, value) {
+            if !honored && !no_effect && !values_equal_to_default(spec, value) && !forced_by_linear(name, value) {
                 return Err(LgbmError::Unsupported(format!(
                     "parameter `{name}={value}` (only the upstream default is accepted)"
                 )));
@@ -938,6 +959,8 @@ impl Config {
         set_f64!(feature_fraction);
         set_f64!(feature_fraction_bynode);
         set_bool!(extra_trees);
+        set_bool!(linear_tree);
+        set_f64!(linear_lambda);
         set_bool!(use_quantized_grad);
         set_int!(num_grad_quant_bins);
         set_bool!(quant_train_renew_leaf);
@@ -1077,6 +1100,31 @@ impl Config {
             crate::log::warning("bagging_by_query=true is only compatible with data_sample_strategy=bagging. Setting bagging_by_query=false.");
             self.bagging_by_query = false;
         }
+        // upstream: Config::CheckParamConflict (linear tree learner)
+        if self.linear_tree {
+            let current = |k: &str| p.get(k).or_else(|| self.explicit.get(k)).map(|v| v.trim().to_ascii_lowercase());
+            if current("device_type").is_some_and(|v| v == "cuda") {
+                crate::log::warning("Linear tree learner only works with CPU and GPU. Falling back to CPU now.");
+            }
+            if current("tree_learner").is_some_and(|v| v != "serial") {
+                crate::log::warning("Linear tree learner must be serial.");
+            }
+            if self.zero_as_missing {
+                return Err(LgbmError::InvalidParameter("zero_as_missing must be false when fitting linear trees.".into()));
+            }
+            if self.objective == "regression_l1" {
+                return Err(LgbmError::InvalidParameter(
+                    "Cannot use regression_l1 objective when fitting linear trees.".into(),
+                ));
+            }
+            if self.use_quantized_grad {
+                return Err(LgbmError::Unsupported(
+                    "linear_tree with use_quantized_grad (upstream's linear tree learner does not discretize the \
+                     gradients its quantized histograms read)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1204,6 +1252,8 @@ impl Config {
             "feature_fraction" => g(self.feature_fraction),
             "feature_fraction_bynode" => g(self.feature_fraction_bynode),
             "extra_trees" => b(self.extra_trees),
+            "linear_tree" => b(self.linear_tree),
+            "linear_lambda" => g(self.linear_lambda),
             "use_quantized_grad" => b(self.use_quantized_grad),
             "num_grad_quant_bins" => self.num_grad_quant_bins.to_string(),
             "quant_train_renew_leaf" => b(self.quant_train_renew_leaf),
