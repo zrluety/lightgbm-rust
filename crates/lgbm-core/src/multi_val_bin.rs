@@ -701,6 +701,96 @@ fn rows_loop<T>(
         None => (start..end).for_each(row),
     }
 }
+
+impl MultiValBin {
+    /// [`MultiValBin::construct`] with packed integer gradients and hessians
+    /// (`gh[row]`, upstream `ConstructHistogramsInt32`): one `i64` per bin in
+    /// `origin` (`num_bin` values). Every column is summed; integer sums do
+    /// not depend on the block layout.
+    pub fn construct_int(
+        &self,
+        team: &ThreadTeam,
+        indices: Option<&[u32]>,
+        gh: &[i64],
+        origin: &mut [i64],
+        bufs: &mut Vec<Vec<i64>>,
+    ) {
+        let cnt = indices.map_or(self.num_data, |ix| ix.len());
+        let (nblock, bsize) = block_info(team.num_threads(), cnt, min_block_size(self.num_bin, self.num_element_per_row));
+        let len = self.num_bin;
+        assert_eq!(origin.len(), len);
+        origin.fill(0);
+        if nblock == 1 {
+            self.block_int(indices, 0, cnt, gh, origin);
+            return;
+        }
+        if bufs.len() < nblock - 1 {
+            bufs.resize_with(nblock - 1, Vec::new);
+        }
+        for b in bufs.iter_mut().take(nblock - 1) {
+            b.clear();
+            b.resize(len, 0);
+        }
+        let targets: Vec<SharedMut<i64>> = std::iter::once(SharedMut::new(&mut *origin))
+            .chain(bufs.iter_mut().take(nblock - 1).map(|b| SharedMut::new(&mut b[..len])))
+            .collect();
+        let per_row = self.num_element_per_row as usize + 1;
+        team.for_each(nblock, cnt * per_row + nblock * len, |b| {
+            // SAFETY: each block writes only its own buffer.
+            let dst = unsafe { targets[b].slice(0, len) };
+            let start = (b * bsize).min(cnt);
+            let end = (start + bsize).min(cnt);
+            if start < end {
+                self.block_int(indices, start, end, gh, dst);
+            }
+        });
+        drop(targets);
+        for src in &bufs[..nblock - 1] {
+            for (o, v) in origin.iter_mut().zip(src) {
+                *o = o.wrapping_add(*v);
+            }
+        }
+    }
+
+    fn block_int(&self, indices: Option<&[u32]>, start: usize, end: usize, gh: &[i64], out: &mut [i64]) {
+        match &self.vals {
+            Vals::U8(v) => self.block_int_typed(v, indices, start, end, gh, out),
+            Vals::U16(v) => self.block_int_typed(v, indices, start, end, gh, out),
+            Vals::U32(v) => self.block_int_typed(v, indices, start, end, gh, out),
+        }
+    }
+
+    fn block_int_typed<T: Copy + Into<u32>>(
+        &self,
+        data: &[T],
+        indices: Option<&[u32]>,
+        start: usize,
+        end: usize,
+        gh: &[i64],
+        out: &mut [i64],
+    ) {
+        let nc = self.columns.len();
+        let mut add_row = |i: usize| {
+            let v = gh[i];
+            if self.sparse {
+                for &b in &data[self.row_ptr[i]..self.row_ptr[i + 1]] {
+                    let t = &mut out[b.into() as usize];
+                    *t = t.wrapping_add(v);
+                }
+            } else {
+                for (&b, &o) in data[i * nc..(i + 1) * nc].iter().zip(&self.offsets) {
+                    let t = &mut out[(b.into() + o) as usize];
+                    *t = t.wrapping_add(v);
+                }
+            }
+        };
+        match indices {
+            Some(ix) => ix[start..end].iter().for_each(|&i| add_row(i as usize)),
+            None => (start..end).for_each(add_row),
+        }
+    }
+}
+
 /// upstream `HistMerge`: `dst += bufs[0] + bufs[1] + ...` (in that order)
 /// over the f64 ranges `(start, len)`, split into bin blocks across threads.
 fn merge(team: &ThreadTeam, dst: &mut [f64], bufs: &[Vec<f64>], ranges: &[(usize, usize)]) {

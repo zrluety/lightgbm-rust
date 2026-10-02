@@ -62,6 +62,28 @@ pub fn subtract(parent: &mut [f64], smaller: &[f64]) {
     }
 }
 
+/// upstream `Dataset::FixHistogramInt` on packed integer sums (one `i64`
+/// per bin: gradient in the high half, hessian in the low half).
+pub fn fix_int(layout: &HistLayout, int_sum: i64, hist: &mut [i64]) {
+    let mfb = layout.most_freq_bin as usize;
+    if mfb > 0 {
+        let mut s = int_sum;
+        for (i, &v) in hist.iter().enumerate().take(layout.num_bin as usize) {
+            if i != mfb {
+                s = s.wrapping_sub(v);
+            }
+        }
+        hist[mfb] = s;
+    }
+}
+
+/// [`subtract`] on packed integer sums.
+pub fn subtract_int(parent: &mut [i64], smaller: &[i64]) {
+    for (a, b) in parent.iter_mut().zip(smaller) {
+        *a = a.wrapping_sub(*b);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

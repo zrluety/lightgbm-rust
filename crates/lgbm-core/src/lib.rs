@@ -31,6 +31,7 @@ pub mod learner;
 pub mod log;
 pub mod matrix;
 pub mod metric;
+pub mod mt19937;
 pub mod multi_val_bin;
 pub mod objective;
 pub mod predict;

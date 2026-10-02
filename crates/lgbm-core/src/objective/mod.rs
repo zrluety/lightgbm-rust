@@ -73,6 +73,10 @@ pub trait RowObjective: Send + Sync {
     fn num_positive_data(&self) -> usize {
         0
     }
+    /// upstream `IsConstantHessian` (after `init`).
+    fn is_constant_hessian(&self) -> bool {
+        false
+    }
     /// upstream `IsRenewTreeOutput`: leaf values are recomputed from the
     /// residuals after each tree is grown (L1, quantile, MAPE).
     fn is_renew_tree_output(&self) -> bool {
@@ -362,6 +366,13 @@ impl Objective {
     pub fn is_renew_tree_output(&self) -> bool {
         match self {
             Objective::Row(o) => o.is_renew_tree_output(),
+            Objective::Grouped { .. } => false,
+        }
+    }
+
+    pub fn is_constant_hessian(&self) -> bool {
+        match self {
+            Objective::Row(o) => o.is_constant_hessian(),
             Objective::Grouped { .. } => false,
         }
     }

@@ -156,6 +156,19 @@ impl RowObjective for Regression {
         self.kind.name()
     }
 
+    fn is_constant_hessian(&self) -> bool {
+        match self.kind {
+            RegressionKind::L2 | RegressionKind::L1 | RegressionKind::Huber { .. } | RegressionKind::Quantile { .. } => {
+                self.weight.is_none()
+            }
+            RegressionKind::Mape => true,
+            RegressionKind::Fair { .. }
+            | RegressionKind::Poisson { .. }
+            | RegressionKind::Gamma
+            | RegressionKind::Tweedie { .. } => false,
+        }
+    }
+
     fn init(&mut self, meta: &Metadata, _num_data: usize) -> Result<()> {
         self.label = if self.sqrt {
             meta.label.iter().map(|&l| (sign(l as f64) as f32) * (l.abs()).sqrt()).collect()

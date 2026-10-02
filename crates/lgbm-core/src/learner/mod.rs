@@ -15,6 +15,7 @@ pub mod col_sampler;
 pub mod constraints;
 mod forced;
 pub mod partition;
+mod quant;
 pub mod split;
 
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use crate::consts::{K_EPSILON, K_MIN_SCORE};
 use crate::fmt::fmt_f;
 use crate::dataset::Dataset;
 use crate::error::{LgbmError, Result};
-use crate::bin::{construct_histogram, with_bin};
+use crate::bin::{construct_histogram, construct_histogram_int, with_bin};
 use crate::histogram::{self, HistLayout};
 use crate::multi_val_bin::{HistOffsets, MultiValBin, TreePlan, share_state_sparse_rate};
 use crate::random::Random;
@@ -39,10 +40,12 @@ pub(crate) use forced::{load_forced_splits, reload_forced_splits};
 use col_sampler::ColSampler;
 use constraints::{LeafConstraints, Method, monotone_split_gain_penalty};
 use partition::DataPartition;
-use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_output};
+use quant::GradientDiscretizer;
+use split::{FeatureMeta, IntSums, SplitInfo, SplitParams, find_best_threshold, find_best_threshold_int, root_output};
 
 /// Histograms of all features of one leaf in one flat buffer laid out by
-/// [`HistOffsets`] (`[g, h]` pairs per bin).
+/// [`HistOffsets`] (`[g, h]` pairs per bin), or with quantized gradients one
+/// packed integer sum per bin (`idata`).
 ///
 /// As upstream's `HistogramPool` (when it holds every leaf), each leaf index
 /// owns a buffer that keeps its contents across trees: a build writes only
@@ -50,6 +53,7 @@ use split::{FeatureMeta, SplitInfo, SplitParams, find_best_threshold, root_outpu
 /// values upstream reads.
 struct LeafHist {
     data: Vec<f64>,
+    idata: Vec<i64>,
     splittable: Vec<bool>,
 }
 
@@ -59,12 +63,14 @@ struct LeafSplits {
     num_data: i32,
     sum_gradients: f64,
     sum_hessians: f64,
+    /// Packed integer sums (quantized gradients only).
+    int_sum: i64,
     weight: f64,
 }
 
 impl LeafSplits {
     fn none() -> Self {
-        Self { leaf: -1, num_data: 0, sum_gradients: 0.0, sum_hessians: 0.0, weight: 0.0 }
+        Self { leaf: -1, num_data: 0, sum_gradients: 0.0, sum_hessians: 0.0, int_sum: 0, weight: 0.0 }
     }
 }
 
@@ -128,6 +134,14 @@ pub struct SerialTreeLearner {
     /// the last histogram build (upstream's `smaller_/larger_leaf_histogram_array_`,
     /// which keep pointing there when `BeforeFindBestSplit` skips a build).
     hist_slots: (i32, i32),
+    /// upstream `gradient_discretizer_` (created iff `use_quantized_grad` at `Init`).
+    quant: Option<GradientDiscretizer>,
+    /// `use_quantized_grad` of the current config.
+    quant_active: bool,
+    quant_renew: bool,
+    iblock_bufs: Vec<Vec<i64>>,
+    /// The bag's rows when bagging uses a subset (kept only with quantized gradients).
+    subset_rows: Option<Vec<u32>>,
     pub trace: Option<TreeTrace>,
 }
 
@@ -238,7 +252,16 @@ impl SerialTreeLearner {
         let col_sampler = ColSampler::new(&data, cfg);
         let extra_rands = extra_rands(&data, cfg);
         let cegb = Cegb::is_enable(cfg).then(|| new_cegb(&data, cfg, num_leaves));
+        let num_threads = resolve_num_threads(cfg.num_threads);
+        let quant = cfg.use_quantized_grad.then(|| {
+            GradientDiscretizer::new(cfg.num_grad_quant_bins, cfg.seed, false, cfg.stochastic_rounding, num_data, num_threads)
+        });
         Self {
+            quant,
+            quant_active: cfg.use_quantized_grad,
+            quant_renew: cfg.quant_train_renew_leaf,
+            iblock_bufs: Vec::new(),
+            subset_rows: None,
             cegb,
             view_num_data: num_data,
             bag_local: None,
@@ -255,7 +278,7 @@ impl SerialTreeLearner {
             multi_val,
             mv_plan: None,
             forced_layout,
-            team: ThreadTeam::new(resolve_num_threads(cfg.num_threads)),
+            team: ThreadTeam::new(num_threads),
             hist_built: vec![false; num_leaves],
             mv_scratch: Vec::new(),
             block_bufs: Vec::new(),
@@ -280,6 +303,52 @@ impl SerialTreeLearner {
         &self.partition
     }
 
+    /// upstream: the `is_constant_hessian` the booster passes to `Init`
+    /// (read by the gradient discretizer it creates there).
+    pub fn set_is_constant_hessian(&mut self, is_constant_hessian: bool) {
+        if let Some(q) = self.quant.as_mut() {
+            q.set_constant_hessian(is_constant_hessian);
+        }
+    }
+
+    /// Combinations of `use_quantized_grad` whose upstream results depend on
+    /// memory it does not initialize.
+    pub fn check_quantized(&self, cfg: &Config) -> Result<()> {
+        if !cfg.use_quantized_grad {
+            return Ok(());
+        }
+        if self.quant.is_none() {
+            return Err(LgbmError::Unsupported(
+                "turning on use_quantized_grad during training (upstream creates its gradient discretizer \
+                 only when the learner is initialized)"
+                    .into(),
+            ));
+        }
+        if !cfg.forcedsplits_filename.is_empty() {
+            return Err(LgbmError::Unsupported(
+                "use_quantized_grad with forcedsplits_filename (upstream reads the integer histograms of a \
+                 forced split as floating-point values)"
+                    .into(),
+            ));
+        }
+        if !cfg.monotone_constraints.is_empty() && cfg.monotone_constraints_method != "basic" {
+            return Err(LgbmError::Unsupported(
+                "use_quantized_grad with monotone_constraints_method other than basic (upstream recomputes \
+                 leaf splits without the leaf's integer sums)"
+                    .into(),
+            ));
+        }
+        if cfg.feature_fraction < 1.0 && self.multi_val.is_some() {
+            return Err(LgbmError::Unsupported(
+                "use_quantized_grad with feature_fraction < 1 and a multi-value histogram (row-wise, or a \
+                 sparse feature group): upstream's sub-column 8-bit histogram path copies from a buffer \
+                 region it did not write"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// upstream: `SerialTreeLearner::ResetConfig`. The histogram pool only
     /// grows (its buffers keep their contents), the column sampler draws a new
     /// per-tree sample, the extra-trees generators restart
@@ -287,6 +356,9 @@ impl SerialTreeLearner {
     pub fn reset_config(&mut self, cfg: &Config) -> Result<()> {
         let num_leaves = cfg.num_leaves.max(2) as usize;
         Cegb::check(cfg, self.data.num_total_features())?;
+        self.check_quantized(cfg)?;
+        self.quant_active = cfg.use_quantized_grad;
+        self.quant_renew = cfg.quant_train_renew_leaf;
         if num_leaves != self.num_leaves {
             if self.cegb.as_ref().is_some_and(|c| num_leaves > c.num_leaves()) {
                 return Err(LgbmError::Unsupported(
@@ -337,8 +409,16 @@ impl SerialTreeLearner {
             ));
         }
         let num_data = data.num_data();
+        if self.quant.as_ref().is_some_and(|q| num_data > q.num_data()) {
+            return Err(LgbmError::Unsupported(
+                "training data with more rows than the first training set under use_quantized_grad (upstream \
+                 keeps the gradient discretizer's buffers and writes past them)"
+                    .into(),
+            ));
+        }
         self.partition.reset_num_data(num_data);
         self.partition.set_used_data_indices(None);
+        self.subset_rows = None;
         self.col_sampler.set_training_data(&data);
         let offsets = HistOffsets::new(&data, self.col_wise);
         if offsets.views != self.offsets.views || offsets.num_total_bin != self.offsets.num_total_bin {
@@ -397,9 +477,13 @@ impl SerialTreeLearner {
     /// only changes how CEGB numbers them.
     pub fn set_bagging_data(&mut self, used: Option<&[u32]>, subset: bool) {
         self.partition.set_used_data_indices(used);
+        self.subset_rows = None;
         match used {
             Some(u) if subset => {
                 self.view_num_data = u.len();
+                if self.quant.is_some() {
+                    self.subset_rows = Some(u.to_vec());
+                }
                 if self.cegb.is_some() {
                     let mut local = self.bag_local.take().unwrap_or_default();
                     local.resize(self.data.num_data(), 0);
@@ -419,6 +503,11 @@ impl SerialTreeLearner {
     /// Train one tree on `grad`/`hess` (length `num_data`).
     pub fn train(&mut self, grad: &[f32], hess: &[f32]) -> Result<Tree> {
         let n = self.data.num_data();
+        let quant = self.quant_active;
+        if quant {
+            let q = self.quant.as_mut().expect("discretizer present");
+            q.discretize(grad, hess, self.subset_rows.as_deref());
+        }
         // upstream: BeforeTrain
         self.hist_built.fill(false);
         self.col_sampler.reset_by_tree();
@@ -434,7 +523,7 @@ impl SerialTreeLearner {
             c.before_train();
         }
         let root_cnt = self.partition.leaf_count(0);
-        if self.multi_val.is_some() {
+        if self.multi_val.is_some() && !quant {
             self.gh.resize(n, [0.0; 2]);
             const CHUNK: usize = 1 << 15;
             let out = SharedMut::new(&mut self.gh);
@@ -453,7 +542,12 @@ impl SerialTreeLearner {
         }
         let mut sg = 0.0f64;
         let mut sh = 0.0f64;
-        if root_cnt == n {
+        let mut int_sum = 0i64;
+        if quant {
+            let q = self.quant.as_ref().expect("discretizer present");
+            let rows = self.partition.indices_on_leaf(0);
+            (sg, sh, int_sum) = if root_cnt == self.view_num_data { q.root_sums(rows) } else { q.bag_root_sums(rows) };
+        } else if root_cnt == n {
             for i in 0..n {
                 sg += grad[i] as f64;
                 sh += hess[i] as f64;
@@ -471,6 +565,7 @@ impl SerialTreeLearner {
             num_data: root_cnt as i32,
             sum_gradients: sg,
             sum_hessians: sh,
+            int_sum,
             weight: self.smaller.weight,
         };
         self.larger = LeafSplits::none();
@@ -497,6 +592,9 @@ impl SerialTreeLearner {
                 break;
             }
             (left_leaf, right_leaf) = self.split(&mut tree, best_leaf)?;
+        }
+        if quant && self.quant_renew {
+            self.renew_int_grad_tree_output(&mut tree, grad, hess);
         }
         if crate::log::enabled(crate::log::LogLevel::Debug) {
             crate::log::debug(&format!(
@@ -544,12 +642,37 @@ impl SerialTreeLearner {
         true
     }
 
-    /// The memory of slot `leaf` (upstream zero-initializes a new buffer).
+    /// upstream `GradientDiscretizer::RenewIntGradTreeOutput` (serial
+    /// learner): each leaf's output from its float gradient sums. Upstream
+    /// sums with an OpenMP reduction; this sums in row order, as one thread does.
+    fn renew_int_grad_tree_output(&self, tree: &mut Tree, grad: &[f32], hess: &[f32]) {
+        for leaf in 0..tree.num_leaves {
+            let rows = self.partition.indices_on_leaf(leaf);
+            let (mut sg, mut sh) = (0.0f64, 0.0f64);
+            for &r in rows {
+                sg += grad[r as usize] as f64;
+                sh += hess[r as usize] as f64;
+            }
+            let out = split::refit_leaf_output(sg, sh, &self.params, false, rows.len() as i32, 0.0);
+            tree.set_leaf_output(leaf, out);
+        }
+    }
+
+    /// The memory of slot `leaf` (upstream zero-initializes a new buffer);
+    /// only the buffer of the current gradient kind is allocated.
     fn take_slot(&mut self, leaf: usize) -> LeafHist {
         let nf = self.data.num_features();
-        self.hist_pool[leaf]
-            .take()
-            .unwrap_or_else(|| LeafHist { data: vec![0.0; self.offsets.buf_len()], splittable: vec![true; nf] })
+        let mut h = self.hist_pool[leaf].take().unwrap_or_else(|| LeafHist {
+            data: Vec::new(),
+            idata: Vec::new(),
+            splittable: vec![true; nf],
+        });
+        if self.quant_active {
+            h.idata.resize(self.offsets.buf_len() / 2, 0);
+        } else {
+            h.data.resize(self.offsets.buf_len(), 0.0);
+        }
+        h
     }
 
     /// upstream `Dataset::ConstructHistograms` with float gradients into `s_buf`.
@@ -647,6 +770,7 @@ impl SerialTreeLearner {
         let sm_leaf = self.smaller.leaf as usize;
         let use_indices = right >= 0 || self.partition.leaf_count(sm_leaf) != self.data.num_data();
         let mut s_buf = s_hist.data;
+        let mut s_ibuf = s_hist.idata;
         let mut used_groups = Vec::new();
         let mut mv_used = false;
         if self.col_wise {
@@ -660,8 +784,39 @@ impl SerialTreeLearner {
                 }
             }
         }
-        // upstream Dataset::ConstructHistogramsInner
-        self.construct_float(&mut s_buf, sm_leaf, use_indices, &used_groups, mv_used, grad, hess);
+        let quant = self.quant_active;
+        // upstream Dataset::ConstructHistogramsInner (ConstructHistogramsInt
+        // with quantized gradients: one packed integer per bin)
+        if quant {
+            let idx = use_indices.then(|| self.partition.indices_on_leaf(sm_leaf));
+            let data: &Dataset = &self.data;
+            let gh: &[i64] = &self.quant.as_ref().expect("discretizer present").packed;
+            let mv_region = if self.col_wise {
+                let groups = data.feature_groups();
+                let gs = &self.offsets.group_start;
+                let shared = SharedMut::new(&mut s_ibuf);
+                let n = data.num_data();
+                let rows = idx.map_or(n, |ix| ix.len());
+                self.team.for_each(used_groups.len(), rows * used_groups.len(), |k| {
+                    let g = used_groups[k];
+                    // SAFETY: group regions are disjoint and each task owns one group.
+                    let hist = unsafe { shared.slice(gs[g], gs[g + 1] - gs[g]) };
+                    hist.fill(0);
+                    with_bin!(&groups[g].bins[0], b => construct_histogram_int(b, idx, n, gh, hist));
+                });
+                mv_used.then(|| {
+                    let g = data.multi_val_group().expect("multi-value group");
+                    gs[g]..gs[g + 1]
+                })
+            } else {
+                Some(0..s_ibuf.len())
+            };
+            if let (Some(r), Some(mv)) = (mv_region, &self.multi_val) {
+                mv.construct_int(&self.team, idx, gh, &mut s_ibuf[r], &mut self.iblock_bufs);
+            }
+        } else {
+            self.construct_float(&mut s_buf, sm_leaf, use_indices, &used_groups, mv_used, grad, hess);
+        }
         let data: &Dataset = &self.data;
         let metas = &self.metas;
         let params = self.params;
@@ -695,11 +850,17 @@ impl SerialTreeLearner {
             larger_splittable: bool,
         }
 
-        let mut l_buf = parent.map(|p| p.data);
+        let (mut l_buf, mut l_ibuf) = match parent {
+            Some(p) => (Some(p.data), Some(p.idata)),
+            None => (None, None),
+        };
         let s_shared = SharedMut::new(&mut s_buf);
         let l_shared = l_buf.as_mut().map(|b| SharedMut::new(b));
+        let si_shared = SharedMut::new(&mut s_ibuf);
+        let li_shared = l_ibuf.as_mut().map(|b| SharedMut::new(b));
         let views = &self.offsets.views;
         let rands = self.extra_rands.as_mut().map(|r| SharedMut::new(r));
+        let (grad_scale, hess_scale) = self.quant.as_ref().map_or((0.0, 0.0), |q| (q.grad_scale, q.hess_scale));
 
         let work = 4 * self.offsets.buf_len();
         let results: Vec<FeatResult> = self.team.map(nf, work, |f| {
@@ -724,6 +885,47 @@ impl SerialTreeLearner {
                 let mut s_split = SplitInfo::default();
                 let mut l_split = SplitInfo::default();
                 let mut l_ok = false;
+                if quant {
+                    // SAFETY: feature views are disjoint and each task owns one feature.
+                    let hist = unsafe { si_shared.slice(v.start / 2, v.len / 2) };
+                    let lview = li_shared.as_ref().map(|l| unsafe { l.slice(v.start / 2, v.len / 2) });
+                    histogram::fix_int(&layout, smaller.int_sum, hist);
+                    let sums = |ls: &LeafSplits| IntSums { sum: ls.int_sum, grad_scale, hess_scale };
+                    let s_ok = find_best_threshold_int(
+                        hist,
+                        meta,
+                        &params,
+                        sums(&smaller),
+                        smaller.num_data,
+                        smaller_parent_output,
+                        constraints.map(|c| c.feature_constraint(smaller.leaf as usize, f)),
+                        rand.as_deref_mut(),
+                        &mut s_split,
+                    );
+                    s_split.feature = real;
+                    if larger.leaf >= 0 {
+                        let lh = lview.expect("parent histogram present");
+                        histogram::subtract_int(lh, hist);
+                        l_ok = find_best_threshold_int(
+                            lh,
+                            meta,
+                            &params,
+                            sums(&larger),
+                            larger.num_data,
+                            larger_parent_output,
+                            constraints.map(|c| c.feature_constraint(larger.leaf as usize, f)),
+                            rand.as_deref_mut(),
+                            &mut l_split,
+                        );
+                        l_split.feature = real;
+                    }
+                    return FeatResult {
+                        smaller_split: s_split,
+                        smaller_splittable: s_ok,
+                        larger_split: l_split,
+                        larger_splittable: l_ok,
+                    };
+                }
                 // SAFETY: feature views are disjoint and each task owns one feature.
                 let hist = unsafe { s_shared.slice(v.start, v.len) };
                 let lview = l_shared.as_ref().map(|l| unsafe { l.slice(v.start, v.len) });
@@ -796,13 +998,16 @@ impl SerialTreeLearner {
             }
         }
         self.best_split_per_leaf[sm_leaf] = s_best;
-        self.hist_pool[sm_leaf] = Some(LeafHist { data: s_buf, splittable: s_spl });
+        self.hist_pool[sm_leaf] = Some(LeafHist { data: s_buf, idata: s_ibuf, splittable: s_spl });
         self.hist_built[sm_leaf] = true;
         if larger.leaf >= 0 {
             let lg = larger.leaf as usize;
             self.best_split_per_leaf[lg] = l_best;
-            self.hist_pool[lg] =
-                Some(LeafHist { data: l_buf.expect("parent histogram"), splittable: l_spl });
+            self.hist_pool[lg] = Some(LeafHist {
+                data: l_buf.expect("parent histogram"),
+                idata: l_ibuf.expect("parent histogram"),
+                splittable: l_spl,
+            });
             self.hist_built[lg] = true;
         }
         self.hist_slots = (smaller.leaf, larger.leaf);
@@ -885,6 +1090,7 @@ impl SerialTreeLearner {
             num_data: info.left_count,
             sum_gradients: info.left_sum_gradient,
             sum_hessians: info.left_sum_hessian,
+            int_sum: info.left_sum_gh,
             weight: info.left_output,
         };
         let right_s = LeafSplits {
@@ -892,6 +1098,7 @@ impl SerialTreeLearner {
             num_data: info.right_count,
             sum_gradients: info.right_sum_gradient,
             sum_hessians: info.right_sum_hessian,
+            int_sum: info.right_sum_gh,
             weight: info.right_output,
         };
         // only a forced split can leave a child empty

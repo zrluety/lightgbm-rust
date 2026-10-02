@@ -217,7 +217,7 @@ fn reset_parameter_and_training_data() {
 
 #[test]
 fn unsupported_parameters_are_rejected() {
-    for (k, v) in [("tree_learner", "data"), ("objective", "multiclass"), ("use_quantized_grad", "true"), ("linear_tree", "true")] {
+    for (k, v) in [("tree_learner", "data"), ("objective", "multiclass"), ("linear_tree", "true")] {
         let e = Config::from_pairs([(k, v)]);
         assert!(e.is_err(), "{k}={v} should be rejected");
     }

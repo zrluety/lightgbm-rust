@@ -644,6 +644,29 @@ pub fn construct_histogram<B: RawBins>(bin: &B, indices: Option<&[u32]>, og: &[f
     }
 }
 
+/// Accumulate the packed integer gradients and hessians `gh[row]` (by global
+/// row) into `hist[raw]` (upstream `Bin::ConstructHistogramInt32`): rows
+/// `idx`, or rows `0..n`. Integer sums do not depend on the order.
+pub fn construct_histogram_int<B: RawBins>(bin: &B, indices: Option<&[u32]>, n: usize, gh: &[i64], hist: &mut [i64]) {
+    match indices {
+        Some(idx) => {
+            let Some(&first) = idx.first() else { return };
+            let mut c = bin.cursor(first as usize);
+            for &i in idx {
+                let raw = c.get(i as usize);
+                if B::DENSE || raw != 0 {
+                    let t = &mut hist[raw as usize];
+                    *t = t.wrapping_add(gh[i as usize]);
+                }
+            }
+        }
+        None => bin.for_each_row(n, |i, raw| {
+            let t = &mut hist[raw as usize];
+            *t = t.wrapping_add(gh[i]);
+        }),
+    }
+}
+
 /// Stable split of `src` (ascending rows) by `lut[raw]` into `l` and `r`;
 /// returns the counts.
 #[inline(always)]

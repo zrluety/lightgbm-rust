@@ -106,7 +106,8 @@ const HONORED: &[&str] = &[
     "cegb_penalty_feature_coupled", "interaction_constraints", "drop_rate", "max_drop", "skip_drop",
     "xgboost_dart_mode", "uniform_drop", "drop_seed", "header", "label_column", "weight_column",
     "group_column", "ignore_column", "precise_float_parser", "two_round", "max_bin_by_feature",
-    "forcedbins_filename", "forcedsplits_filename",
+    "forcedbins_filename", "forcedsplits_filename", "use_quantized_grad", "num_grad_quant_bins",
+    "quant_train_renew_leaf", "stochastic_rounding",
 ];
 
 /// Parameters that cannot change results here (threading, layout, logging,
@@ -120,8 +121,6 @@ const NO_EFFECT: &[&str] = &[
     // device_type / num_machines / tree_learner.
     "gpu_platform_id", "gpu_device_id", "gpu_device_id_list", "gpu_use_dp", "num_gpu",
     "local_listen_port", "time_out", "machine_list_filename", "machines",
-    // Quantization sub-options are inert unless use_quantized_grad (gated).
-    "num_grad_quant_bins", "quant_train_renew_leaf", "stochastic_rounding",
     "top_k",
     "linear_lambda",
     "convert_model_language", "convert_model",
@@ -450,6 +449,10 @@ pub struct Config {
     pub feature_fraction: f64,
     pub feature_fraction_bynode: f64,
     pub extra_trees: bool,
+    pub use_quantized_grad: bool,
+    pub num_grad_quant_bins: i32,
+    pub quant_train_renew_leaf: bool,
+    pub stochastic_rounding: bool,
     pub use_missing: bool,
     pub zero_as_missing: bool,
     pub feature_pre_filter: bool,
@@ -565,6 +568,10 @@ impl Default for Config {
             feature_fraction: 1.0,
             feature_fraction_bynode: 1.0,
             extra_trees: false,
+            use_quantized_grad: false,
+            num_grad_quant_bins: 4,
+            quant_train_renew_leaf: false,
+            stochastic_rounding: true,
             use_missing: true,
             zero_as_missing: false,
             feature_pre_filter: true,
@@ -931,6 +938,10 @@ impl Config {
         set_f64!(feature_fraction);
         set_f64!(feature_fraction_bynode);
         set_bool!(extra_trees);
+        set_bool!(use_quantized_grad);
+        set_int!(num_grad_quant_bins);
+        set_bool!(quant_train_renew_leaf);
+        set_bool!(stochastic_rounding);
         set_bool!(use_missing);
         set_bool!(zero_as_missing);
         set_bool!(feature_pre_filter);
@@ -1193,6 +1204,10 @@ impl Config {
             "feature_fraction" => g(self.feature_fraction),
             "feature_fraction_bynode" => g(self.feature_fraction_bynode),
             "extra_trees" => b(self.extra_trees),
+            "use_quantized_grad" => b(self.use_quantized_grad),
+            "num_grad_quant_bins" => self.num_grad_quant_bins.to_string(),
+            "quant_train_renew_leaf" => b(self.quant_train_renew_leaf),
+            "stochastic_rounding" => b(self.stochastic_rounding),
             "bagging_by_query" => b(self.bagging_by_query),
             "use_missing" => b(self.use_missing),
             "zero_as_missing" => b(self.zero_as_missing),

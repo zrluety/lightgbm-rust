@@ -257,6 +257,11 @@ impl Gbdt {
         // upstream: SerialTreeLearner::Init -> CostEfficientGradientBoosting::Init
         Cegb::check(&config, train.num_total_features())?;
         let mut learner = SerialTreeLearner::new(train.clone(), &config);
+        // upstream: GBDT::GetIsConstHessian (false when the sample strategy changes hessians)
+        learner.set_is_constant_hessian(
+            objective.as_ref().is_some_and(|o| o.is_constant_hessian()) && config.data_sample_strategy != "goss",
+        );
+        learner.check_quantized(&config)?;
         // upstream: GBDT::Init loads the forced splits, then CheckForcedSplitFeatures
         learner.set_forced_split(load_forced_splits(&config.forcedsplits_filename, train.num_total_features() as i32 - 1)?);
         // upstream: GBDT::Init ends with ResetSampleConfig
