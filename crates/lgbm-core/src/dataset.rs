@@ -316,22 +316,55 @@ impl Metadata {
     }
 }
 
+/// The construction parameters upstream records in a dataset
+/// (`max_bin_`, `min_data_in_bin_`, ...) and checks when a binary file is
+/// loaded (`DatasetLoader::CheckDataset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinConstructConfig {
+    pub max_bin: i32,
+    pub min_data_in_bin: i32,
+    pub bin_construct_sample_cnt: i32,
+    pub use_missing: bool,
+    pub zero_as_missing: bool,
+}
+
+impl BinConstructConfig {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            max_bin: cfg.max_bin,
+            min_data_in_bin: cfg.min_data_in_bin,
+            bin_construct_sample_cnt: cfg.bin_construct_sample_cnt,
+            use_missing: cfg.use_missing,
+            zero_as_missing: cfg.zero_as_missing,
+        }
+    }
+}
+
+impl Default for BinConstructConfig {
+    fn default() -> Self {
+        Self::from_config(&Config::default())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    num_data: usize,
-    bin_mappers: Vec<BinMapper>,
+    pub(crate) num_data: usize,
+    pub(crate) bin_mappers: Vec<BinMapper>,
     /// inner feature index -> real (column) index; only non-trivial features
-    used_features: Vec<usize>,
+    pub(crate) used_features: Vec<usize>,
     /// Upstream's inner index of each inner feature (see `feature_groups`).
-    upstream_inner: Vec<usize>,
+    pub(crate) upstream_inner: Vec<usize>,
     /// upstream `num_feature_groups()`: one group per feature for datasets
     /// built from a reference (`CreateValid`).
-    num_feature_groups: usize,
-    real_to_inner: Vec<Option<usize>>,
-    bins: Vec<BinColumn>,
+    pub(crate) num_feature_groups: usize,
+    pub(crate) real_to_inner: Vec<Option<usize>>,
+    pub(crate) bins: Vec<BinColumn>,
     pub metadata: Metadata,
-    feature_names: Vec<String>,
-    warnings: Vec<String>,
+    pub(crate) feature_names: Vec<String>,
+    pub(crate) bin_config: BinConstructConfig,
+    /// upstream `data_filename_`: the file this dataset was loaded from.
+    pub(crate) data_filename: Option<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Optional per-row fields supplied with the features.
@@ -423,6 +456,7 @@ impl Dataset {
         };
         let mut ds = Self::assemble(mat, fields, bin_mappers, feature_names)?;
         ds.warnings = warnings;
+        ds.bin_config = BinConstructConfig::from_config(cfg);
         let explicit_bool = |k: &str| cfg.explicit.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "+"));
         (ds.upstream_inner, ds.num_feature_groups) = upstream_inner_order(
             &ds.bin_mappers,
@@ -491,6 +525,7 @@ impl Dataset {
         }
         let mut ds = Self::assemble(mat, fields, reference.bin_mappers.clone(), reference.feature_names.clone())?;
         ds.upstream_inner = reference.upstream_inner.clone();
+        ds.bin_config = reference.bin_config;
         Ok(ds)
     }
 
@@ -544,6 +579,8 @@ impl Dataset {
                 ..Default::default()
             },
             feature_names: self.feature_names.clone(),
+            bin_config: self.bin_config,
+            data_filename: None,
             warnings: Vec::new(),
         })
     }
@@ -615,6 +652,8 @@ impl Dataset {
             bins,
             metadata,
             feature_names,
+            bin_config: BinConstructConfig::default(),
+            data_filename: None,
             warnings: Vec::new(),
         })
     }

@@ -45,13 +45,15 @@ def test_pandas_input_uses_column_names():
     np.testing.assert_array_equal(bst.predict(df), bst.predict(X))
 
 
-def test_unsupported_features_raise_lightgbm_error():
+def test_unsupported_features_raise_lightgbm_error(tmp_path):
     X, y = _data()
     for params in ({"objective": "cross_entropy"}, {"cegb_tradeoff": 0.5}, {"boosting": "dart"}):
         with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet"):
             lgb.train({**BASE, **params}, lgb.Dataset(X, label=y), 2)
-    with pytest.raises(lgb.LightGBMError, match="not supported"):
-        lgb.Dataset(X, label=y).construct().save_binary("unused.bin")
+    text = tmp_path / "train.csv"
+    text.write_text("1,0.5,0.25\n0,0.1,0.2\n")
+    with pytest.raises(lgb.LightGBMError, match="not supported by lightgbm-rust yet: training from files"):
+        lgb.Dataset(text).construct()
 
 
 def test_invalid_parameter_message_matches_upstream_check():

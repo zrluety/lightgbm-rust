@@ -223,6 +223,23 @@ impl RsDataset {
         Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings })
     }
 
+    /// upstream: `LGBM_DatasetCreateFromFile` for binary files. With a
+    /// reference the file is loaded as is, without parameter checks.
+    #[staticmethod]
+    #[pyo3(signature = (filename, params, has_reference=false))]
+    fn load_binary(py: Python<'_>, filename: String, params: Vec<(String, String)>, has_reference: bool) -> PyResult<Self> {
+        let cfg = config_from(params)?;
+        let check = (!has_reference).then_some(&cfg);
+        let ds = detached(py, || Dataset::load_binary(&filename, check))?;
+        Ok(Self { inner: Arc::new(ds), warnings: cfg.warnings.clone() })
+    }
+
+    /// upstream: `LGBM_DatasetSaveBinary`. Returns upstream's warnings.
+    fn save_binary(&self, py: Python<'_>, filename: String) -> PyResult<Vec<String>> {
+        let ds = &self.inner;
+        detached(py, || ds.save_binary(&filename))
+    }
+
     fn config_warnings(&self) -> Vec<String> {
         self.warnings.clone()
     }

@@ -873,6 +873,118 @@ def test_bagging_by_query_edge_cases():
         fit(lgb_rs, {"bagging_by_query": True, "bagging_fraction": 0.7, "bagging_freq": 1}, fobj=fobj)
 
 
+# --------------------------------------------------------------------------- save_binary
+
+
+SAVE_BINARY_CASES = [c for c in CASES if c.name in ("reg_basic", "reg_nan_zero", "bin_weighted", "bin_init_score",
+                                                    "mc_basic", "reg_sampled_bins", "reg_sparse", "cat_basic",
+                                                    "bag_basic")]
+
+
+@pytest.mark.parametrize("case", SAVE_BINARY_CASES, ids=[c.name for c in SAVE_BINARY_CASES])
+def test_save_binary(case, recorder, tmp_path):
+    """Each package's own binary format: a Dataset saved and loaded back (training and validation sets)
+    trains the same model as the in-memory Dataset, and the loaded fields match upstream's."""
+    rec = recorder(case.name)
+    params = case.full_params
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        d = tmp_path / mod.__name__
+        d.mkdir()
+        train = mod.Dataset(case.X, label=case.y, weight=case.weight, init_score=case.init_score, params=params)
+        valid = train.create_valid(case.Xv, label=case.yv)
+        train.save_binary(d / "train.bin")
+        valid.save_binary(d / "valid.bin")
+        mem = mod.train(params, train, num_boost_round=10, valid_sets=[valid], callbacks=[])
+        loaded = mod.Dataset(d / "train.bin", params=params)
+        loaded_valid = loaded.create_valid(str(d / "valid.bin"))
+        h = {}
+        bst = mod.train(params, loaded, num_boost_round=10, valid_sets=[loaded_valid],
+                        callbacks=[mod.record_evaluation(h)])
+        fields = {f: loaded.get_field(f) for f in ("label", "weight", "init_score", "group")}
+        out[mod.__name__] = (mem, bst, h, fields, loaded)
+    (mem_rs, rs, h_rs, f_rs, ds_rs), (mem_up, up, h_up, f_up, ds_up) = out["lightgbm_rust"], out["lightgbm"]
+    rec.compare("model_text(loaded)", "model_text", rs.model_to_string(), up.model_to_string())
+    if case.init_score is None:  # init_score is not saved
+        rec.compare("model_text(loaded vs in-memory)", "model_text", rs.model_to_string(), mem_rs.model_to_string())
+    rec.compare("raw_score[holdout]", "predictions", rs.predict(case.Xv, raw_score=True),
+                up.predict(case.Xv, raw_score=True))
+    for m in h_up["valid_0"]:
+        rec.compare(f"valid.{m}[per iteration]", "metrics", h_rs["valid_0"][m], h_up["valid_0"][m])
+    for f in ("label", "weight", "group"):
+        rec.compare(f"loaded {f}", "tree_structure", f_rs[f], f_up[f])
+    rec.compare("loaded init_score is None", "tree_structure", f_rs["init_score"] is None,
+                f_up["init_score"] is None)
+    rec.compare("num_data, num_feature", "tree_structure", [ds_rs.num_data(), ds_rs.num_feature()],
+                [ds_up.num_data(), ds_up.num_feature()])
+    rec.compare("feature_name", "tree_structure", ds_rs.get_feature_name(), ds_up.get_feature_name())
+    rec.compare("feature_num_bin", "tree_structure", [ds_rs.feature_num_bin(i) for i in range(ds_rs.num_feature())],
+                [ds_up.feature_num_bin(i) for i in range(ds_up.num_feature())])
+    rec.finish()
+
+
+def test_save_binary_ranking(tmp_path):
+    """Query boundaries survive the round trip, positions do not (as upstream), also for a subset."""
+    case = next(c for c in RANK_CASES if c.name == "rank_position")
+    out = {}
+    for mod in (lgb_rs, lgb_up):
+        d = tmp_path / mod.__name__
+        d.mkdir()
+        ds = mod.Dataset(case.X, label=case.y, group=case.group, position=case.position, free_raw_data=False)
+        ds.save_binary(d / "rank.bin")
+        ds.subset(list(range(0, 200))).save_binary(d / "subset.bin")
+        loaded = mod.Dataset(str(d / "rank.bin")).construct()
+        sub = mod.Dataset(str(d / "subset.bin")).construct()
+        bst = mod.train({**case.full_params, "verbosity": -1}, loaded, num_boost_round=5)
+        out[mod.__name__] = (loaded.get_group(), loaded.get_position(), sub.get_group(), sub.num_data(),
+                             bst.model_to_string())
+    rs, up = out["lightgbm_rust"], out["lightgbm"]
+    np.testing.assert_array_equal(rs[0], up[0])
+    assert rs[1] is None and up[1] is None
+    np.testing.assert_array_equal(rs[2], up[2])
+    assert rs[3] == up[3] == 200
+    assert rs[4] == up[4]
+
+
+def test_save_binary_behaviors(tmp_path):
+    """Same observable behavior as upstream for existing files, the `.bin` suffix lookup, parameter checks,
+    field overrides, and prediction from a binary file; each package rejects the other's files."""
+    X, y = CASES[0].X, CASES[0].y
+    params = {"max_bin": 63, "min_data_in_bin": 5, "verbosity": -1}
+    files = {}
+    for mod in (lgb_rs, lgb_up):
+        d = tmp_path / mod.__name__
+        d.mkdir()
+        path = d / "data.bin"
+        mod.Dataset(X, label=y, params=params).save_binary(path)
+        files[mod.__name__] = path
+        before = path.read_bytes()
+        mod.Dataset(X[:50], label=y[:50], params=params).save_binary(path)
+        assert path.read_bytes() == before, "an existing file is left untouched"
+        # `<name>.bin` is tried before `<name>`
+        assert mod.Dataset(str(d / "data"), params=params).construct().num_data() == len(y)
+        for key, value, stored in (("max_bin", 255, 63), ("min_data_in_bin", 3, 5), ("use_missing", False, 1),
+                                   ("zero_as_missing", True, 0), ("bin_construct_sample_cnt", 100, 200000)):
+            shown = int(value) if isinstance(value, bool) else value
+            with pytest.raises(mod.basic.LightGBMError,
+                               match=rf"Dataset was constructed with parameter {key}={stored}\. "
+                                     rf"It cannot be changed to {shown} when loading from binary file\."):
+                mod.Dataset(path, params={**params, key: value}).construct()
+        new_label = (y > np.median(y)).astype(float)
+        ds = mod.Dataset(path, label=new_label, weight=np.full(len(y), 2.0), params=params).construct()
+        np.testing.assert_array_equal(ds.get_label(), new_label.astype(np.float32))
+        np.testing.assert_array_equal(ds.get_weight(), np.full(len(y), 2.0, dtype=np.float32))
+        bst = mod.train({**params, "objective": "binary"}, ds, num_boost_round=2)
+        with pytest.raises(mod.basic.LightGBMError, match="Unknown format of training data"):
+            bst.predict(str(path))
+        with pytest.raises(mod.basic.LightGBMError, match="Cannot open data file"):
+            mod.Dataset(d / "missing.bin").construct()
+    with pytest.raises(lgb_rs.basic.LightGBMError, match="upstream LightGBM binary dataset file"):
+        lgb_rs.Dataset(files["lightgbm"]).construct()
+    with pytest.raises(lgb_up.basic.LightGBMError):
+        lgb_up.Dataset(files["lightgbm_rust"]).construct()
+
+
 RANK_CV_CASES = [c for c in RANK_CASES if c.name in ("rank_basic", "rank_weighted", "xendcg_basic")]
 
 

@@ -402,6 +402,19 @@ def _matrix_nrows(mat: Union[np.ndarray, _SparseParts]) -> int:
     return mat[4] if isinstance(mat, tuple) else mat.shape[0]
 
 
+# first bytes of lightgbm-rust (crates/lgbm-core/src/binary.rs) and upstream binary dataset files
+_BINARY_DATASET_PREFIXES = (b"\x89LGBMRS-DATASET\n", b"______LightGBM_Binary_File_Token______\n")
+
+
+def _is_binary_dataset_file(path: Union[str, Path]) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    return any(head.startswith(p) for p in _BINARY_DATASET_PREFIXES)
+
+
 def _to_float_matrix(
     data: Any,
     feature_name: Any = "auto",
@@ -417,7 +430,12 @@ def _to_float_matrix(
     """
     names: Optional[List[str]] = None
     if isinstance(data, (str, Path)):
-        raise _unsupported("training from files")
+        if predict and _is_binary_dataset_file(data):
+            # upstream's text parser rejects binary dataset files
+            raise LightGBMError(
+                "Unknown format of training data. Only CSV, TSV, and LibSVM (zero-based) formatted text files are supported."
+            )
+        raise _unsupported("training from files" if not predict else "predicting from files")
     if _is_scipy_sparse(data):
         return _sparse_input(data, predict), None
     if isinstance(data, Sequence) or (isinstance(data, list) and data and isinstance(data[0], Sequence)):
@@ -748,6 +766,8 @@ class Dataset:
         if self.reference is not None:
             self.pandas_categorical = self.reference.pandas_categorical
             categorical_feature = self.reference.categorical_feature
+        if isinstance(data, (str, Path)):
+            return self._construct_from_file(data, feature_name, categorical_feature)
         if _is_pandas_df(data):
             data, feature_name, categorical_feature, self.pandas_categorical = _data_from_pandas(
                 data, feature_name, categorical_feature, self.pandas_categorical
@@ -822,6 +842,66 @@ class Dataset:
             self._set_init_score_by_predictor(predictor=predictor, data=self.data, used_indices=None)
         elif self.init_score is not None:
             self.init_score = self.get_field("init_score")
+        if self.free_raw_data:
+            self.data = None
+        self.feature_name = self.get_feature_name()
+        return self
+
+    def _construct_from_file(self, data: Union[str, Path], feature_name: Any, categorical_feature: Any) -> "Dataset":
+        # upstream: Dataset._lazy_init with a file path (LGBM_DatasetCreateFromFile); only
+        # lightgbm-rust binary files can be read
+        self._has_non_default_feature_names = feature_name != "auto"
+        params = self.params
+        for key in params.keys():
+            if key in _LAZY_INIT_ARGS:
+                _log_warning(
+                    f"{key} keyword has been found in `params` and will be ignored.\n"
+                    f"Please use {key} argument of the Dataset constructor to pass this parameter."
+                )
+        if isinstance(categorical_feature, list):
+            categorical_indices = set()
+            feature_dict = {}
+            if isinstance(feature_name, list):
+                feature_dict = {name: i for i, name in enumerate(feature_name)}
+            for name in categorical_feature:
+                if isinstance(name, str) and name in feature_dict:
+                    categorical_indices.add(feature_dict[name])
+                elif isinstance(name, int):
+                    categorical_indices.add(name)
+                else:
+                    raise TypeError(f"Wrong type({type(name).__name__}) or unknown name({name}) in categorical_feature")
+            if categorical_indices:
+                for cat_alias in _ConfigAliases.get("categorical_feature"):
+                    if cat_alias in params:
+                        if not (isinstance(params[cat_alias], list) and set(params[cat_alias]) == categorical_indices):
+                            _log_warning(f"{cat_alias} in param dict is overridden.")
+                        params.pop(cat_alias, None)
+                params["categorical_column"] = sorted(categorical_indices)
+        has_reference = self.reference is not None
+        if has_reference:
+            self.reference.construct()
+        self._rs = _rs.RsDataset.load_binary(str(data), _param_dict_to_pairs(params), has_reference)
+        _emit_engine_warnings(self._rs.config_warnings(), params)
+        if self.label is not None:
+            self.set_label(self.label)
+        if self.get_label() is None:
+            raise ValueError("Label should not be None")
+        if self.weight is not None:
+            self.set_weight(self.weight)
+        if self.group is not None:
+            self.set_group(self.group)
+        if self.position is not None:
+            self.set_position(self.position)
+        predictor = self._predictor
+        if isinstance(predictor, _InnerPredictor):
+            if self.init_score is not None:
+                _log_warning("The init_score will be overridden by the prediction of init_model.")
+            self._set_init_score_by_predictor(predictor=predictor, data=data, used_indices=None)
+        elif self.init_score is not None:
+            self.set_init_score(self.init_score)
+        elif predictor is not None:
+            raise TypeError(f"Wrong predictor type {type(predictor).__name__}")
+        self.set_feature_name(feature_name)
         if self.free_raw_data:
             self.data = None
         self.feature_name = self.get_feature_name()
@@ -1218,7 +1298,9 @@ class Dataset:
         return ret
 
     def save_binary(self, filename: Union[str, Path]) -> "Dataset":
-        raise _unsupported("Dataset.save_binary()")
+        """Save to lightgbm-rust's binary format (not readable by upstream LightGBM, and vice versa)."""
+        _emit_engine_warnings(self.construct()._rs.save_binary(str(filename)), None)
+        return self
 
     def add_features_from(self, other: "Dataset") -> "Dataset":
         raise _unsupported("Dataset.add_features_from()")

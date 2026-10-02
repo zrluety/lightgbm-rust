@@ -12,6 +12,7 @@
 
 pub mod array_args;
 pub mod arrow;
+pub mod binary;
 pub mod binning;
 pub mod boosting;
 pub mod config;
